@@ -18,7 +18,8 @@ impl Scratch {
         let dir = std::env::temp_dir().join(format!("pma-test-{}-{name}-{n}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        Scratch(dir)
+        // `pma root add` canonicalizes, and macOS's temp dir is a symlink.
+        Scratch(dir.canonicalize().unwrap())
     }
 
     fn project(&self, name: &str, todo: &str) -> PathBuf {
@@ -960,6 +961,46 @@ fn a_retried_publish_publishes_only_what_was_approved() {
         git_out(&origin, &["rev-parse", "pma/second-task"]),
         pushed,
         "the branch is not pushed again"
+    );
+}
+
+/// Commits a secret, then deletes it: the net diff is clean.
+const COMMITTING_CLAUDE: &str = r#"#!/bin/sh
+echo key > secret.txt
+git add secret.txt && git commit -qm "wip: secret"
+case "$2" in *"second task"*) f=second.txt ;; *) f=hello.txt ;; esac
+git rm -q secret.txt && echo hi > $f && git add $f
+git commit -qm "tidy up"
+echo '{"type":"result","subtype":"success","is_error":false,"result":"did it","total_cost_usd":0.1}'
+"#;
+
+/// Review shows the net diff, so only the approved tree is published: one
+/// commit on the base, none of the agent's history.
+#[test]
+fn the_agents_own_commits_are_not_published() {
+    let s = Scratch::new("agent-commits");
+    let (env, origin, _) = dispatch_env(&s, &[("claude", COMMITTING_CLAUDE), ("gh", FAKE_GH_PR)]);
+    env.ok(&["dispatch", "alpha:5"]);
+    env.ok(&["review", "1", "--approve"]);
+    assert!(env.ok(&["push", "1"]).contains("#1 alpha: pushed "));
+    assert_eq!(
+        git_out(&origin, &["log", "--format=%s", "main"]),
+        "add greeting\ninit\n"
+    );
+    assert_eq!(
+        git_out(
+            &origin,
+            &["log", "--all", "--format=%s", "--", "secret.txt"]
+        ),
+        ""
+    );
+
+    env.ok(&["dispatch", "alpha:7"]);
+    env.ok(&["review", "2", "--approve"]);
+    env.ok(&["pr", "2"]);
+    assert_eq!(
+        git_out(&origin, &["log", "--format=%s", "main..pma/second-task"]),
+        "second task\n"
     );
 }
 
@@ -2940,6 +2981,58 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"did it","t
     let (_, err, success) = env.run(&["workflow", "run", "greet", "alpha", "--approve", &id]);
     assert!(!success, "an instance with no edit budget must not edit");
     assert!(err.contains("max_edits"), "{err}");
+    assert!(
+        env.ok(&["review"]).contains("no runs to review"),
+        "no run was made"
+    );
+}
+
+/// Unit ids repeat across instances, so a plan id must also bind the target
+/// and the arguments: a plan approved for one project runs on no other.
+#[test]
+fn a_plan_id_names_its_target_and_arguments() {
+    let s = Scratch::new("wfplanid");
+    let (env, _origin, alpha) = dispatch_env(&s, &[("claude", FAKE_CLAUDE)]);
+    let root = alpha.parent().unwrap();
+    git(root, &["clone", "-q", "../origin.git", "beta"], None);
+    env.ok(&["project", "tier", "1", "beta"]);
+    env.ok(&["scan", "--offline"]);
+
+    let wf = s.0.join("greet.rhai");
+    fs::write(
+        &wf,
+        r#"
+        let graph = source("project")
+            .edit("greet", "verify", "Say {$word} in hello.txt for `{name}`.")
+            .output();
+        document(#{}, [
+            workflow("greet", graph, #{
+                params: #{ word: param("line", "hello") },
+                caps: #{ max_units: 10, max_edits: 10 },
+            }),
+        ])
+        "#,
+    )
+    .unwrap();
+    env.ok(&["config", "workflow_budget", "20"]);
+    env.ok(&["workflow", "propose", wf.to_str().unwrap()]);
+    env.ok(&["workflow", "activate", "1"]);
+    let dry = |args: &[&str]| {
+        let mut all = vec!["workflow", "run", "greet"];
+        all.extend_from_slice(args);
+        all.push("--dry-run");
+        plan_id(&env.ok(&all))
+    };
+    let alpha_id = dry(&["alpha"]);
+    assert_ne!(alpha_id, dry(&["beta"]));
+    assert_ne!(alpha_id, dry(&["alpha", "--set", "word=bye"]));
+    assert_eq!(alpha_id, dry(&["alpha"]), "the same plan has the same id");
+
+    let (_, err, success) = env.run(&["workflow", "run", "greet", "beta", "--approve", &alpha_id]);
+    assert!(
+        !success && err.contains("is not the plan for this pass"),
+        "{err}"
+    );
     assert!(
         env.ok(&["review"]).contains("no runs to review"),
         "no run was made"

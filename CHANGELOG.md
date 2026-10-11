@@ -4,6 +4,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+**A workflow plan id names its target and arguments.** It hashed each node's units by id, and root unit ids are `u1..uN` in every instance. So a plan printed for one project could be approved to run on another, under another instance, or with another `--set`. It now also hashes the arguments, each node's definition, each unit's data and resolved worker, the routing policy revision and `agent_budget`. A plan whose units resolve to different workers shows `several` instead of the first unit's.
+
+**`make check` passes on macOS.** The clone test compared against the temp directory as given. `root add` canonicalizes it, and macOS's `/var` is a symlink to `/private/var`.
+
+### Security
+
+**`pma pr` and `pma push` publish one commit of the approved tree, and none of the agent's commits.** Publishing kept every commit the agent made since the base, and review shows only the net diff. A file committed and then deleted, such as a key read from `~/.ssh`, was pushed in history without anyone reading it. The commit is still made with `git commit` on the base, so the user's hooks run.
+
 ## [0.6.0]
 
 Upgrading from 0.5:

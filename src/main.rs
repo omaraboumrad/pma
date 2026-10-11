@@ -2953,7 +2953,7 @@ fn workflow_command(action: Option<WorkflowAction>) -> Result<()> {
                             })
                             .collect();
                         let (rules, plan) =
-                            pass::plan_over(&store, &cfg, &over, &w, &units, &moves)?;
+                            pass::plan_over(&store, &cfg, &over, &w, &args, &units, &moves)?;
                         println!(
                             "`{name}` over {} unit(s), at most ${:.2} in all",
                             units.len(),
@@ -2996,7 +2996,7 @@ fn workflow_command(action: Option<WorkflowAction>) -> Result<()> {
             }
 
             if dry_run {
-                let (rules, plan) = pass::plan(&store, &cfg, &over, &w, instance)?;
+                let (rules, plan) = pass::plan(&store, &cfg, &over, &w, &args, instance)?;
                 warn_unrouted(&store, &w)?;
                 print_dry_run(&rules, &plan);
                 return Ok(());

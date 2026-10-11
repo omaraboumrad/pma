@@ -170,6 +170,9 @@ impl Planned {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Plan {
     pub steps: Vec<Planned>,
+    /// What the steps do not show but a run depends on: the arguments, each
+    /// node's definition, each unit's data and worker, the policy, the budget.
+    basis: String,
 }
 
 impl Plan {
@@ -182,10 +185,11 @@ impl Plan {
     }
 
     /// A short hash of what the plan runs: each node, its units, its worker
-    /// and its model. Approving by id means a pass runs what was printed and
-    /// nothing else; a frontier that changed has another id.
+    /// and its model, and the basis. Approving by id means a pass runs what
+    /// was printed and nothing else; a frontier, a target or an argument that
+    /// changed gives another id. Unit ids alone repeat across instances.
     pub fn id(&self) -> String {
-        let mut text = String::new();
+        let mut text = self.basis.clone();
         for p in &self.steps {
             text.push_str(&format!(
                 "{}\u{0}{}\u{0}{}\u{0}{}\n",
@@ -533,6 +537,7 @@ fn plan_of(
     over: &Overrides,
     policy: &Option<Active>,
     w: &Workflow,
+    args: &Value,
     ready: &[(String, Vec<WorkflowUnit>)],
 ) -> Result<Plan> {
     let mut room = match cfg.agent_budget > 0.0 {
@@ -540,6 +545,12 @@ fn plan_of(
         false => usize::MAX,
     };
     let mut steps = Vec::new();
+    let mut basis = format!(
+        "{}\u{0}{args}\u{0}{:?}\u{0}{}\n",
+        w.name,
+        policy.as_ref().map(|p| (p.revision, p.shadow)),
+        cfg.agent_budget
+    );
     for (name, units) in ready {
         let Some(node) = w.node(name) else { continue };
         if free(node) {
@@ -559,7 +570,26 @@ fn plan_of(
         let take = all.len().min(room);
         room -= take;
         let taken: Vec<WorkflowUnit> = all[..take].concat();
-        let (agent, model) = shown_worker(store, cfg, over, policy, node, &taken[0])?;
+        basis.push_str(&format!("{node:?}\n"));
+        let mut shown: Option<(String, Option<String>)> = None;
+        for u in &taken {
+            let (agent, model) = shown_worker(store, cfg, over, policy, node, u)?;
+            basis.push_str(&format!(
+                "{}\u{0}{}\u{0}{}\u{0}{}\u{0}{agent}\u{0}{}\n",
+                u.id,
+                u.ty,
+                u.project.as_deref().unwrap_or(""),
+                u.data,
+                model.as_deref().unwrap_or("")
+            ));
+            // Units in projects of other tiers can resolve apart.
+            shown = match shown {
+                None => Some((agent, model)),
+                Some(s) if s == (agent.clone(), model.clone()) => Some(s),
+                Some(_) => Some(("several".into(), None)),
+            };
+        }
+        let (agent, model) = shown.expect("a batch holds a unit");
         steps.push(Planned {
             node: name.clone(),
             op: node.op.name().to_string(),
@@ -569,7 +599,7 @@ fn plan_of(
             cost: take as f64 * cfg.agent_budget,
         });
     }
-    Ok(Plan { steps })
+    Ok(Plan { steps, basis })
 }
 
 /// The ready nodes of a bag, priced, whether or not the store holds it. What
@@ -580,6 +610,7 @@ pub fn plan_over(
     cfg: &Config,
     over: &Overrides,
     w: &Workflow,
+    args: &Value,
     units: &[WorkflowUnit],
     moves: &[(String, usize, bool)],
 ) -> Result<(Vec<Planned>, Plan)> {
@@ -599,7 +630,7 @@ pub fn plan_over(
             })
         })
         .collect();
-    let plan = plan_of(store, cfg, over, &policy, w, &ready)?;
+    let plan = plan_of(store, cfg, over, &policy, w, args, &ready)?;
     Ok((rules, plan))
 }
 
@@ -609,11 +640,12 @@ pub fn plan(
     cfg: &Config,
     over: &Overrides,
     w: &Workflow,
+    args: &Value,
     instance: i64,
 ) -> Result<(Vec<Planned>, Plan)> {
     let units = store.workflow_units(instance)?;
     let moves = store.workflow_moves(instance)?;
-    plan_over(store, cfg, over, w, &units, &moves)
+    plan_over(store, cfg, over, w, args, &units, &moves)
 }
 
 /// One line per node, priced. What the developer approves.
@@ -941,7 +973,7 @@ fn advance_inner(
             run_free(&ctx, node, waiting, &known)?;
             continue;
         }
-        let plan = plan_of(store, cfg, over, &ctx.policy, w, &ready)?;
+        let plan = plan_of(store, cfg, over, &ctx.policy, w, given.args, &ready)?;
         let id = plan.id();
         match approve.take() {
             Some(given) if !plan.is_empty() && given == id => {

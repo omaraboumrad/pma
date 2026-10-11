@@ -117,10 +117,11 @@ fn publish_one(home: &std::path::Path, cfg: &Config, run: &Run, target: Target) 
     }
     let message = message(cfg, run);
 
-    // Every attempt starts again from the approved head and tree. A failed
-    // publish leaves its commits, and verify its output, in the worktree; a
-    // retry that committed the worktree would publish what nobody read.
-    // `-B` also recovers an agent that switched branches.
+    // Every attempt builds one commit of the approved tree on the base. A
+    // failed publish leaves its commits, and verify its output, in the
+    // worktree; the agent's own commits hold whatever their history held,
+    // and review showed only the net diff. `-B` also recovers an agent that
+    // switched branches.
     wt_git(
         run,
         &[
@@ -129,14 +130,11 @@ fn publish_one(home: &std::path::Path, cfg: &Config, run: &Run, target: Target) 
             "--force",
             "-B",
             &run.branch,
-            approved_head,
+            &run.base,
         ],
     )?;
     wt_git(run, &["read-tree", "--reset", "-u", approved])?;
-    let staged = wt_git(run, &["diff", "--cached", "--quiet"]).is_err();
-    if staged {
-        wt_git(run, &["commit", "--quiet", "-m", &message])?;
-    }
+    wt_git(run, &["commit", "--quiet", "-m", &message])?;
     if target == Target::Push
         && let Err(e) = wt_git(run, &["rebase", "--quiet", &upstream])
     {
@@ -158,11 +156,7 @@ fn publish_one(home: &std::path::Path, cfg: &Config, run: &Run, target: Target) 
         if let Some(edited) = todo::mark_done(&text, &run.task_key, &run.text) {
             std::fs::write(&path, edited).map_err(|e| format!("{}: {e}", path.display()))?;
             wt_git(run, &["add", "TODO.md"])?;
-            if staged {
-                wt_git(run, &["commit", "--quiet", "--amend", "--no-edit"])?;
-            } else {
-                wt_git(run, &["commit", "--quiet", "-m", &message])?;
-            }
+            wt_git(run, &["commit", "--quiet", "--amend", "--no-edit"])?;
         }
     }
     if wt_git(run, &["rev-list", "--count", &format!("{upstream}..HEAD")])? == "0" {
