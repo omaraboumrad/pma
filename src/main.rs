@@ -647,6 +647,15 @@ enum WorkflowAction {
         /// it. A plan that has changed since is refused.
         #[arg(long, value_name = "PLAN")]
         approve: Option<String>,
+        /// Approve each plan as it is reached and run until the instance
+        /// finishes. `batch_budget` sizes each plan; the caps still hold.
+        #[arg(long, conflicts_with_all = ["approve", "dry_run"])]
+        unattended: bool,
+        /// Work from each clone's `HEAD`, never the remote, and write each
+        /// edit that passes verify into the clone as unstaged changes; one
+        /// that fails is discarded. Recorded on the instance.
+        #[arg(long, conflicts_with = "instance")]
+        local: bool,
         /// Raise a cap of a capped instance and resume it: `--cap
         /// max_units=80`. Repeatable; recorded on the instance.
         #[arg(long = "cap", value_name = "NAME=N", requires = "instance")]
@@ -1840,6 +1849,7 @@ fn run_dispatch(
                 class: None,
                 details: None,
                 quadrant: Some(format!("{:?}", x.quadrant)),
+                local: false,
             });
         }
         let tasks = store.tasks()?;
@@ -1979,6 +1989,7 @@ fn run_dispatch(
                     key,
                     text,
                     gh,
+                    local: false,
                 });
             }
         }
@@ -2413,6 +2424,7 @@ fn run_campaign(name: &str, count: Option<usize>) -> Result<()> {
             details: (!campaign.description.trim().is_empty())
                 .then(|| format!("{}\n", campaign.description.trim_end())),
             quadrant: None,
+            local: false,
         });
     }
     if picks.is_empty() {
@@ -2842,6 +2854,8 @@ fn workflow_command(action: Option<WorkflowAction>) -> Result<()> {
             set,
             dry_run,
             approve,
+            unattended,
+            local,
             cap,
             agent,
             model,
@@ -2934,7 +2948,10 @@ fn workflow_command(action: Option<WorkflowAction>) -> Result<()> {
                             }
                         }
                     }
-                    let args = serde_json::to_value(w.bind(&set)?)?;
+                    let mut args = serde_json::to_value(w.bind(&set)?)?;
+                    if local {
+                        args["@local"] = serde_json::Value::Bool(true);
+                    }
                     let units = pass::root_units(&store, &doc, &name, &names)?;
                     // The per-unit ceiling was weighed at activation. What a
                     // pass spends is bounded by `batch_budget` and by the plan
@@ -3007,6 +3024,7 @@ fn workflow_command(action: Option<WorkflowAction>) -> Result<()> {
                 home: &home,
                 args: &args,
                 approve: approve.as_deref(),
+                unattended,
             };
             let outcome = pass::advance(&store, &cfg, &over, &doc, &w, instance, &given)?;
             for refused in &outcome.refused {
@@ -3014,6 +3032,9 @@ fn workflow_command(action: Option<WorkflowAction>) -> Result<()> {
             }
             if outcome.ran {
                 println!("the approved plan ran; `pma review` lists any edits it made");
+            }
+            for line in &outcome.landed {
+                println!("{line}");
             }
             if outcome.plan.is_empty() {
                 if outcome.waiting.is_empty() {

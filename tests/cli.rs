@@ -2950,6 +2950,107 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"did it","t
     );
 }
 
+/// `--local --unattended` runs every plan without an approval, starts each
+/// edit from the clone's working tree with no remote, and leaves only the
+/// edits that passed verify in the clone, unstaged. One at a time, each edit
+/// sees the ones before it, and two failures do not refuse a third finding.
+#[test]
+fn a_local_unattended_instance_leaves_verified_edits_unstaged() {
+    let s = Scratch::new("wflocal");
+    let worker = r#"#!/bin/sh
+case "$2" in
+  *"findings to "*)
+    out=$(printf '%s' "$2" | sed -n 's/.*findings to //p')
+    printf '[{"title":"greet"},{"title":"break"},{"title":"break2"},{"title":"append"}]' > "$out" ;;
+  *"Fix greet"*) echo hi > hello.txt; printf 'A\nb\nc\n\n' > notes.txt ;;
+  *"Fix append"*) echo more >> hello.txt ;;
+  *) rm -f hello.txt; echo x > other.txt ;;
+esac
+echo '{"type":"result","subtype":"success","is_error":false,"result":"ok","total_cost_usd":0.1}'
+"#;
+    let (env, _origin, alpha) = dispatch_env(&s, &[("claude", worker)]);
+    // A commit the remote never saw, and no remote to fetch from.
+    fs::write(alpha.join("local.txt"), "mine\n").unwrap();
+    // Changing its first line gives a diff whose last line is a blank
+    // context line: a single space.
+    fs::write(alpha.join("notes.txt"), "a\nb\nc\n\n").unwrap();
+    git(&alpha, &["add", "local.txt", "notes.txt"], None);
+    git(&alpha, &["commit", "-qm", "local"], None);
+    git(&alpha, &["remote", "remove", "origin"], None);
+    let head = git_out(&alpha, &["rev-parse", "HEAD"]);
+
+    let wf = s.0.join("review-fix.rhai");
+    fs::write(
+        &wf,
+        r#"
+        let graph = source("project")
+            .expand("review", "finding", 4, "Review `{name}`. Write findings to {out}")
+            .edit("fix", "verify", "Fix {title}.")
+            .output();
+        document(#{ finding: #{ fields: #{ title: req(line(200)) }}}, [
+            workflow("review-fix", graph, #{ caps: #{ max_units: 10, max_edits: 4 }}),
+        ])
+        "#,
+    )
+    .unwrap();
+    env.ok(&["config", "workflow_budget", "20"]);
+    env.ok(&["config", "max_parallel", "1"]);
+    env.ok(&["workflow", "propose", wf.to_str().unwrap()]);
+    env.ok(&["workflow", "activate", "1"]);
+
+    let (out, err, success) = env.run(&[
+        "workflow",
+        "run",
+        "review-fix",
+        "alpha",
+        "--local",
+        "--unattended",
+    ]);
+    assert!(success, "{err}\n{out}");
+    assert_eq!(
+        out.matches("approved unattended").count(),
+        2,
+        "the review plan, then the fix plan: {out}"
+    );
+    assert!(out.contains("nothing left to run"), "{out}");
+    assert!(out.contains("Fix greet.: applied"), "{out}");
+    assert!(
+        out.contains("Fix break.: discarded: verify failed"),
+        "{out}"
+    );
+    assert!(
+        out.contains("Fix break2.: discarded: verify failed"),
+        "{out}"
+    );
+    assert!(out.contains("Fix append.: applied"), "{out}");
+    assert!(!out.contains("refused"), "{out}");
+
+    // Both verified edits are in the working tree, unstaged, the second on
+    // top of the first; the failed ones left nothing.
+    assert_eq!(
+        fs::read_to_string(alpha.join("hello.txt")).unwrap(),
+        "hi\nmore\n"
+    );
+    assert!(!alpha.join("other.txt").exists());
+    assert_eq!(
+        fs::read_to_string(alpha.join("notes.txt")).unwrap(),
+        "A\nb\nc\n\n"
+    );
+    assert_eq!(
+        git_out(&alpha, &["status", "--porcelain"]),
+        " M notes.txt\n?? hello.txt\n"
+    );
+    assert_eq!(
+        git_out(&alpha, &["rev-parse", "HEAD"]),
+        head,
+        "nothing committed"
+    );
+    // Both edit runs are settled. The read node's run stays listed, as any
+    // read node's does.
+    let review = env.ok(&["review"]);
+    assert!(!review.contains("fix"), "{review}");
+}
+
 /// `caps.max_edits` bounds what one instance may change, and it is enforced
 /// where the edit is dispatched rather than only where it was estimated.
 #[test]

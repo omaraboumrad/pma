@@ -50,6 +50,11 @@ struct Ctx<'a> {
     /// The fetched head of each project's default branch, which the read
     /// nodes of a workflow that edits work from.
     bases: RefCell<BTreeMap<String, std::result::Result<String, String>>>,
+    /// The instance works from each clone's `HEAD` and writes a verified edit
+    /// into the clone, unstaged. Recorded on the instance as `@local`.
+    local: bool,
+    /// What happened to each edit written to, or discarded from, a clone.
+    landed: RefCell<Vec<String>>,
 }
 
 /// A policy revision in effect: its number, whether it is in shadow, and the
@@ -144,6 +149,9 @@ pub struct Invocation<'a> {
     pub home: &'a Path,
     pub args: &'a Value,
     pub approve: Option<&'a str>,
+    /// Approve every plan as it is reached, until the instance finishes or
+    /// waits. `batch_budget` still sizes each plan, and the caps still hold.
+    pub unattended: bool,
 }
 
 /// What one node of a plan would spend on.
@@ -222,6 +230,8 @@ pub struct Outcome {
     pub refused: Vec<String>,
     /// Whether an approved plan ran.
     pub ran: bool,
+    /// Each edit of a local instance: applied to its clone, or discarded.
+    pub landed: Vec<String>,
 }
 
 pub fn root_units(
@@ -954,6 +964,8 @@ fn advance_inner(
         refused: RefCell::new(Vec::new()),
         deferred: RefCell::new(BTreeSet::new()),
         bases: RefCell::new(BTreeMap::new()),
+        local: given.args.get("@local").and_then(Value::as_bool) == Some(true),
+        landed: RefCell::new(Vec::new()),
     };
     let mut approve = given.approve.map(String::from);
     let mut ran = false;
@@ -975,7 +987,14 @@ fn advance_inner(
         }
         let plan = plan_of(store, cfg, over, &ctx.policy, w, given.args, &ready)?;
         let id = plan.id();
-        match approve.take() {
+        let unattended = (given.unattended && !plan.is_empty()).then(|| {
+            println!(
+                "{}plan {id}: approved unattended",
+                describe(&plan.steps, "next: ")
+            );
+            id.clone()
+        });
+        match approve.take().or(unattended) {
             Some(given) if !plan.is_empty() && given == id => {
                 for step in &plan.steps {
                     let node = w.node(&step.node).expect("planned from the graph");
@@ -1014,6 +1033,7 @@ fn advance_inner(
                     waiting: holding(w, &units, &moves),
                     refused: ctx.refused.take(),
                     ran,
+                    landed: ctx.landed.take(),
                 });
             }
         }
@@ -1889,7 +1909,7 @@ struct Ran {
 /// finding names code the fix will see. Otherwise the clone's `HEAD`, which
 /// lets a review read local commits. Fetched once per project per pass.
 fn read_base(ctx: &Ctx<'_>, repo: &Path, project: &str) -> std::result::Result<String, String> {
-    if !ctx.w.effects.repo {
+    if !ctx.w.effects.repo || ctx.local {
         return Ok("HEAD".into());
     }
     if let Some(found) = ctx.bases.borrow().get(project) {
@@ -2629,119 +2649,156 @@ fn run_edit(ctx: &Ctx<'_>, node: &Node, units: &[WorkflowUnit], known: &Known) -
     };
     let mut known = known.clone();
     let mut edits = edits_made(ctx)?;
-    let mut queued: Vec<crate::store::Run> = Vec::new();
-    let mut driving: BTreeMap<i64, WorkflowUnit> = BTreeMap::new();
-    for unit in units {
-        if edits >= ctx.w.caps.max_edits {
-            return Err(capped(
-                &node.name,
-                format!(
-                    "instance {} has made {edits} edits, its `caps.max_edits`",
-                    ctx.instance
-                ),
-            ));
-        }
-        let Some(project) = unit.project.clone() else {
-            ctx.store
-                .atomically(|| route_failed(ctx, node, unit, "the unit names no project"))?;
-            continue;
-        };
-        let Some(row) = ctx.store.project(&project)? else {
-            let why = format!("no project `{project}`; `pma scan` first");
-            ctx.store
-                .atomically(|| route_failed(ctx, node, unit, &why))?;
-            continue;
-        };
-        // One counter per lineage, whatever node or lap spends it (W23).
-        let key = format!("workflow:{}:{}", ctx.instance, unit.root);
-        let spent = ctx.store.consumed_attempts(&project, &key)?;
-        if spent >= crate::dispatch::ATTEMPT_LIMIT {
-            let why = format!("{spent} attempts on this unit's lineage were used");
-            ctx.store
-                .atomically(|| route_failed(ctx, node, unit, &why))?;
-            continue;
-        }
-        let data: Value = serde_json::from_str(&unit.data).unwrap_or(Value::Null);
-        let task = fill(
-            &e.task,
-            &data,
-            &system_fields(unit, &known),
-            &ctx.params,
-            &[],
-        );
-        let pick = crate::dispatch::Pick {
-            workflow: Some(crate::dispatch::UnitRef {
-                instance: ctx.instance,
-                node: node.name.clone(),
-                unit: unit.id.clone(),
-                lap: unit.lap,
-            }),
-            project: project.clone(),
-            repo: row.path.clone(),
-            key,
-            text: summary(&task),
-            gh: None,
-            tier: row.tier,
-            class: None,
-            details: Some(task),
-            quadrant: None,
-        };
-        match crate::dispatch::prepare(ctx.store, ctx.home, ctx.cfg, ctx.over, &pick)? {
-            crate::dispatch::Prepared::Refused(why) => {
+    let all = ctx.store.workflow_units(ctx.instance)?;
+    // A local edit starts from the clone as the edits before it left it, so
+    // only `max_parallel` of them share a base.
+    let size = match ctx.local {
+        true => ctx.cfg.max_parallel.max(1) as usize,
+        false => units.len().max(1),
+    };
+    for chunk in units.chunks(size) {
+        let mut queued: Vec<crate::store::Run> = Vec::new();
+        let mut driving: BTreeMap<i64, WorkflowUnit> = BTreeMap::new();
+        for unit in chunk {
+            if edits >= ctx.w.caps.max_edits {
+                return Err(capped(
+                    &node.name,
+                    format!(
+                        "instance {} has made {edits} edits, its `caps.max_edits`",
+                        ctx.instance
+                    ),
+                ));
+            }
+            let Some(project) = unit.project.clone() else {
+                ctx.store
+                    .atomically(|| route_failed(ctx, node, unit, "the unit names no project"))?;
+                continue;
+            };
+            let Some(row) = ctx.store.project(&project)? else {
+                let why = format!("no project `{project}`; `pma scan` first");
                 ctx.store
                     .atomically(|| route_failed(ctx, node, unit, &why))?;
+                continue;
+            };
+            // One counter per lineage, whatever node or lap spends it (W23).
+            let key = format!("workflow:{}:{}", ctx.instance, lineage(&all, unit));
+            let spent = ctx.store.consumed_attempts(&project, &key)?;
+            if spent >= crate::dispatch::ATTEMPT_LIMIT {
+                let why = format!("{spent} attempts on this unit's lineage were used");
+                ctx.store
+                    .atomically(|| route_failed(ctx, node, unit, &why))?;
+                continue;
             }
-            crate::dispatch::Prepared::Queued(run) => {
-                edits += 1;
-                driving.insert(run.id, unit.clone());
-                queued.push(*run);
+            let data: Value = serde_json::from_str(&unit.data).unwrap_or(Value::Null);
+            let task = fill(
+                &e.task,
+                &data,
+                &system_fields(unit, &known),
+                &ctx.params,
+                &[],
+            );
+            let pick = crate::dispatch::Pick {
+                workflow: Some(crate::dispatch::UnitRef {
+                    instance: ctx.instance,
+                    node: node.name.clone(),
+                    unit: unit.id.clone(),
+                    lap: unit.lap,
+                }),
+                project: project.clone(),
+                repo: row.path.clone(),
+                key,
+                text: summary(&task),
+                gh: None,
+                tier: row.tier,
+                class: None,
+                details: Some(task),
+                quadrant: None,
+                local: ctx.local,
+            };
+            match crate::dispatch::prepare(ctx.store, ctx.home, ctx.cfg, ctx.over, &pick)? {
+                crate::dispatch::Prepared::Refused(why) => {
+                    ctx.store
+                        .atomically(|| route_failed(ctx, node, unit, &why))?;
+                }
+                crate::dispatch::Prepared::Queued(run) => {
+                    edits += 1;
+                    driving.insert(run.id, unit.clone());
+                    queued.push(*run);
+                }
             }
         }
-    }
-    if queued.is_empty() {
-        return Ok(());
-    }
-    let done = crate::dispatch::execute(ctx.store, ctx.home, ctx.cfg, ctx.over, queued, |_| {})?;
-    for run in done {
-        let Some(unit) = driving.get(&run.id) else {
-            continue;
-        };
-        // A run the batch budget refused never reached the agent, so its unit
-        // keeps its place in the frontier and the next plan names it again.
-        // Its worktree goes, or the branch would be in the way.
-        if run
-            .error
-            .as_deref()
-            .is_some_and(|e| e.starts_with(crate::dispatch::NOT_STARTED))
-        {
-            let _ = crate::dispatch::remove_worktree(&run.repo, &run.worktree, &run.branch);
+        if queued.is_empty() {
             continue;
         }
-        known.runs.insert(unit.id.clone(), run.id);
-        ctx.store.atomically(|| {
-            // The node's own check writes its verdict against the unit, under
-            // the rule's name, so a guard reads `@verify` rather than the run.
-            if let Some(rule) = &e.check {
-                let (verdict, detail) = match verdict_of(&run, rule) {
-                    Checked::Verdict(v, d) => (v, d),
-                    Checked::NotReady(why) => ("unknown".to_string(), Some(why)),
+        let done =
+            crate::dispatch::execute(ctx.store, ctx.home, ctx.cfg, ctx.over, queued, |_| {})?;
+        for mut run in done {
+            let Some(unit) = driving.get(&run.id) else {
+                continue;
+            };
+            // A run the batch budget refused never reached the agent, so its unit
+            // keeps its place in the frontier and the next plan names it again.
+            // Its worktree goes, or the branch would be in the way.
+            if run
+                .error
+                .as_deref()
+                .is_some_and(|e| e.starts_with(crate::dispatch::NOT_STARTED))
+            {
+                let _ = crate::dispatch::remove_worktree(&run.repo, &run.worktree, &run.branch);
+                continue;
+            }
+            known.runs.insert(unit.id.clone(), run.id);
+            if ctx.local {
+                let line = match crate::publish::land_local(ctx.store, ctx.home, &mut run) {
+                    Ok((_, said)) => format!("#{} {}: {said}", run.id, run.text),
+                    Err(e) => format!("#{} {}: left in `pma review`: {e}", run.id, run.text),
                 };
-                ctx.store.add_workflow_verdict(
-                    ctx.instance,
-                    &unit.id,
-                    rule,
-                    &verdict,
-                    detail.as_deref(),
-                )?;
-                known
-                    .verdicts
-                    .insert((unit.id.clone(), rule.clone()), verdict);
+                ctx.landed.borrow_mut().push(line);
             }
-            route_unit(ctx.store, ctx.instance, ctx.w, &node.name, unit, &known)?;
-            mark_handled(ctx.store, ctx.instance, ctx.w, &node.name, &unit.id)
-        })?;
+            ctx.store.atomically(|| {
+                // The node's own check writes its verdict against the unit, under
+                // the rule's name, so a guard reads `@verify` rather than the run.
+                if let Some(rule) = &e.check {
+                    let (verdict, detail) = match verdict_of(&run, rule) {
+                        Checked::Verdict(v, d) => (v, d),
+                        Checked::NotReady(why) => ("unknown".to_string(), Some(why)),
+                    };
+                    ctx.store.add_workflow_verdict(
+                        ctx.instance,
+                        &unit.id,
+                        rule,
+                        &verdict,
+                        detail.as_deref(),
+                    )?;
+                    known
+                        .verdicts
+                        .insert((unit.id.clone(), rule.clone()), verdict);
+                }
+                route_unit(ctx.store, ctx.instance, ctx.w, &node.name, unit, &known)?;
+                mark_handled(ctx.store, ctx.instance, ctx.w, &node.name, &unit.id)
+            })?;
+        }
     }
     Ok(())
+}
+
+/// The unit an edit's attempts count against: itself, or for a unit a lap
+/// minted, the unit the lap started from. Not the root: findings that one
+/// project yielded are separate tasks, and one exhausted lineage would refuse
+/// them all.
+fn lineage<'a>(all: &'a [WorkflowUnit], unit: &'a WorkflowUnit) -> &'a str {
+    let mut u = unit;
+    while u.lap > 0 {
+        match u
+            .parent
+            .as_deref()
+            .and_then(|p| all.iter().find(|x| x.id == p))
+        {
+            Some(parent) => u = parent,
+            None => break,
+        }
+    }
+    &u.id
 }
 
 /// Edits this instance has made, which is what `caps.max_edits` bounds.

@@ -2,7 +2,8 @@
 //! `pma push` commits a run and pushes it to the default branch, and `pma pr`
 //! commits it and opens a pull request. Both remove the worktree afterwards. A
 //! run with a pull request stays `pr-open`, holding its task, until the pull
-//! request is merged or closed.
+//! request is merged or closed. A third way, `land_local`, writes a verified
+//! run into its clone as unstaged changes and commits nothing.
 
 use std::process::Command;
 
@@ -70,6 +71,82 @@ pub fn publish(
         }
     }
     Ok(())
+}
+
+/// Writes a run that passed verify into its clone as unstaged changes, then
+/// removes its worktree; a run that did not pass is rejected. Nothing is
+/// staged or committed: the developer stages, commits or discards. Returns
+/// whether it was applied, with what to report. The patch stays in the run's
+/// log directory either way.
+pub fn land_local(store: &Store, home: &std::path::Path, run: &mut Run) -> Result<(bool, String)> {
+    let passed = run.state == RunState::Ready && run.verify_ok == Some(true) && run.error.is_none();
+    let refused = if !passed {
+        Some(match (&run.verify, run.verify_ok) {
+            (None, _) => format!("`{}` states no verify command", run.project),
+            (_, Some(false)) => "verify failed".to_string(),
+            _ => run
+                .error
+                .clone()
+                .unwrap_or_else(|| format!("run is {}", run.state.name())),
+        })
+    } else {
+        let tree = match &run.reviewed_tree {
+            Some(t) => t.clone(),
+            None => crate::dispatch::tree(run)?,
+        };
+        let dir = home.join("runs").join(run.id.to_string());
+        std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let file = dir.join("change.patch");
+        // Written by git rather than through `git`'s trimmed output, which
+        // drops a final context line that is a single space. The flags undo
+        // settings that make a diff `apply` cannot read.
+        let output = format!("--output={}", crate::dispatch::path_arg(&file)?);
+        wt_git(
+            run,
+            &[
+                "diff",
+                "--binary",
+                "--no-color",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--src-prefix=a/",
+                "--dst-prefix=b/",
+                &output,
+                &run.base,
+                &tree,
+            ],
+        )?;
+        if std::fs::metadata(&file).map_or(0, |m| m.len()) == 0 {
+            Some("no changes".to_string())
+        } else {
+            crate::dispatch::clone_unchanged(store, &run.repo)?;
+            // Without `--index`: the working tree only, all or nothing.
+            match crate::dispatch::git(
+                &run.repo,
+                &["apply", "--binary", crate::dispatch::path_arg(&file)?],
+            ) {
+                Ok(_) => None,
+                Err(e) => Some(format!(
+                    "does not apply to the clone: {e}; patch: {}",
+                    file.display()
+                )),
+            }
+        }
+    };
+    match refused {
+        None => {
+            remove_worktree(&run.repo, &run.worktree, &run.branch)?;
+            run.enter(RunState::Applied);
+            run.outcome = Some(format!("applied to {} unstaged", run.repo.display()));
+            store.update_run(run)?;
+            Ok((true, run.outcome.clone().unwrap_or_default()))
+        }
+        Some(why) => {
+            run.outcome = Some(format!("discarded: {why}"));
+            crate::dispatch::discard(store, run, false)?;
+            Ok((false, format!("discarded: {why}")))
+        }
+    }
 }
 
 fn publish_one(home: &std::path::Path, cfg: &Config, run: &Run, target: Target) -> Result<String> {

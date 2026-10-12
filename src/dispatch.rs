@@ -38,6 +38,9 @@ pub struct Pick {
     /// Extra prompt lines a campaign carries.
     pub details: Option<String>,
     pub quadrant: Option<String>,
+    /// Start from the clone's `HEAD` rather than the fetched default branch.
+    /// A local run never reaches the remote.
+    pub local: bool,
 }
 
 /// Which workflow unit a dispatch serves.
@@ -493,15 +496,23 @@ pub fn prepare(
     let repo = &pick.repo;
     // Before the fetch, which reads `url.*` and `core.sshCommand`.
     clone_unchanged(store, repo)?;
-    git(repo, &["fetch", "--quiet", "origin"])?;
-    let default_branch = scan::default_branch(repo).ok_or(scan::DEFAULT_BRANCH_UNKNOWN)?;
-    let base = git(
-        repo,
-        &[
-            "rev-parse",
-            &format!("refs/remotes/origin/{default_branch}"),
-        ],
-    )?;
+    let (default_branch, base) = if pick.local {
+        (
+            git(repo, &["rev-parse", "--abbrev-ref", "HEAD"])?,
+            working_tree_commit(repo)?,
+        )
+    } else {
+        git(repo, &["fetch", "--quiet", "origin"])?;
+        let default_branch = scan::default_branch(repo).ok_or(scan::DEFAULT_BRANCH_UNKNOWN)?;
+        let base = git(
+            repo,
+            &[
+                "rev-parse",
+                &format!("refs/remotes/origin/{default_branch}"),
+            ],
+        )?;
+        (default_branch, base)
+    };
     let refuse = |why: String| Ok(Prepared::Refused(format!("{}: {why}", pick.project)));
 
     let (details, tags) = match pick.key.as_str() {
@@ -617,6 +628,54 @@ pub fn prepare(
         let _ = remove_worktree(repo, &worktree, &branch);
     }
     prepared
+}
+
+/// A commit of the clone's working tree, untracked files included and ignored
+/// ones not, on top of `HEAD`. A local edit starts from it, so it sees the
+/// developer's uncommitted work and the edits applied before it, and its patch
+/// applies to the tree it was made from. Built in a temporary index, so the
+/// clone's index, refs and files are untouched; `HEAD` when nothing differs.
+fn working_tree_commit(repo: &Path) -> Result<String> {
+    let head = git(repo, &["rev-parse", "HEAD"])?;
+    let index = std::env::temp_dir().join(format!(
+        "pma-index-{}-{}",
+        std::process::id(),
+        crate::dates::now()
+    ));
+    let run = |args: &[&str]| -> Result<String> {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["-c", "core.fsmonitor=false"])
+            .args(args)
+            .env("GIT_INDEX_FILE", &index)
+            .env("GIT_AUTHOR_NAME", "pma")
+            .env("GIT_AUTHOR_EMAIL", "pma@localhost")
+            .env("GIT_COMMITTER_NAME", "pma")
+            .env("GIT_COMMITTER_EMAIL", "pma@localhost")
+            .output()
+            .map_err(|e| format!("git: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "git {}: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            )
+            .into());
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+    let built = (|| {
+        run(&["read-tree", &head])?;
+        run(&["add", "--all"])?;
+        let tree = run(&["write-tree"])?;
+        if tree == run(&["rev-parse", &format!("{head}^{{tree}}")])? {
+            return Ok(head.clone());
+        }
+        run(&["commit-tree", &tree, "-p", &head, "-m", "pma: working tree"])
+    })();
+    let _ = std::fs::remove_file(&index);
+    built
 }
 
 /// The part of `prepare` that runs once the worktree exists.
@@ -767,7 +826,7 @@ fn queue(
     Ok(Prepared::Queued(Box::new(run)))
 }
 
-fn path_arg(path: &Path) -> Result<&str> {
+pub fn path_arg(path: &Path) -> Result<&str> {
     path.to_str()
         .ok_or_else(|| format!("{} is not valid UTF-8", path.display()).into())
 }
@@ -1519,6 +1578,30 @@ pub fn approve(store: &Store, run: &mut Run, by: &str) -> Result<()> {
 /// snapshot again, so rejecting does not quietly lift what `clone_unchanged`
 /// holds.
 pub fn reject(store: &Store, run: &mut Run, keep: bool, infra: bool) -> Result<()> {
+    discard(store, run, keep)?;
+    run.infra = infra;
+    store.update_run(run)?;
+    let attempts = store.attempts(Some(run.id))?;
+    if infra {
+        // The checks this run failed judged the infrastructure, not the task.
+        let failed = attempts
+            .iter()
+            .filter(|a| a.verify_ok == Some(false))
+            .count() as i64;
+        store.refund_attempts(&run.project, &attempt_key(run), failed)?;
+    } else if !attempts.is_empty() {
+        // A reviewer who refuses the work has judged the task, whatever
+        // verify made of it. A run that never started has no work to judge.
+        store.consume_attempt(&run.project, &attempt_key(run))?;
+    }
+    Ok(())
+}
+
+/// Removes a run's worktree and marks it rejected, consuming no attempt: what
+/// `reject` does before a reviewer's judgement is counted. A local edit that
+/// failed verify was counted by verify; one that did not apply was judged by
+/// no one.
+pub fn discard(store: &Store, run: &mut Run, keep: bool) -> Result<()> {
     if run.state == RunState::PrOpen {
         return Err(format!(
             "run #{} has an open pull request; merge or close it: {}",
@@ -1553,22 +1636,7 @@ pub fn reject(store: &Store, run: &mut Run, keep: bool, infra: bool) -> Result<(
     }
     remove_worktree(&run.repo, &run.worktree, &run.branch)?;
     run.enter(RunState::Rejected);
-    run.infra = infra;
-    store.update_run(run)?;
-    let attempts = store.attempts(Some(run.id))?;
-    if infra {
-        // The checks this run failed judged the infrastructure, not the task.
-        let failed = attempts
-            .iter()
-            .filter(|a| a.verify_ok == Some(false))
-            .count() as i64;
-        store.refund_attempts(&run.project, &attempt_key(run), failed)?;
-    } else if !attempts.is_empty() {
-        // A reviewer who refuses the work has judged the task, whatever
-        // verify made of it. A run that never started has no work to judge.
-        store.consume_attempt(&run.project, &attempt_key(run))?;
-    }
-    Ok(())
+    store.update_run(run)
 }
 
 /// Runs the agent again in the same worktree with the reviewer's feedback.

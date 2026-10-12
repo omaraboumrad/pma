@@ -4,7 +4,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+**`pma workflow run --unattended` and `--local`.** `--unattended` approves each plan as it is reached and runs until the instance finishes or waits. Each plan is still sized by `batch_budget`, and the caps and the activated worst case still bound the instance. `--local` starts each edit from a commit of the clone's working tree, built in a temporary index, with no fetch and no remote. An edit that passes verify is written into the clone as unstaged changes, and one that fails is discarded; the run becomes `applied` or `rejected`, and its patch stays in `runs/<id>/change.patch`. Nothing is staged or committed. Edits run in groups of `max_parallel`, so at 1 each sees the ones applied before it; edits in one group share a base, and one that no longer applies is discarded with that reason. A discard consumes no attempt beyond what verify consumed.
+
+```sh
+pma workflow run review-fix myproject --local --unattended
+```
+
 ### Fixed
+
+**A workflow edit's attempts are counted per unit, not per root.** The counter was keyed on `workflow:<instance>:<root>`, and every finding a review yields shares the project unit as its root. Two failed or rejected fixes in one project then refused every other finding from it. The key is now the unit itself, or for a lap's unit, the unit the lap started from.
 
 **A workflow plan id names its target and arguments.** It hashed each node's units by id, and root unit ids are `u1..uN` in every instance. So a plan printed for one project could be approved to run on another, under another instance, or with another `--set`. It now also hashes the arguments, each node's definition, each unit's data and resolved worker, the routing policy revision and `agent_budget`. A plan whose units resolve to different workers shows `several` instead of the first unit's.
 

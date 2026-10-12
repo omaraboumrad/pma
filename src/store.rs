@@ -2191,10 +2191,13 @@ pub enum RunState {
     Merged,
     /// Its pull request was closed without merging.
     Closed,
+    /// Written into its clone as unstaged changes, for the developer to
+    /// stage and commit, or discard.
+    Applied,
 }
 
 impl RunState {
-    const ALL: [(&'static str, RunState); 10] = [
+    const ALL: [(&'static str, RunState); 11] = [
         ("queued", RunState::Queued),
         ("running", RunState::Running),
         ("ready", RunState::Ready),
@@ -2205,6 +2208,7 @@ impl RunState {
         ("pushed", RunState::Pushed),
         ("merged", RunState::Merged),
         ("closed", RunState::Closed),
+        ("applied", RunState::Applied),
     ];
 
     pub fn name(self) -> &'static str {
@@ -2222,7 +2226,11 @@ impl RunState {
     pub fn is_final(self) -> bool {
         matches!(
             self,
-            RunState::Rejected | RunState::Pushed | RunState::Merged | RunState::Closed
+            RunState::Rejected
+                | RunState::Pushed
+                | RunState::Merged
+                | RunState::Closed
+                | RunState::Applied
         )
     }
 
