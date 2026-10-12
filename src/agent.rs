@@ -139,7 +139,7 @@ const WATCHDOG: &str = r#"exec 3<&0 0</dev/null; "$@" 3<&- & pid=$!; { read _ <&
 ///
 /// The sandbox wraps the watchdog's own `sh`: on Linux it is a `pre_exec`
 /// hook on that `Command`, which rebuilding `cmd` below would drop.
-fn spawn_guarded(
+pub fn spawn_guarded(
     cmd: Command,
     sandbox: Option<&Policy>,
     log: &Path,

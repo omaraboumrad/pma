@@ -23,7 +23,7 @@ use crate::worker::{Parser, Worker};
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
-const VERSION: i64 = 31;
+const VERSION: i64 = 33;
 
 const SCHEMA: &str = "
 CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -304,6 +304,33 @@ CREATE TABLE campaign_members (
     project TEXT NOT NULL,
     run_id INTEGER,
     PRIMARY KEY (campaign, project)
+);
+";
+
+/// Version 33. The command a job that stopped at a workflow plan would run
+/// to approve it, as a JSON array. And the `claude` worker streams its
+/// events, unless its row was edited: `pma watch` reads them.
+const JOB_APPROVAL_AND_STREAM: &str = r#"
+ALTER TABLE jobs ADD COLUMN awaiting TEXT;
+UPDATE agents
+SET args = '["-p","{prompt}","--output-format","stream-json","--verbose","--permission-mode","acceptEdits","--model","{model}","--max-budget-usd","{budget}","{extra}"]'
+WHERE name = 'claude'
+  AND args = '["-p","{prompt}","--output-format","json","--permission-mode","acceptEdits","--model","{model}","--max-budget-usd","{budget}","{extra}"]';
+"#;
+
+/// Version 32. A `pma` command queued to run detached, with what became of
+/// it. `args` is a JSON array, run as `pma <args>` in `cwd`.
+const JOBS: &str = "
+CREATE TABLE jobs (
+    id INTEGER PRIMARY KEY,
+    args TEXT NOT NULL,
+    cwd TEXT NOT NULL,
+    state TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    started_at INTEGER,
+    finished_at INTEGER,
+    pid INTEGER,
+    exit_code INTEGER
 );
 ";
 
@@ -597,7 +624,13 @@ pub struct Session {
 impl Session {
     /// `None` when another process holds the lock.
     pub fn try_acquire(dir: &Path) -> Result<Option<Session>> {
-        let path = dir.join("session.lock");
+        Session::try_lock(dir, "session.lock")
+    }
+
+    /// The same exclusive lock on another file in `dir`, such as the job
+    /// runner's.
+    pub fn try_lock(dir: &Path, name: &str) -> Result<Option<Session>> {
+        let path = dir.join(name);
         let io = |e: std::io::Error| format!("{}: {e}", path.display());
         let mut file = OpenOptions::new()
             .write(true)
@@ -721,6 +754,8 @@ impl Store {
                     REVIEWED_TREE,
                     VERIFY_BASE_SANDBOX,
                     INFRA_REJECTION,
+                    JOBS,
+                    JOB_APPROVAL_AND_STREAM,
                 ];
                 let tx = conn.unchecked_transaction()?;
                 for step in &steps[version as usize..] {
@@ -1132,6 +1167,123 @@ impl Store {
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn add_job(&self, args: &[String], cwd: &Path) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO jobs (args, cwd, state, created_at) VALUES (?1, ?2, 'queued', ?3)",
+            params![
+                serde_json::to_string(args)?,
+                cwd.to_string_lossy(),
+                crate::dates::now()
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// The newest `limit` jobs, newest first.
+    pub fn jobs(&self, limit: i64) -> Result<Vec<Job>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {JOB_COLUMNS} FROM jobs ORDER BY id DESC LIMIT ?1"
+        ))?;
+        let rows = stmt.query_map([limit], job_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn job(&self, id: i64) -> Result<Job> {
+        self.conn
+            .query_row(
+                &format!("SELECT {JOB_COLUMNS} FROM jobs WHERE id = ?1"),
+                [id],
+                job_row,
+            )
+            .optional()?
+            .ok_or_else(|| format!("no job {id}; `pma job` lists them").into())
+    }
+
+    /// Marks the oldest queued job running and returns it.
+    pub fn claim_job(&self) -> Result<Option<Job>> {
+        let Some(id) = self
+            .conn
+            .query_row(
+                "SELECT id FROM jobs WHERE state = 'queued' ORDER BY id LIMIT 1",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        self.conn.execute(
+            "UPDATE jobs SET state = 'running', started_at = ?2 WHERE id = ?1 AND state = 'queued'",
+            params![id, crate::dates::now()],
+        )?;
+        self.job(id).map(Some)
+    }
+
+    /// Records what would approve the plan a job stopped at.
+    pub fn set_job_awaiting(&self, id: i64, args: &[String]) -> Result<()> {
+        self.conn.execute(
+            "UPDATE jobs SET awaiting = ?2 WHERE id = ?1",
+            params![id, serde_json::to_string(args)?],
+        )?;
+        Ok(())
+    }
+
+    /// Marks an awaiting job approved. False if it was not awaiting.
+    pub fn approve_job(&self, id: i64) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE jobs SET state = 'approved' WHERE id = ?1 AND state = 'awaiting-approval'",
+            [id],
+        )? > 0)
+    }
+
+    pub fn set_job_pid(&self, id: i64, pid: u32) -> Result<()> {
+        self.conn
+            .execute("UPDATE jobs SET pid = ?2 WHERE id = ?1", params![id, pid])?;
+        Ok(())
+    }
+
+    /// Records how a job ended. A job stopped while it ran stays `stopped`.
+    pub fn finish_job(&self, id: i64, exit_code: Option<i32>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE jobs SET finished_at = ?2, exit_code = ?3,
+                 state = CASE WHEN state = 'stopped' THEN 'stopped'
+                              WHEN ?3 = 0 AND awaiting IS NOT NULL THEN 'awaiting-approval'
+                              WHEN ?3 = 0 THEN 'done' ELSE 'failed' END
+             WHERE id = ?1",
+            params![id, crate::dates::now(), exit_code],
+        )?;
+        Ok(())
+    }
+
+    /// Returns the state the job was in. Only a queued or running job stops.
+    pub fn stop_job(&self, id: i64) -> Result<String> {
+        let job = self.job(id)?;
+        if matches!(job.state.as_str(), "queued" | "running") {
+            self.conn.execute(
+                "UPDATE jobs SET state = 'stopped', finished_at = ?2 WHERE id = ?1",
+                params![id, crate::dates::now()],
+            )?;
+        }
+        Ok(job.state)
+    }
+
+    /// Jobs left `running` by a runner that exited. Called under the runner
+    /// lock, so no live runner holds them.
+    pub fn fail_running_jobs(&self) -> Result<usize> {
+        Ok(self.conn.execute(
+            "UPDATE jobs SET state = 'failed', finished_at = ?1 WHERE state = 'running'",
+            [crate::dates::now()],
+        )?)
+    }
+
+    pub fn has_queued_jobs(&self) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT count(*) FROM jobs WHERE state = 'queued'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )? > 0)
     }
 
     pub fn add_note(&self, text: &str, now: i64) -> Result<i64> {
@@ -2165,6 +2317,46 @@ impl Store {
     }
 }
 
+/// A `pma` command queued to run detached.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Job {
+    pub id: i64,
+    pub args: Vec<String>,
+    pub cwd: PathBuf,
+    /// `queued`, `running`, `done`, `failed` or `stopped`.
+    pub state: String,
+    pub created_at: i64,
+    pub started_at: Option<i64>,
+    pub finished_at: Option<i64>,
+    /// The process group leader of a running job.
+    pub pid: Option<i64>,
+    pub exit_code: Option<i64>,
+    /// For a job that stopped at a workflow plan: the arguments that approve
+    /// it, which `pma job approve` queues.
+    pub awaiting: Option<Vec<String>>,
+}
+
+const JOB_COLUMNS: &str =
+    "id, args, cwd, state, created_at, started_at, finished_at, pid, exit_code, awaiting";
+
+fn job_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
+    let args: String = r.get(1)?;
+    Ok(Job {
+        id: r.get(0)?,
+        args: serde_json::from_str(&args).unwrap_or_default(),
+        cwd: PathBuf::from(r.get::<_, String>(2)?),
+        state: r.get(3)?,
+        created_at: r.get(4)?,
+        started_at: r.get(5)?,
+        finished_at: r.get(6)?,
+        pid: r.get(7)?,
+        exit_code: r.get(8)?,
+        awaiting: r
+            .get::<_, Option<String>>(9)?
+            .and_then(|a| serde_json::from_str(&a).ok()),
+    })
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Note {
     pub id: i64,
@@ -2927,6 +3119,36 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Schema 33 moves a `claude` row still on the shipped template to
+    /// `stream-json`, which `pma watch` reads, and leaves an edited row alone.
+    #[test]
+    fn the_claude_template_moves_to_stream_json_unless_edited() {
+        let old = r#"["-p","{prompt}","--output-format","json","--permission-mode","acceptEdits","--model","{model}","--max-budget-usd","{budget}","{extra}"]"#;
+        for (args, streams) in [(old, true), (r#"["-p","{prompt}"]"#, false)] {
+            let dir = scratch("stream-json");
+            let path = dir.join("p.db");
+            {
+                let store = Store::open(&path).unwrap();
+                store
+                    .conn
+                    .execute_batch("ALTER TABLE jobs DROP COLUMN awaiting;")
+                    .unwrap();
+                store
+                    .conn
+                    .execute("UPDATE agents SET args = ?1 WHERE name = 'claude'", [args])
+                    .unwrap();
+                store.conn.pragma_update(None, "user_version", 32).unwrap();
+            }
+            let store = Store::open(&path).unwrap();
+            let got = store.agent("claude").unwrap().args;
+            assert_eq!(got.contains(&"stream-json".to_string()), streams, "{got:?}");
+            if streams {
+                assert_eq!(got, Worker::claude().args);
+            }
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
     /// A worker that named a model before presets existed keeps that pairing:
     /// it becomes a preset of the worker's name, and the default when that
     /// worker was the configured one.
@@ -2943,7 +3165,8 @@ mod tests {
                     "ALTER TABLE agents ADD COLUMN model TEXT;
                      ALTER TABLE runs DROP COLUMN git_snapshot;
                      ALTER TABLE runs DROP COLUMN reviewed_tree;
-                     ALTER TABLE runs DROP COLUMN infra;",
+                     ALTER TABLE runs DROP COLUMN infra;
+                     DROP TABLE jobs;",
                 )
                 .unwrap();
             store

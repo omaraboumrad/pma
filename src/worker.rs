@@ -16,8 +16,9 @@ use crate::agent::{Report, tail};
 /// How a worker's output is read back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Parser {
-    /// A `{"type":"result", ...}` line, as `claude -p --output-format json`
-    /// writes: success, error flag and `total_cost_usd`.
+    /// A `{"type":"result", ...}` line, the last that `claude -p
+    /// --output-format json` or `stream-json` writes: success, error flag
+    /// and `total_cost_usd`.
     ClaudeJson,
     /// No structured output. The exit status decides, the last lines are the
     /// summary, and the cost is unknown rather than zero.
@@ -340,8 +341,11 @@ impl Worker {
             args: [
                 "-p",
                 "{prompt}",
+                // One JSON record per event, so `pma watch` can read a run
+                // while it works. The last record is the same `result`.
                 "--output-format",
-                "json",
+                "stream-json",
+                "--verbose",
                 "--permission-mode",
                 "acceptEdits",
                 "--model",
@@ -509,7 +513,8 @@ mod tests {
                 "-p",
                 "do it",
                 "--output-format",
-                "json",
+                "stream-json",
+                "--verbose",
                 "--permission-mode",
                 "acceptEdits",
                 "--model",

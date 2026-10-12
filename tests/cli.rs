@@ -3051,6 +3051,189 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"ok","total
     assert!(!review.contains("fix"), "{review}");
 }
 
+/// Polls `pma job` until `done` holds for its output, or panics after
+/// `seconds`.
+fn wait_for_job(env: &Env, seconds: u64, done: impl Fn(&str) -> bool) -> String {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+    loop {
+        let jobs = env.ok(&["job"]);
+        if done(&jobs) {
+            return jobs;
+        }
+        assert!(std::time::Instant::now() < until, "timed out: {jobs}");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+const GREET: &str = r#"
+    let graph = source("project")
+        .edit("greet", "verify", "Say hello in hello.txt for `{name}`.")
+        .output();
+    document(#{}, [
+        workflow("greet", graph, #{ caps: #{ max_units: 10, max_edits: 1 }}),
+    ])
+"#;
+
+/// `--detach` queues the command and returns; a runner it started runs it
+/// to the end with no terminal, and `pma job` reports how it ended.
+#[test]
+fn a_detached_workflow_runs_to_the_end_in_the_background() {
+    let s = Scratch::new("detach");
+    let worker = r#"#!/bin/sh
+echo hi > hello.txt
+echo '{"type":"result","subtype":"success","is_error":false,"result":"ok","total_cost_usd":0.1}'
+"#;
+    let (env, _origin, alpha) = dispatch_env(&s, &[("claude", worker)]);
+    let wf = s.0.join("greet.rhai");
+    fs::write(&wf, GREET).unwrap();
+    env.ok(&["config", "workflow_budget", "20"]);
+    env.ok(&["workflow", "propose", wf.to_str().unwrap()]);
+    env.ok(&["workflow", "activate", "1"]);
+
+    let out = env.ok(&[
+        "workflow",
+        "run",
+        "greet",
+        "alpha",
+        "--local",
+        "--unattended",
+        "--detach",
+    ]);
+    assert!(out.contains("job 1 queued"), "{out}");
+
+    let jobs = wait_for_job(&env, 60, |j| {
+        !j.contains("queued") && !j.contains("running")
+    });
+    assert!(jobs.contains("#1") && jobs.contains("done"), "{jobs}");
+    assert!(
+        jobs.contains("pma workflow run greet alpha --local --unattended"),
+        "the command, less --detach: {jobs}"
+    );
+    let log = env.ok(&["job", "log", "1"]);
+    assert!(log.contains("nothing left to run"), "{log}");
+    assert_eq!(fs::read_to_string(alpha.join("hello.txt")).unwrap(), "hi\n");
+}
+
+/// Stopping a running job kills its process group, and the agent with it:
+/// the agent's watchdog sees its `pma` exit.
+#[test]
+fn stopping_a_running_job_kills_its_agent() {
+    let s = Scratch::new("jobstop");
+    let pidfile = s.0.join("agent.pid");
+    let worker = format!(
+        "#!/bin/sh\n\
+         echo '{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"tool_use\",\"name\":\"Bash\",\"input\":{{\"command\":\"make test\"}}}}]}}}}'\n\
+         echo $$ > {}\nexec sleep 60\n",
+        pidfile.display()
+    );
+    let (env, _origin, _alpha) = dispatch_env(&s, &[("claude", &worker)]);
+    let wf = s.0.join("greet.rhai");
+    fs::write(&wf, GREET).unwrap();
+    env.ok(&["config", "workflow_budget", "20"]);
+    env.ok(&["workflow", "propose", wf.to_str().unwrap()]);
+    env.ok(&["workflow", "activate", "1"]);
+    env.ok(&[
+        "workflow",
+        "run",
+        "greet",
+        "alpha",
+        "--local",
+        "--unattended",
+        "--detach",
+    ]);
+
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let pid = loop {
+        if let Ok(p) = fs::read_to_string(&pidfile)
+            && !p.trim().is_empty()
+        {
+            break p.trim().to_string();
+        }
+        assert!(std::time::Instant::now() < until, "the agent never started");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let alive = |pid: &str| {
+        command("kill")
+            .args(["-0", pid])
+            .status()
+            .unwrap()
+            .success()
+    };
+    assert!(alive(&pid));
+
+    // `pma watch` reads the running agent's log.
+    let watch = env.ok(&["watch", "--once"]);
+    assert!(watch.contains("job #1 running"), "{watch}");
+    assert!(
+        watch.contains("1 tool calls") && watch.contains("Bash: make test"),
+        "{watch}"
+    );
+
+    let out = env.ok(&["job", "stop", "1"]);
+    assert!(out.contains("job 1 stopped"), "{out}");
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while alive(&pid) {
+        assert!(
+            std::time::Instant::now() < until,
+            "the agent outlived its job"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let jobs = wait_for_job(&env, 10, |j| j.contains("stopped"));
+    assert!(!jobs.contains("running"), "{jobs}");
+}
+
+/// Without `--unattended`, a detached workflow stops at its plan and waits;
+/// `pma job approve` queues the approval with the flags the plan was priced
+/// at, and `notify` hears of each job's end.
+#[test]
+fn a_detached_job_waits_for_approval_and_notifies() {
+    let s = Scratch::new("jobapprove");
+    let worker = r#"#!/bin/sh
+echo hi > hello.txt
+echo '{"type":"result","subtype":"success","is_error":false,"result":"ok","total_cost_usd":0.1}'
+"#;
+    let (env, _origin, alpha) = dispatch_env(&s, &[("claude", worker)]);
+    let wf = s.0.join("greet.rhai");
+    fs::write(&wf, GREET).unwrap();
+    let heard = s.0.join("heard.log");
+    env.ok(&["config", "workflow_budget", "20"]);
+    env.ok(&[
+        "config",
+        "notify",
+        &format!("echo \"$PMA_JOB_ID $PMA_JOB_STATE\" >> {}", heard.display()),
+    ]);
+    env.ok(&["workflow", "propose", wf.to_str().unwrap()]);
+    env.ok(&["workflow", "activate", "1"]);
+
+    env.ok(&[
+        "workflow", "run", "greet", "alpha", "--local", "-m", "haiku", "--detach",
+    ]);
+    let jobs = wait_for_job(&env, 60, |j| j.contains("awaiting-approval"));
+    assert!(jobs.contains("pma job approve 1"), "{jobs}");
+    assert!(env.ok(&["job", "log", "1"]).contains("next: greet"));
+    assert!(!alpha.join("hello.txt").exists(), "nothing ran unapproved");
+
+    let out = env.ok(&["job", "approve", "1"]);
+    assert!(out.contains("job 2 queued"), "{out}");
+    assert!(
+        out.contains("-m haiku"),
+        "the plan was priced at haiku: {out}"
+    );
+    let (_, err, success) = env.run(&["job", "approve", "1"]);
+    assert!(!success && err.contains("not awaiting approval"), "{err}");
+
+    let jobs = wait_for_job(&env, 60, |j| j.contains("#2") && j.contains("done"));
+    assert!(jobs.contains("approved"), "job 1 is settled: {jobs}");
+    assert_eq!(fs::read_to_string(alpha.join("hello.txt")).unwrap(), "hi\n");
+    let log = env.ok(&["job", "log", "2"]);
+    assert!(log.contains("nothing left to run"), "{log}");
+    assert_eq!(
+        fs::read_to_string(&heard).unwrap(),
+        "1 awaiting-approval\n2 done\n"
+    );
+}
+
 /// `caps.max_edits` bounds what one instance may change, and it is enforced
 /// where the edit is dispatched rather than only where it was estimated.
 #[test]

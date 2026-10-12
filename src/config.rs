@@ -42,6 +42,9 @@ pub struct Config {
     pub workflow_budget: f64,
     /// Minutes an agent run, or a verify run, may take.
     pub timeout: i64,
+    /// A shell command run when a detached job ends, with `PMA_JOB_ID`,
+    /// `PMA_JOB_STATE` and `PMA_JOB_SUMMARY` set.
+    pub notify: Option<String>,
     pub projects: BTreeMap<String, ProjectSettings>,
 }
 
@@ -103,6 +106,7 @@ impl Default for Config {
             agent_budget: 1.0,
             workflow_budget: 25.0,
             timeout: 30,
+            notify: None,
             projects: BTreeMap::new(),
         }
     }
@@ -216,6 +220,7 @@ impl Config {
                 "agent_budget",
                 "workflow_budget",
                 "timeout",
+                "notify",
             ]
             .map(String::from),
         );
@@ -356,6 +361,7 @@ impl Config {
                 "agent_budget" => Slot::Number(&mut self.agent_budget, 0.0),
                 "workflow_budget" => Slot::Number(&mut self.workflow_budget, 0.0),
                 "timeout" => Slot::Count(&mut self.timeout, 1),
+                "notify" => Slot::OptText(&mut self.notify),
                 _ => return None,
             },
             Some(("tiers", t)) => Slot::Number(&mut self.tiers[tier(t)?], 0.0),
@@ -413,7 +419,7 @@ mod tests {
     #[test]
     fn every_key_reads_and_round_trips() {
         let keys = Config::keys();
-        assert_eq!(keys.len(), 31);
+        assert_eq!(keys.len(), 32);
         let defaults = Config::default();
         let mut copy = Config::default();
         for key in &keys {

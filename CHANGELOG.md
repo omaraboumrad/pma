@@ -12,6 +12,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 pma workflow run review-fix myproject --local --unattended
 ```
 
+**`--detach` on `pma dispatch` and `pma workflow run`, and `pma job`.** `--detach` queues the command and returns at once. A runner process, started on demand and holding `runner.lock`, runs queued jobs one at a time and exits when none is left; it outlives the terminal. `pma job` lists jobs, `pma job log <id>` prints one's output, and `pma job stop <id>` cancels a queued job or kills a running one. Each job runs as a child `pma` under the agent watchdog, so a killed job kills its agents and a dead runner kills its job. Opt-in rather than the default, so approval mode and scripts that read a command's output keep working. Schema 32. Design: `docs/dev/async_dispatch.md`.
+
+```sh
+pma workflow run review-fix myproject --local --unattended --detach
+pma job log 1
+```
+
+**`pma watch`, `pma job approve` and `notify`.** `pma watch` shows each running agent's tool calls, last tool and last words, read from its log, and redraws until nothing runs. The `claude` worker now writes `stream-json` so its log can be read mid-run; schema 33 updates a row still on the shipped template and leaves an edited one alone. A detached workflow without `--unattended` stops at its plan as `awaiting-approval`; `pma job approve <id>` queues the approval with the flags the plan was priced at. `pma config notify '<command>'` runs once per finished job with `PMA_JOB_ID`, `PMA_JOB_STATE` and `PMA_JOB_SUMMARY` set. Earlier binaries refuse a schema 33 database. Known gaps are listed under Remaining work in `docs/dev/async_dispatch.md`.
+
+```sh
+pma config notify 'notify-send pma "$PMA_JOB_SUMMARY"'
+pma watch
+```
+
 ### Fixed
 
 **A workflow edit's attempts are counted per unit, not per root.** The counter was keyed on `workflow:<instance>:<root>`, and every finding a review yields shares the project unit as its root. Two failed or rejected fixes in one project then refused every other finding from it. The key is now the unit itself, or for a lap's unit, the unit the lap started from.

@@ -11,6 +11,7 @@ mod config;
 mod dates;
 mod deps;
 mod dispatch;
+mod jobs;
 mod next;
 mod pass;
 mod progress;
@@ -26,6 +27,7 @@ mod store;
 mod sync;
 mod todo;
 mod tui;
+mod watch;
 mod worker;
 mod workflow;
 
@@ -48,10 +50,10 @@ const GROUPS: [(&str, &[&str]); 6] = [
         &["next", "scan", "matrix", "dispatch", "review", "pr", "push"],
     ),
     ("Tasks", &["lint", "prune", "stale", "sync", "note"]),
-    ("Reading", &["status", "report", "tui"]),
+    ("Reading", &["status", "report", "tui", "watch"]),
     ("Setup", &["root", "project", "config", "verify"]),
     ("Agents", &["agent", "preset", "route"]),
-    ("Many at once", &["campaign", "workflow"]),
+    ("Many at once", &["campaign", "workflow", "job"]),
 ];
 
 /// The template that leaves the command list to `grouped_commands`.
@@ -256,6 +258,9 @@ enum Command {
         /// Clear the named target's consumed attempts and dispatch it again.
         #[arg(long, conflicts_with = "auto")]
         retry: bool,
+        /// Queue the command and return at once; `pma job` follows it.
+        #[arg(long)]
+        detach: bool,
     },
     /// Runs awaiting a decision; show one, or act on it.
     Review {
@@ -377,6 +382,25 @@ enum Command {
     },
     /// Browse `pma next`, or the matrix, in the terminal.
     Tui,
+    /// Commands queued with `--detach`, newest first.
+    ///
+    /// `pma job log <id>` prints one's output, `pma job stop <id>` ends one,
+    /// and `pma job approve <id>` runs the plan a job stopped at.
+    Job {
+        #[command(subcommand)]
+        action: Option<JobAction>,
+    },
+    /// What running agents are doing, read from their logs.
+    ///
+    /// Redraws every 2 seconds until no job or agent is left running, or
+    /// prints once with --once.
+    Watch {
+        #[arg(long)]
+        once: bool,
+    },
+    /// Run queued jobs until none is left. `--detach` starts it.
+    #[command(hide = true)]
+    Runner,
     /// Mirror `Critical` items to GitHub Issues.
     ///
     /// Opens an issue per Critical item and writes `gh:N` into its line,
@@ -394,6 +418,16 @@ enum Command {
         #[arg(long)]
         apply: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum JobAction {
+    /// Print a job's output so far.
+    Log { id: i64 },
+    /// Stop a queued job, or kill a running one and its agents.
+    Stop { id: i64 },
+    /// Queue the approval of the plan a job stopped at.
+    Approve { id: i64 },
 }
 
 #[derive(Subcommand)]
@@ -656,6 +690,9 @@ enum WorkflowAction {
         /// that fails is discarded. Recorded on the instance.
         #[arg(long, conflicts_with = "instance")]
         local: bool,
+        /// Queue the command and return at once; `pma job` follows it.
+        #[arg(long, conflicts_with = "dry_run")]
+        detach: bool,
         /// Raise a cap of a capped instance and resume it: `--cap
         /// max_units=80`. Repeatable; recorded on the instance.
         #[arg(long = "cap", value_name = "NAME=N", requires = "instance")]
@@ -756,6 +793,9 @@ fn main() -> ExitCode {
             explain,
             all,
         } => show_status(&projects, &tags, explain, all),
+        Command::Dispatch { detach: true, .. } => {
+            Store::open_default().and_then(|store| jobs::enqueue(&store))
+        }
         Command::Dispatch {
             targets,
             agent,
@@ -765,6 +805,7 @@ fn main() -> ExitCode {
             auto,
             count,
             retry,
+            detach: false,
         } => overrides(agent, model, preset)
             .and_then(|over| run_dispatch(&targets, &tags, auto, count, retry, &over)),
         Command::Review {
@@ -808,6 +849,9 @@ fn main() -> ExitCode {
         Command::Note { action } => note(action),
 
         Command::Tui => run_tui(),
+        Command::Job { action } => run_job(action),
+        Command::Runner => jobs::run(),
+        Command::Watch { once } => run_watch(once),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -2856,11 +2900,15 @@ fn workflow_command(action: Option<WorkflowAction>) -> Result<()> {
             approve,
             unattended,
             local,
+            detach,
             cap,
             agent,
             model,
             preset,
         } => {
+            if detach {
+                return jobs::enqueue(&Store::open_default()?);
+            }
             let store = Store::open_default()?;
             // A pass runs agents and edits worktrees, so it holds the session
             // lock for its whole run, as `pma dispatch` does.
@@ -2869,6 +2917,13 @@ fn workflow_command(action: Option<WorkflowAction>) -> Result<()> {
             let cfg = load_config(&store)?;
             // The flags cover the whole pass and are not stored: a pass
             // resolves its worker exactly as a dispatch does.
+            // Kept for a job that stops at a plan: its approval must resolve
+            // the same worker, or the plan id differs.
+            let flags: Vec<String> = [("-a", &agent), ("-m", &model), ("-p", &preset)]
+                .into_iter()
+                .filter_map(|(f, v)| v.as_ref().map(|v| [f.to_string(), v.clone()]))
+                .flatten()
+                .collect();
             let over = overrides(agent, model, preset)?;
             // An instance is frozen at the revision it started under. Reading
             // the active revision instead would walk units one graph wrote
@@ -3055,6 +3110,19 @@ fn workflow_command(action: Option<WorkflowAction>) -> Result<()> {
                 return Ok(());
             }
             let plan = &outcome.plan;
+            if let Some(job) = jobs::current() {
+                let mut approve = vec![
+                    "workflow".to_string(),
+                    "run".into(),
+                    name.clone(),
+                    "--instance".into(),
+                    instance.to_string(),
+                    "--approve".into(),
+                    plan.id(),
+                ];
+                approve.extend(flags);
+                store.set_job_awaiting(job, &approve)?;
+            }
             print!("{}", pass::describe(&plan.steps, "next: "));
             println!(
                 "\nplan {}: at most ${:.2}. Nothing was spent on it. Approve it with \
@@ -3718,6 +3786,49 @@ fn note(action: Option<NoteAction>) -> Result<()> {
     Ok(())
 }
 
+fn run_watch(once: bool) -> Result<()> {
+    use std::io::IsTerminal;
+    let store = Store::open_default()?;
+    let state = store::state_home()?;
+    let tty = std::io::stdout().is_terminal();
+    loop {
+        let jobs = store.jobs(50)?;
+        let runs = store.runs()?;
+        let text = watch::screen(&state, &jobs, &runs, dates::now());
+        if tty && !once {
+            // Clear the screen and home the cursor.
+            print!("\x1b[2J\x1b[H");
+        }
+        print!("{text}");
+        let busy = jobs
+            .iter()
+            .any(|j| matches!(j.state.as_str(), "queued" | "running"))
+            || runs.iter().any(|r| r.state == store::RunState::Running);
+        if once || !busy {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+}
+
+fn run_job(action: Option<JobAction>) -> Result<()> {
+    let store = Store::open_default()?;
+    match action {
+        None => print!("{}", jobs::list(&store.jobs(20)?)),
+        Some(JobAction::Log { id }) => {
+            store.job(id)?;
+            let path = jobs::log_path(id)?;
+            match std::fs::read_to_string(&path) {
+                Ok(text) => print!("{text}"),
+                Err(_) => println!("job {id} has no output yet"),
+            }
+        }
+        Some(JobAction::Stop { id }) => println!("{}", jobs::stop(&store, id)?),
+        Some(JobAction::Approve { id }) => println!("{}", jobs::approve(&store, id)?),
+    }
+    Ok(())
+}
+
 fn run_tui() -> Result<()> {
     use std::io::IsTerminal;
     if !std::io::stdout().is_terminal() {
@@ -3748,7 +3859,8 @@ mod tests {
             .collect();
         for sub in command.get_subcommands() {
             let name = sub.get_name();
-            if name == "help" {
+            // A hidden command is kept out of the help on purpose.
+            if name == "help" || sub.is_hide_set() {
                 continue;
             }
             let count = grouped.iter().filter(|n| **n == name).count();

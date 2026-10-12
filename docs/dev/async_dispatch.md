@@ -1,6 +1,17 @@
 # Async dispatch
 
-Status: proposed, 2026-10-12. Nothing here is built.
+Status: phases 1-4 built, 2026-10-12.
+
+Where the build departs from the design below:
+
+- `--detach` is opt-in, not the default. Approval mode prints a plan and exits at once, and scripts read a command's stdout; both would change.
+- The runner does not hold `session.lock`. It runs each job as a child `pma <args>`, which takes the session as a foreground command does. The runner holds `runner.lock`, and waits for the session to be free before starting a job, so a foreground command does not fail the job.
+- Each job runs under the agent watchdog (`agent::spawn_guarded`). A dead runner kills its job; a killed job's agents die through their own watchdogs. `pma job stop` sends `SIGTERM` to the job's process group, so it kills runs in flight rather than letting them finish. Those runs are marked `failed` when the next session starts.
+- Progress has no `events.jsonl` and no heartbeat columns. The agent's log already is the event stream, so `pma watch` reads it when called: tool calls, the last tool, the last text, and the log's age. Nothing writes progress while a run works.
+- `pma watch` takes no job id. Jobs run one at a time, so every running agent belongs to the running job or to a foreground command.
+- Approval is `pma job approve <id>`, which queues the command the job recorded: `workflow run <name> --instance <n> --approve <plan>`, with the job's `-a`, `-m` and `-p` flags. The plan id hashes the resolved worker, so without them the plan is refused. The job learns its id from `PMA_JOB`, which the runner sets.
+- `notify` gets the summary in `PMA_JOB_SUMMARY`, with `PMA_JOB_ID` and `PMA_JOB_STATE`, not on stdin: `notify-send` reads arguments. It runs for 30 seconds at most, logged to `jobs/<id>.notify.log`.
+- Open questions 1-3 were answered by default: one job at a time, plain-text `pma job`, no notification unless `notify` is set.
 
 ## Problem
 
@@ -65,3 +76,53 @@ A job queue in SQLite, drained by a runner that `pma` spawns on demand. Progress
 2. `stream-json` for `claude`, `events.jsonl`, heartbeat columns, `pma watch`.
 3. `awaiting-approval` and re-queue on `--approve`.
 4. `notify`.
+
+## Remaining work
+
+As of 2026-10-13, most urgent first.
+
+### Before committing phases 1-4
+
+1. Run one real detached job. So far only fake agents in tests have run detached. `--detach`, `pma watch` and `notify` are unproven with a real `claude` run.
+   ```sh
+   pma workflow propose review-fix ~/.config/pma/review-fix.rhai
+   pma workflow activate review-fix 2
+   pma config max_parallel 1
+   pma workflow run review-fix <proj> --local --unattended -m claude-opus-5-5 --detach
+   pma watch
+   ```
+   The first command migrates the database from schema 31 to 33. Older binaries then refuse it.
+2. Review and commit. New: `src/jobs.rs`, `src/watch.rs`. Changed: `src/store.rs`, `src/main.rs`, `src/agent.rs`, `src/config.rs`, `src/worker.rs`, `tests/cli.rs`, `CHANGELOG.md`, `README.md`, this file.
+
+### xtgen (unstaged, needs a decision)
+
+- Fix #11 removes the int, atom, signal and sample param types. This is an API change.
+- `mx/external.c.mako` and `mx/dsp-external.c.mako` now initialise every param from `${p.c_initial}`. This assumes Max SDK `gensym`. The output has not been compiled.
+- The other instance 2 fixes are ready to review. All 82 tests pass.
+
+### Known defects
+
+| Issue | Effect | Fix size (estimate) |
+|-|-|-|
+| Read-node runs stay `ready` in `pma review` | A finished review looks unfinished | small |
+| Foreground `--approve` of a waiting job's plan leaves the job `awaiting-approval` | Its `job approve` then fails | small: mark the job `approved` when its plan runs |
+| Local fixes in one chunk conflict when `max_parallel` > 1 | The conflicting fix is discarded, using no attempt | medium: rebase onto the prior result, or keep 1 as the default |
+| The working-tree snapshot leaves a dangling commit in the clone | Disk use until `git gc` | ignore, or prune after the run |
+| `pma watch` parses only `claude` logs | Other workers show their last log line | defer until a second worker is in use |
+
+### Missing tests
+
+- `--unattended` without `--local`: auto-approve, then publish a branch or PR.
+
+### Open questions, answered by default
+
+- Concurrent jobs on different projects. Needs per-project locks and a shared `batch_budget` ledger.
+- `pma job --json`, if an agent rather than a person reads progress.
+
+### Older items
+
+- Pilot cohort: 1 of 20 runs shipped as of 2026-09-24. Finishing it is the milestone.
+- Agent sandbox and permissions: deferred until pma is tested. `sanduk` is the candidate.
+- `TODO.md` lost 62 lines on 2026-10-12, before this work. It looked like `pma prune --apply`. Confirm it was intended.
+
+Order: run the detached job, commit, then decide on xtgen. Real runs found 4 bugs so far, so run before adding features. Then fix foreground approval, since approval mode is required.

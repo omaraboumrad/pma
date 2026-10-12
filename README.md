@@ -230,6 +230,12 @@ pma workflow run review myproject -p claude-haiku
 pma workflow run triage myproject:critical --set severity=high
 pma workflow run triage --instance 3 --approve 3fa2c1e09b7d   # the plan it printed
 pma workflow run review-fix myproject --local --unattended   # no approvals; verified fixes left unstaged
+pma workflow run review-fix myproject --local --unattended --detach   # returns at once
+pma job                         # queued, running and finished jobs; `job log <id>`, `job stop <id>`
+pma job approve 3               # run the plan a detached job stopped at
+pma watch                       # each running agent's tool calls and last words
+pma config notify 'notify-send pma "$PMA_JOB_SUMMARY"'   # told when a job ends
+# design and known gaps: docs/dev/async_dispatch.md
 pma workflow run triage --instance 3 --cap max_units=80   # resume a capped instance
 pma workflow stop 3             # no further node; its runs stand
 pma workflow                    # revisions, and every instance with its state
