@@ -23,7 +23,7 @@ use crate::worker::{Parser, Worker};
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
-const VERSION: i64 = 33;
+const VERSION: i64 = 34;
 
 const SCHEMA: &str = "
 CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -305,6 +305,13 @@ CREATE TABLE campaign_members (
     run_id INTEGER,
     PRIMARY KEY (campaign, project)
 );
+";
+
+/// Version 34. A workflow node that is not an `edit` changes no files, so a
+/// run of one that finished is `done`, not `ready` for a review it cannot have.
+const READ_RUNS_DONE: &str = "
+UPDATE runs SET state = 'done'
+WHERE state = 'ready' AND branch = '' AND workflow_instance IS NOT NULL;
 ";
 
 /// Version 33. The command a job that stopped at a workflow plan would run
@@ -756,6 +763,7 @@ impl Store {
                     INFRA_REJECTION,
                     JOBS,
                     JOB_APPROVAL_AND_STREAM,
+                    READ_RUNS_DONE,
                 ];
                 let tx = conn.unchecked_transaction()?;
                 for step in &steps[version as usize..] {
@@ -1236,6 +1244,17 @@ impl Store {
             "UPDATE jobs SET state = 'approved' WHERE id = ?1 AND state = 'awaiting-approval'",
             [id],
         )? > 0)
+    }
+
+    /// Marks every job awaiting `plan` approved, once that plan has run by
+    /// any route. Plan ids are hex, so the quoted match is exact.
+    pub fn settle_jobs_awaiting(&self, plan: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE jobs SET state = 'approved'
+             WHERE state = 'awaiting-approval' AND instr(awaiting, '\"' || ?1 || '\"') > 0",
+            [plan],
+        )?;
+        Ok(())
     }
 
     pub fn set_job_pid(&self, id: i64, pid: u32) -> Result<()> {
@@ -2386,10 +2405,13 @@ pub enum RunState {
     /// Written into its clone as unstaged changes, for the developer to
     /// stage and commit, or discard.
     Applied,
+    /// A workflow node that is not an `edit` finished; its output became
+    /// units. It changed no files, so there is nothing to review.
+    Done,
 }
 
 impl RunState {
-    const ALL: [(&'static str, RunState); 11] = [
+    const ALL: [(&'static str, RunState); 12] = [
         ("queued", RunState::Queued),
         ("running", RunState::Running),
         ("ready", RunState::Ready),
@@ -2401,6 +2423,7 @@ impl RunState {
         ("merged", RunState::Merged),
         ("closed", RunState::Closed),
         ("applied", RunState::Applied),
+        ("done", RunState::Done),
     ];
 
     pub fn name(self) -> &'static str {
@@ -2423,6 +2446,7 @@ impl RunState {
                 | RunState::Merged
                 | RunState::Closed
                 | RunState::Applied
+                | RunState::Done
         )
     }
 
@@ -3147,6 +3171,34 @@ mod tests {
             }
             let _ = std::fs::remove_dir_all(dir);
         }
+    }
+
+    /// Only a workflow run with no branch, which a non-`edit` node made, is
+    /// moved from `ready` to `done`; a dispatched run still waits for review.
+    #[test]
+    fn a_ready_read_run_is_done_after_the_migration() {
+        let dir = scratch("read-runs");
+        let path = dir.join("p.db");
+        {
+            let store = Store::open(&path).unwrap();
+            for (branch, instance) in [("", Some(1)), ("pma/t", Some(1)), ("pma/u", None)] {
+                store
+                    .conn
+                    .execute(
+                        "INSERT INTO runs (project, task_key, text, agent, repo, branch, worktree,
+                                           default_branch, base, prompt, state, workflow_instance)
+                         VALUES ('p', 'k', 't', 'claude', '/k', ?1, '/w', 'main', 'b', 'p',
+                                 'ready', ?2)",
+                        params![branch, instance],
+                    )
+                    .unwrap();
+            }
+            store.conn.pragma_update(None, "user_version", 33).unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let states: Vec<_> = store.runs().unwrap().iter().map(|r| r.state).collect();
+        assert_eq!(states, [RunState::Done, RunState::Ready, RunState::Ready]);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// A worker that named a model before presets existed keeps that pairing:

@@ -212,6 +212,8 @@ A target naming one task fails if that task cannot run. A target naming many pas
 
 Each run gets a worktree of the remote default branch under `~/.local/state/pma/worktrees`, on a `pma/` branch. The item must be open in the remote `TODO.md`, so commit and push before dispatching. Set the test command with `pma config projects.myproject.verify "make check"`, or let it be detected. A check that must write elsewhere needs `pma config projects.myproject.sandbox off`.
 
+In a project with a `CHANGELOG.md`, the agent leaves that file alone and drafts one entry per separable change. `pma review <id>` shows the entries, or says none was drafted.
+
 A run opened with `pma pr` is `pr-open` until the pull request is merged or closed; `pma review` settles it and shows review activity meanwhile. A run published with `pma push` is `pushed`.
 
 Repeating work:

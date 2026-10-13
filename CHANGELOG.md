@@ -26,7 +26,13 @@ pma config notify 'notify-send pma "$PMA_JOB_SUMMARY"'
 pma watch
 ```
 
+**Agents draft changelog entries; pma keeps them out of the change.** In a project with a `CHANGELOG.md`, the agent is told not to edit it and to write one entry per separable change to `.pma/changelog.md`. pma moves the file to `runs/<id>/changelog.md` before the diff, and `pma review <id>` and a local apply show the entries or say none was drafted. A run without entries is flagged, not discarded. Drafting rather than editing `CHANGELOG.md` avoids conflicts between edits that run together.
+
 ### Fixed
+
+**A workflow review run is `done`, not left `ready`.** A run of a node that is not an `edit` changes no files and has its tree removed once its output is read, yet it stayed `ready` in `pma review`. Showing it then reported the removed tree as "tampered with" and advised rejecting the run. Such a run now ends `done`, which is final, and `pma review <id>` shows no diff for it. Schema 34 moves existing ones.
+
+**A plan approved in the foreground settles the job waiting on it.** A detached job that stopped at a plan stayed `awaiting-approval` if the plan was approved with `pma workflow run --approve`. A later `pma job approve` then queued a spent plan, which failed. A job's log now names `pma job approve <id>` rather than the foreground command, and either route marks the job `approved`.
 
 **A workflow edit's attempts are counted per unit, not per root.** The counter was keyed on `workflow:<instance>:<root>`, and every finding a review yields shares the project unit as its root. Two failed or rejected fixes in one project then refused every other finding from it. The key is now the unit itself, or for a lap's unit, the unit the lap started from.
 

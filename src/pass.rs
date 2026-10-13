@@ -2242,7 +2242,7 @@ fn record(
     run.cost_usd = ran.cost_usd;
     run.summary = Some(ran.summary);
     run.state = match &ran.produced {
-        Ok(_) => crate::store::RunState::Ready,
+        Ok(_) => crate::store::RunState::Done,
         Err(_) => crate::store::RunState::Failed,
     };
     run.error = ran.produced.as_ref().err().cloned();

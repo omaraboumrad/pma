@@ -137,7 +137,19 @@ pub fn land_local(store: &Store, home: &std::path::Path, run: &mut Run) -> Resul
         None => {
             remove_worktree(&run.repo, &run.worktree, &run.branch)?;
             run.enter(RunState::Applied);
-            run.outcome = Some(format!("applied to {} unstaged", run.repo.display()));
+            let draft = crate::dispatch::changelog_draft(home, run.id);
+            run.outcome = Some(match draft.is_file() {
+                true => format!(
+                    "applied to {} unstaged; changelog entries in {}",
+                    run.repo.display(),
+                    draft.display()
+                ),
+                false if crate::dispatch::wants_changelog(run) => format!(
+                    "applied to {} unstaged; no changelog entry drafted",
+                    run.repo.display()
+                ),
+                false => format!("applied to {} unstaged", run.repo.display()),
+            });
             store.update_run(run)?;
             Ok((true, run.outcome.clone().unwrap_or_default()))
         }

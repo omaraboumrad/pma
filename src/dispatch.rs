@@ -902,6 +902,21 @@ fn failed_ci_logs(
     Ok(Ok(logs))
 }
 
+/// Where an agent drafts changelog entries, relative to its worktree. pma
+/// moves the file out before any diff, so it is never part of the change.
+const CHANGELOG_DRAFT: &str = ".pma/changelog.md";
+
+/// Whether a run's agent is asked for changelog entries: its project keeps a
+/// `CHANGELOG.md`.
+pub fn wants_changelog(run: &Run) -> bool {
+    run.repo.join("CHANGELOG.md").is_file()
+}
+
+/// Where a run's drafted changelog entries are kept, outside its tree.
+pub fn changelog_draft(home: &Path, id: i64) -> PathBuf {
+    home.join("runs").join(id.to_string()).join("changelog.md")
+}
+
 fn prompt(run: &Run, details: &str, verify: Option<&str>) -> String {
     let mut p = format!(
         "You are working on the project `{}`, in a git worktree of it.\n\nTask: {}\n",
@@ -916,6 +931,13 @@ fn prompt(run: &Run, details: &str, verify: Option<&str>) -> String {
          - Leave your changes uncommitted. Do not commit, push, or switch branches.\n\
          - Do not edit TODO.md. pma marks the task done when the change is published.\n",
     );
+    if wants_changelog(run) {
+        p.push_str(&format!(
+            "- Do not edit CHANGELOG.md. Write one entry per separable change to \
+             `{CHANGELOG_DRAFT}`: a bold one-line title, then what went wrong and what \
+             changed. pma keeps it out of your change and shows it to the reviewer.\n"
+        ));
+    }
     if let Some(v) = verify {
         p.push_str(&format!(
             "- Run `{v}` to check your change. pma runs it again after you finish.\n"
@@ -1219,6 +1241,15 @@ fn attempt(
     }
     a.summary = Some(report.summary.clone());
     run.summary = Some(report.summary);
+    // A regular file only: a symlink could copy any file pma can read into
+    // the review.
+    let drafted = run.worktree.join(CHANGELOG_DRAFT);
+    if std::fs::symlink_metadata(&drafted).is_ok_and(|m| m.is_file())
+        && std::fs::copy(&drafted, logs.join("changelog.md")).is_ok()
+    {
+        let _ = std::fs::remove_file(&drafted);
+        let _ = std::fs::remove_dir(run.worktree.join(".pma"));
+    }
     // Before any git call in the tree: what follows would run under a config
     // or hooks the agent wrote.
     if let Err(e) = unchanged_git(run) {
@@ -1845,6 +1876,22 @@ mod tests {
         assert!(p.contains("Do not commit"));
         assert!(p.contains("Run `make test` to check your change."));
         assert!(!prompt(&run, "", None).contains("pma runs"));
+
+        let repo = std::env::temp_dir().join(format!("pma-changelog-{}", std::process::id()));
+        std::fs::create_dir_all(&repo).unwrap();
+        let run = Run {
+            repo: repo.clone(),
+            ..run
+        };
+        assert!(
+            !prompt(&run, "", None).contains("CHANGELOG.md"),
+            "the project keeps none"
+        );
+        std::fs::write(repo.join("CHANGELOG.md"), "# Changelog\n").unwrap();
+        let p = prompt(&run, "", None);
+        assert!(p.contains("Do not edit CHANGELOG.md"), "{p}");
+        assert!(p.contains("`.pma/changelog.md`"), "{p}");
+        let _ = std::fs::remove_dir_all(repo);
     }
 
     /// Only a run that reached the agent and failed its check says anything

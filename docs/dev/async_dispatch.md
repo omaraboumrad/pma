@@ -81,34 +81,24 @@ A job queue in SQLite, drained by a runner that `pma` spawns on demand. Progress
 
 As of 2026-10-13, most urgent first.
 
-### Before committing phases 1-4
+### First real run
 
-1. Run one real detached job. So far only fake agents in tests have run detached. `--detach`, `pma watch` and `notify` are unproven with a real `claude` run.
-   ```sh
-   pma workflow propose review-fix ~/.config/pma/review-fix.rhai
-   pma workflow activate review-fix 2
-   pma config max_parallel 1
-   pma workflow run review-fix <proj> --local --unattended -m claude-opus-5-5 --detach
-   pma watch
-   ```
-   The first command migrates the database from schema 31 to 33. Older binaries then refuse it.
-2. Review and commit. New: `src/jobs.rs`, `src/watch.rs`. Changed: `src/store.rs`, `src/main.rs`, `src/agent.rs`, `src/config.rs`, `src/worker.rs`, `tests/cli.rs`, `CHANGELOG.md`, `README.md`, this file.
+`review-fix` on `argdec`, instance 3, detached, in approval mode. 1 review and 6 fixes; all 6 passed verify and were applied unstaged. About $2.50.
 
-### xtgen (unstaged, needs a decision)
+Confirmed with a real agent: `--detach`, the runner, `pma job`, `job log`, two `job approve` cycles, settling a job by a foreground `--approve`, and `pma watch` reading `stream-json`.
 
-- Fix #11 removes the int, atom, signal and sample param types. This is an API change.
-- `mx/external.c.mako` and `mx/dsp-external.c.mako` now initialise every param from `${p.c_initial}`. This assumes Max SDK `gensym`. The output has not been compiled.
-- The other instance 2 fixes are ready to review. All 82 tests pass.
+Found and fixed: a review run stayed `ready`, and `pma review` called its removed tree "tampered with". Fix agents edited `CHANGELOG.md` unevenly (2 of 6). Every dispatched agent now drafts entries in `.pma/changelog.md`, which pma keeps out of the change and shows in `pma review`.
+
+Not yet run for real: `notify`, `--unattended --detach`, `job stop`.
 
 ### Known defects
 
 | Issue | Effect | Fix size (estimate) |
 |-|-|-|
-| Read-node runs stay `ready` in `pma review` | A finished review looks unfinished | small |
-| Foreground `--approve` of a waiting job's plan leaves the job `awaiting-approval` | Its `job approve` then fails | small: mark the job `approved` when its plan runs |
 | Local fixes in one chunk conflict when `max_parallel` > 1 | The conflicting fix is discarded, using no attempt | medium: rebase onto the prior result, or keep 1 as the default |
 | The working-tree snapshot leaves a dangling commit in the clone | Disk use until `git gc` | ignore, or prune after the run |
 | `pma watch` parses only `claude` logs | Other workers show their last log line | defer until a second worker is in use |
+| The review agent may not run code to confirm a finding | Findings rest on reading alone | a worker setting, not a code change |
 
 ### Missing tests
 
@@ -124,5 +114,3 @@ As of 2026-10-13, most urgent first.
 - Pilot cohort: 1 of 20 runs shipped as of 2026-09-24. Finishing it is the milestone.
 - Agent sandbox and permissions: deferred until pma is tested. `sanduk` is the candidate.
 - `TODO.md` lost 62 lines on 2026-10-12, before this work. It looked like `pma prune --apply`. Confirm it was intended.
-
-Order: run the detached job, commit, then decide on xtgen. Real runs found 4 bugs so far, so run before adding features. Then fix foreground approval, since approval mode is required.

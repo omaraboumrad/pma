@@ -355,7 +355,9 @@ fn attempt_lines(attempts: &[Attempt]) -> String {
     format!("\nattempts:\n{}", table(&rows, ""))
 }
 
-pub fn run_detail(run: &Run, attempts: &[Attempt], diff: &str) -> String {
+/// `changelog` is the run's drafted entries: `None` when its project keeps
+/// no `CHANGELOG.md`, empty when the agent drafted none.
+pub fn run_detail(run: &Run, attempts: &[Attempt], changelog: Option<&str>, diff: &str) -> String {
     let mut rows = vec![
         vec!["task".into(), run.text.clone()],
         vec![
@@ -464,6 +466,16 @@ pub fn run_detail(run: &Run, attempts: &[Attempt], diff: &str) -> String {
         for line in summary.lines() {
             out.push_str(&format!("  {line}\n").replace("  \n", "\n"));
         }
+    }
+    match changelog.map(str::trim) {
+        Some("") => out.push_str("\nchangelog: none drafted\n"),
+        Some(entries) => {
+            out.push_str("\nchangelog:\n");
+            for line in entries.lines() {
+                out.push_str(&format!("  {line}\n").replace("  \n", "\n"));
+            }
+        }
+        None => {}
     }
     let reasons = accept::review_reasons(run);
     if reasons.is_empty() {

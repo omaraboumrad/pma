@@ -2643,6 +2643,15 @@ fn an_agent_node_is_priced_then_run_on_approval() {
         "the unit carried on"
     );
 
+    // A review changes no files, so its run is done and waits on no one.
+    assert_eq!(run(&["review"]).0, "no runs to review\n");
+    let detail = run(&["review", "1"]).0;
+    assert!(detail.starts_with("#1 done"), "{detail}");
+    assert!(
+        detail.contains("(none: this node changes no files)"),
+        "{detail}"
+    );
+
     // The spend is recorded against the workflow, not loose in the run table.
     let report = run(&["report"]).0;
     assert!(
@@ -3232,6 +3241,127 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"ok","total
         fs::read_to_string(&heard).unwrap(),
         "1 awaiting-approval\n2 done\n"
     );
+}
+
+/// An agent drafts changelog entries in `.pma/changelog.md` rather than in
+/// `CHANGELOG.md`. pma keeps the file out of the change and shows it in
+/// `pma review`; a run that drafted none is flagged, not discarded.
+#[test]
+fn changelog_entries_are_drafted_beside_the_change() {
+    let s = Scratch::new("changelog");
+    let worker = r#"#!/bin/sh
+case "$2" in
+  *"findings to "*)
+    out=$(printf '%s' "$2" | sed -n 's/.*findings to //p')
+    printf '[{"title":"drafted"},{"title":"silent"}]' > "$out" ;;
+  *"Fix drafted"*".pma/changelog.md"*)
+    echo hi > hello.txt; mkdir -p .pma; printf '**Greets.** It said nothing.\n' > .pma/changelog.md ;;
+  *) echo more >> hello.txt ;;
+esac
+echo '{"type":"result","subtype":"success","is_error":false,"result":"ok","total_cost_usd":0.1}'
+"#;
+    let (env, _origin, alpha) = dispatch_env(&s, &[("claude", worker)]);
+    fs::write(alpha.join("CHANGELOG.md"), "# Changelog\n").unwrap();
+    git(&alpha, &["add", "CHANGELOG.md"], None);
+    git(&alpha, &["commit", "-qm", "changelog"], None);
+    let wf = s.0.join("review-fix.rhai");
+    fs::write(
+        &wf,
+        r#"
+        let graph = source("project")
+            .expand("review", "finding", 2, "Review `{name}`. Write findings to {out}")
+            .edit("fix", "verify", "Fix {title}.")
+            .output();
+        document(#{ finding: #{ fields: #{ title: req(line(200)) }}}, [
+            workflow("review-fix", graph, #{ caps: #{ max_units: 10, max_edits: 2 }}),
+        ])
+        "#,
+    )
+    .unwrap();
+    env.ok(&["config", "workflow_budget", "20"]);
+    env.ok(&["config", "max_parallel", "1"]);
+    env.ok(&["workflow", "propose", wf.to_str().unwrap()]);
+    env.ok(&["workflow", "activate", "1"]);
+
+    let out = env.ok(&[
+        "workflow",
+        "run",
+        "review-fix",
+        "alpha",
+        "--local",
+        "--unattended",
+    ]);
+    assert!(out.contains("Fix drafted.: applied"), "{out}");
+    assert!(out.contains("unstaged; changelog entries in"), "{out}");
+    assert!(
+        out.contains("Fix silent.: applied")
+            && out.contains("unstaged; no changelog entry drafted"),
+        "flagged, not discarded: {out}"
+    );
+    assert_eq!(
+        git_out(&alpha, &["status", "--porcelain", "--untracked-files=all"]),
+        "?? hello.txt\n",
+        "the draft is not part of the change"
+    );
+
+    let detail = env.ok(&["review", "2"]);
+    assert!(
+        detail.contains("changelog:\n  **Greets.** It said nothing.\n"),
+        "{detail}"
+    );
+    assert!(
+        env.ok(&["review", "3"]).contains("changelog: none drafted"),
+        "the run that drafted none says so"
+    );
+}
+
+/// A plan a job waits on may also be approved in the foreground. The job is
+/// then settled, so it no longer lists as awaiting or approves a spent plan.
+#[test]
+fn a_foreground_approval_settles_the_waiting_job() {
+    let s = Scratch::new("jobfgapprove");
+    let worker = r#"#!/bin/sh
+echo hi > hello.txt
+echo '{"type":"result","subtype":"success","is_error":false,"result":"ok","total_cost_usd":0.1}'
+"#;
+    let (env, _origin, alpha) = dispatch_env(&s, &[("claude", worker)]);
+    let wf = s.0.join("greet.rhai");
+    fs::write(&wf, GREET).unwrap();
+    env.ok(&["config", "workflow_budget", "20"]);
+    env.ok(&["workflow", "propose", wf.to_str().unwrap()]);
+    env.ok(&["workflow", "activate", "1"]);
+
+    env.ok(&[
+        "workflow", "run", "greet", "alpha", "--local", "-m", "haiku", "--detach",
+    ]);
+    wait_for_job(&env, 60, |j| j.contains("awaiting-approval"));
+    let log = env.ok(&["job", "log", "1"]);
+    assert!(log.contains("Approve it with `pma job approve 1`"), "{log}");
+    let at = log.find("\nplan ").expect("a plan") + "\nplan ".len();
+    let plan: String = log[at..]
+        .chars()
+        .take_while(|c| c.is_ascii_hexdigit())
+        .collect();
+
+    env.ok(&[
+        "workflow",
+        "run",
+        "greet",
+        "--instance",
+        "1",
+        "-m",
+        "haiku",
+        "--approve",
+        &plan,
+    ]);
+    assert_eq!(fs::read_to_string(alpha.join("hello.txt")).unwrap(), "hi\n");
+    let jobs = env.ok(&["job"]);
+    assert!(
+        jobs.contains("approved") && !jobs.contains("awaiting"),
+        "{jobs}"
+    );
+    let (_, err, success) = env.run(&["job", "approve", "1"]);
+    assert!(!success && err.contains("not awaiting approval"), "{err}");
 }
 
 /// `caps.max_edits` bounds what one instance may change, and it is enforced

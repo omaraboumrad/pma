@@ -2296,10 +2296,21 @@ fn run_review(
         // what was printed. A tree that moved meanwhile is not recorded.
         let approvable = matches!(run.state, RunState::Ready | RunState::Approved);
         let before = approvable.then(|| dispatch::tree(&run).ok()).flatten();
-        let diff = dispatch::diff(&run).unwrap_or_else(|e| format!("(no diff: {e})"));
+        // A workflow node that is not an `edit` has no branch, and its tree
+        // is gone once its output is read.
+        let diff = if run.branch.is_empty() {
+            "(none: this node changes no files)".to_string()
+        } else {
+            dispatch::diff(&run).unwrap_or_else(|e| format!("(no diff: {e})"))
+        };
         print!(
             "{}",
-            report::run_detail(&run, &store.attempts(Some(run.id))?, &diff)
+            report::run_detail(
+                &run,
+                &store.attempts(Some(run.id))?,
+                changelog(&home, &run).as_deref(),
+                &diff
+            )
         );
         match (
             before,
@@ -2315,6 +2326,15 @@ fn run_review(
     }
     drop(session);
     Ok(())
+}
+
+/// A run's drafted changelog entries: `None` when its project keeps no
+/// `CHANGELOG.md` and the agent drafted none, empty when it should have.
+fn changelog(home: &std::path::Path, run: &store::Run) -> Option<String> {
+    match std::fs::read_to_string(dispatch::changelog_draft(home, run.id)) {
+        Ok(text) => Some(text),
+        Err(_) => dispatch::wants_changelog(run).then(String::new),
+    }
 }
 
 fn show_stale(names: &[String], tags: &[String], count: Option<usize>) -> Result<()> {
@@ -3086,6 +3106,9 @@ fn workflow_command(action: Option<WorkflowAction>) -> Result<()> {
                 eprintln!("refused: {refused}");
             }
             if outcome.ran {
+                if let Some(plan) = &approve {
+                    store.settle_jobs_awaiting(plan)?;
+                }
                 println!("the approved plan ran; `pma review` lists any edits it made");
             }
             for line in &outcome.landed {
@@ -3110,7 +3133,8 @@ fn workflow_command(action: Option<WorkflowAction>) -> Result<()> {
                 return Ok(());
             }
             let plan = &outcome.plan;
-            if let Some(job) = jobs::current() {
+            let job = jobs::current();
+            if let Some(job) = job {
                 let mut approve = vec![
                     "workflow".to_string(),
                     "run".into(),
@@ -3124,12 +3148,17 @@ fn workflow_command(action: Option<WorkflowAction>) -> Result<()> {
                 store.set_job_awaiting(job, &approve)?;
             }
             print!("{}", pass::describe(&plan.steps, "next: "));
+            let how = match job {
+                Some(job) => format!("pma job approve {job}"),
+                None => format!(
+                    "pma workflow run {name} --instance {instance} --approve {}",
+                    plan.id()
+                ),
+            };
             println!(
-                "\nplan {}: at most ${:.2}. Nothing was spent on it. Approve it with \
-                 `pma workflow run {name} --instance {instance} --approve {}`.",
+                "\nplan {}: at most ${:.2}. Nothing was spent on it. Approve it with `{how}`.",
                 plan.id(),
                 plan.cost(),
-                plan.id()
             );
             Ok(())
         }
