@@ -4,6 +4,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.7.0]
+
+Upgrading from 0.6:
+
+- The database moves from schema 31 to 35 on first open. 0.6 refuses it afterwards.
+
+- The first command writes `~/.config/pma/settings.toml` from the database. From then on the file is the configuration; edit it, or use `pma config` as before.
+
+- The `claude` worker switches to `--output-format stream-json --verbose`, unless its record was edited.
+
+- `pma tui` changed keys: `0`-`9` switch tabs, `m` no longer opens the matrix (`2` does), and `?` lists the rest.
+
+- From a clone, the binary is in `crates/pma`: `make install` as before, or `cargo install --path crates/pma`.
+
 ### Added
 
 **A view of each project.** `pma project show <name>`, the TUI's `o` on any row that names a project, and the web's PROJECTS list in the sidebar each show one project: its tier, states with their reasons, CI, dependencies, local changes, verify command and tags, then its open tasks and every run it has had, newest first. Tasks dispatch and runs are approved or rejected from there. The view says when a scan last read the project, in yellow once that is over a day old, since a stale "failing CI" reads like a current one; `r` rescans that project alone. The status tab now lists every project, untiered ones too, since it is where a project is opened from. Each front end offers only the actions that fit the selected row, from `pma_core::screen::fits`.
@@ -17,7 +31,7 @@ pma web --app      # in a Chrome or Chromium window with no browser controls
 pma web --no-open --port 9000   # then, elsewhere: ssh -L 9000:127.0.0.1:9000 host
 ```
 
-**A shared API for front ends, and a cargo workspace.** `pma_core::api` defines what a front end may read (`Query`, returning a `View` of plain data) and do (`Action`, returning an `Outcome`). A long action, such as a dispatch or an approved plan, is queued as a job running the same CLI command. The CLI now renders each `View`; its output is unchanged. The code moves into `crates/pma-core` (no printing, no UI dependency), `crates/pma-tui` and `crates/pma`, so the TUI and the coming web view can each depend on the core alone. Design: `docs/dev/frontends.md`.
+**A shared API for front ends, and a cargo workspace.** `pma_core::api` defines what a front end may read (`Query`, returning a `View` of plain data) and do (`Action`, returning an `Outcome`). A long action, such as a dispatch or an approved plan, is queued as a job running the same CLI command. The CLI now renders each `View`; its output is unchanged. The code moves into `crates/pma-core` (no printing, no UI dependency), `crates/pma-tui` and `crates/pma`, so the TUI and the web view each depend on the core alone. Design: `docs/dev/frontends.md`.
 
 **Configuration moves to `~/.config/pma/settings.toml`.** It holds the `config` keys, roots, workers, presets, and each project's tier and tags. Edit it by hand, or with `pma config`, `pma root`, `pma project`, `pma agent` and `pma preset`, which keep its comments. The first command writes it from the database; schema 35. An invalid file stops every command, naming the key. The tables of the same names stay as a mirror the file refills when its text changes, so queries that join a project's tier keep working; the file wins. Workflow and route revisions stay in the database: activating one checks its cost and records who did, which a hand edit would skip. Design: `docs/dev/frontends.md`.
 

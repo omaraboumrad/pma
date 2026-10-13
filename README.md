@@ -29,7 +29,11 @@ pma pr 1                       # commit and open a pull request; or `pma push 1`
 
 - Failing CI, outdated dependencies, idle repositories and dirty working trees appear as tasks beside the written ones.
 
-- Two front ends with the same views and actions: `pma tui` in a terminal, over SSH too, and `pma web` in a local browser. Projects worst first by what needs attention (`pma status`), and an oldest-first list to prune (`pma stale`).
+- Two front ends with the same views and actions: `pma tui` in a terminal, over SSH too, and `pma web` in a local browser, on 127.0.0.1 behind a one-time token. Both act on what is selected: dispatch a task, approve or reject a run, approve a plan, stop a job.
+
+- A view of each project: its state and why, CI, dependencies, local changes, open tasks and every run, with how old the scan behind it is. `pma project show <name>`, or `o` on any row.
+
+- Projects worst first by what needs attention (`pma status`), and an oldest-first list to prune (`pma stale`).
 
 - Portfolio notes that belong to no single project.
 
@@ -61,6 +65,14 @@ pma pr 1                       # commit and open a pull request; or `pma push 1`
 
 - `pma report` says what dispatching has produced: first-attempt passes, reworks, merges, cost, review time.
 
+- An agent drafts a changelog entry per change in `.pma/changelog.md`, not in `CHANGELOG.md`, so changes running together do not conflict; `pma review` shows the draft, or says there is none.
+
+**Running unattended**
+
+- `--detach` on `pma dispatch` and `pma workflow run` queues the work and returns at once; a runner takes it and outlives the terminal. `pma job` lists jobs, `pma watch` shows what each running agent is doing, and `pma config notify '<command>'` runs when a job ends.
+
+- `pma workflow run --local --unattended` approves each plan as it comes and leaves every edit that passed the project's tests as unstaged changes in your clone; one that failed is discarded. Nothing is committed or pushed.
+
 **Which model, where**
 
 - A preset names a worker, a model and the arguments that configure it: `pma preset set omp-luna-high omp gpt-5.6-luna --thinking high`.
@@ -87,7 +99,7 @@ pma pr 1                       # commit and open a pull request; or `pma push 1`
 cargo install pma
 ```
 
-From a clone: `make install`, which builds the release binary and copies it to `~/.local/bin`. Set `PREFIX` to install elsewhere: `make install PREFIX=/usr/local`.
+From a clone: `make install`, which builds the release binary and copies it to `~/.local/bin`; set `PREFIX` to install elsewhere: `make install PREFIX=/usr/local`. Or `cargo install --path crates/pma`. `--no-default-features` builds without `pma web` and its HTTP server.
 
 Requirements:
 
