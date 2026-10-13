@@ -23,7 +23,7 @@ use crate::worker::{Parser, Worker};
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
-const VERSION: i64 = 34;
+const VERSION: i64 = 35;
 
 const SCHEMA: &str = "
 CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -307,6 +307,13 @@ CREATE TABLE campaign_members (
 );
 ";
 
+/// Version 35. The `settings.toml` text the configuration tables were last
+/// filled from, so an unchanged file is not applied again. `IF NOT EXISTS`
+/// because tests replay migrations over a store that has it.
+const SETTINGS_SYNC: &str = "
+CREATE TABLE IF NOT EXISTS settings_sync (text TEXT NOT NULL);
+";
+
 /// Version 34. A workflow node that is not an `edit` changes no files, so a
 /// run of one that finished is `done`, not `ready` for a review it cannot have.
 const READ_RUNS_DONE: &str = "
@@ -565,6 +572,9 @@ ALTER TABLE projects ADD COLUMN slug TEXT;
 
 pub struct Store {
     conn: Connection,
+    /// `settings.toml`, beside the database. The configuration tables mirror
+    /// it; every change to them goes through it first.
+    settings: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -764,6 +774,7 @@ impl Store {
                     JOBS,
                     JOB_APPROVAL_AND_STREAM,
                     READ_RUNS_DONE,
+                    SETTINGS_SYNC,
                 ];
                 let tx = conn.unchecked_transaction()?;
                 for step in &steps[version as usize..] {
@@ -806,7 +817,117 @@ impl Store {
                 .into());
             }
         }
-        Ok(Store { conn })
+        let store = Store {
+            conn,
+            settings: path.with_file_name(crate::settings::FILE),
+        };
+        store.load_settings()?;
+        Ok(store)
+    }
+
+    /// Fills the configuration tables from `settings.toml` when its text
+    /// changed since they were last filled. With no file, writes one from the
+    /// tables: the first run after they held the configuration. A migration
+    /// that changes a configuration row must change the file too, or the next
+    /// edit of the file undoes it.
+    fn load_settings(&self) -> Result<()> {
+        if !self.settings.exists() {
+            crate::settings::create(&self.settings, &self.settings_from_tables()?)?;
+        }
+        let (text, settings) = crate::settings::read(&self.settings)?;
+        let synced: Option<String> = self
+            .conn
+            .query_row("SELECT text FROM settings_sync", [], |r| r.get(0))
+            .optional()?;
+        if synced.as_deref() != Some(text.as_str()) {
+            self.apply_settings(&text, &settings)?;
+        }
+        Ok(())
+    }
+
+    fn settings_from_tables(&self) -> Result<crate::settings::Settings> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT name, tier FROM projects WHERE tier IS NOT NULL ORDER BY name")?;
+        let tiers = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(crate::settings::Settings {
+            config: self.config_rows()?,
+            roots: self.roots()?,
+            tiers,
+            tags: self.project_tags()?,
+            agents: self.agents()?,
+            presets: self.presets()?,
+        })
+    }
+
+    /// Replaces the configuration tables with what the file says. A tier for a
+    /// project no scan has recorded waits for the scan.
+    fn apply_settings(&self, text: &str, s: &crate::settings::Settings) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute_batch(
+            "DELETE FROM config; DELETE FROM roots; DELETE FROM agents; DELETE FROM presets;
+             DELETE FROM project_tags; DELETE FROM settings_sync;
+             UPDATE projects SET tier = NULL;",
+        )?;
+        for (key, value) in &s.config {
+            tx.execute(
+                "INSERT OR REPLACE INTO config (key, value) VALUES (?1, ?2)",
+                params![key, value],
+            )?;
+        }
+        for root in &s.roots {
+            tx.execute(
+                "INSERT OR IGNORE INTO roots (path) VALUES (?1)",
+                [path_str(root)?],
+            )?;
+        }
+        for (name, tier) in &s.tiers {
+            tx.execute(
+                "UPDATE projects SET tier = ?2 WHERE name = ?1",
+                params![name, tier],
+            )?;
+        }
+        for (project, tag) in &s.tags {
+            tx.execute(
+                "INSERT OR IGNORE INTO project_tags (project, tag) VALUES (?1, ?2)",
+                params![project, tag],
+            )?;
+        }
+        for w in &s.agents {
+            seed_agent(&tx, w)?;
+        }
+        for p in &s.presets {
+            tx.execute(
+                "INSERT OR REPLACE INTO presets (name, agent, model, args, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    p.name,
+                    p.agent,
+                    p.model,
+                    serde_json::to_string(&p.args).unwrap_or_else(|_| "[]".into()),
+                    crate::dates::now()
+                ],
+            )?;
+        }
+        tx.execute("INSERT INTO settings_sync (text) VALUES (?1)", [text])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Edits `settings.toml` with `f`, then refills the tables from it.
+    fn change_settings<T>(&self, f: impl FnOnce(&mut toml_edit::DocumentMut) -> T) -> Result<T> {
+        let out = crate::settings::edit(&self.settings, f)?;
+        let (text, settings) = crate::settings::read(&self.settings)?;
+        self.apply_settings(&text, &settings)?;
+        Ok(out)
+    }
+
+    /// Re-applies the file's tiers and tags, for projects a scan just added.
+    fn reapply_settings(&self) -> Result<()> {
+        let (text, settings) = crate::settings::read(&self.settings)?;
+        self.apply_settings(&text, &settings)
     }
 
     pub fn config_rows(&self) -> Result<Vec<(String, String)>> {
@@ -818,20 +939,12 @@ impl Store {
     }
 
     pub fn set_config(&self, key: &str, value: &str) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO config (key, value) VALUES (?1, ?2)
-             ON CONFLICT (key) DO UPDATE SET value = excluded.value",
-            params![key, value],
-        )?;
-        Ok(())
+        self.change_settings(|doc| crate::settings::set_config(doc, key, value))
     }
 
     /// Returns whether a stored value was removed.
     pub fn reset_config(&self, key: &str) -> Result<bool> {
-        Ok(self
-            .conn
-            .execute("DELETE FROM config WHERE key = ?1", [key])?
-            > 0)
+        self.change_settings(|doc| crate::settings::reset_config(doc, key))
     }
 
     pub fn roots(&self) -> Result<Vec<PathBuf>> {
@@ -844,26 +957,23 @@ impl Store {
 
     /// Returns false when the root was already present.
     pub fn add_root(&self, path: &Path) -> Result<bool> {
-        Ok(self.conn.execute(
-            "INSERT OR IGNORE INTO roots (path) VALUES (?1)",
-            [path_str(path)?],
-        )? > 0)
+        let path = path_str(path)?;
+        self.change_settings(|doc| crate::settings::add_root(doc, path))
     }
 
     pub fn remove_root(&self, path: &Path) -> Result<bool> {
-        Ok(self
-            .conn
-            .execute("DELETE FROM roots WHERE path = ?1", [path_str(path)?])?
-            > 0)
+        let path = path_str(path)?;
+        self.change_settings(|doc| crate::settings::remove_root(doc, path))
     }
 
+    /// Records the project first if no scan has, so the tier has a row.
     pub fn set_tier(&self, name: &str, path: &Path, tier: Option<u8>) -> Result<()> {
         self.conn.execute(
             "INSERT INTO projects (name, path, tier) VALUES (?1, ?2, ?3)
              ON CONFLICT (name) DO UPDATE SET tier = excluded.tier",
             params![name, path_str(path)?, tier],
         )?;
-        Ok(())
+        self.change_settings(|doc| crate::settings::set_tier(doc, name, tier))
     }
 
     pub fn last_scan(&self) -> Result<Option<i64>> {
@@ -1083,6 +1193,8 @@ impl Store {
             }
         }
         tx.commit()?;
+        // A project this scan added may have a tier or tags in the file.
+        self.reapply_settings()?;
         Ok(absent)
     }
 
@@ -1121,7 +1233,7 @@ impl Store {
             tx.execute(sql, [name])?;
         }
         tx.commit()?;
-        Ok(())
+        self.change_settings(|doc| crate::settings::forget_project(doc, name))
     }
 
     /// Every `(project, tag)` pair, ordered by project then tag.
@@ -1135,18 +1247,12 @@ impl Store {
 
     /// Returns false when the project already had the tag.
     pub fn add_project_tag(&self, project: &str, tag: &str) -> Result<bool> {
-        Ok(self.conn.execute(
-            "INSERT OR IGNORE INTO project_tags (project, tag) VALUES (?1, ?2)",
-            params![project, tag],
-        )? > 0)
+        self.change_settings(|doc| crate::settings::tag_project(doc, project, tag, true))
     }
 
     /// Returns false when the project did not have the tag.
     pub fn remove_project_tag(&self, project: &str, tag: &str) -> Result<bool> {
-        Ok(self.conn.execute(
-            "DELETE FROM project_tags WHERE project = ?1 AND tag = ?2",
-            params![project, tag],
-        )? > 0)
+        self.change_settings(|doc| crate::settings::tag_project(doc, project, tag, false))
     }
 
     /// The projects carrying any of `tags`, in name order. A project in
@@ -2039,18 +2145,7 @@ impl Store {
         if self.agent(&p.agent).is_err() {
             return Err(format!("no worker `{}`; `pma agent` lists them", p.agent).into());
         }
-        self.conn.execute(
-            "INSERT OR REPLACE INTO presets (name, agent, model, args, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                p.name,
-                p.agent,
-                p.model,
-                serde_json::to_string(&p.args).unwrap_or_else(|_| "[]".into()),
-                crate::dates::now()
-            ],
-        )?;
-        Ok(())
+        self.change_settings(|doc| crate::settings::set_preset(doc, p))
     }
 
     pub fn presets(&self) -> Result<Vec<Preset>> {
@@ -2077,10 +2172,7 @@ impl Store {
 
     /// Returns false when no preset has the name.
     pub fn remove_preset(&self, name: &str) -> Result<bool> {
-        Ok(self
-            .conn
-            .execute("DELETE FROM presets WHERE name = ?1", [name])?
-            > 0)
+        self.change_settings(|doc| crate::settings::remove_preset(doc, name))
     }
 
     /// Every worker, by name.
@@ -2117,15 +2209,12 @@ impl Store {
     }
 
     pub fn set_agent(&self, w: &Worker) -> Result<()> {
-        seed_agent(&self.conn, w)
+        self.change_settings(|doc| crate::settings::set_agent(doc, w))
     }
 
     /// Returns false when no agent has the name.
     pub fn remove_agent(&self, name: &str) -> Result<bool> {
-        Ok(self
-            .conn
-            .execute("DELETE FROM agents WHERE name = ?1", [name])?
-            > 0)
+        self.change_settings(|doc| crate::settings::remove_agent(doc, name))
     }
 
     /// Decided runs in a project and how many were accepted. An open pull
@@ -3211,6 +3300,9 @@ mod tests {
         // A store as schema 23 left it: the column exists and holds a model.
         {
             let store = Store::open(&path).unwrap();
+            // First: it refills the tables from settings.toml, which knows no
+            // `model` column.
+            store.set_config("agent", "claude").unwrap();
             store
                 .conn
                 .execute_batch(
@@ -3225,7 +3317,6 @@ mod tests {
                 .conn
                 .execute("UPDATE agents SET model = 'opus' WHERE name = 'claude'", [])
                 .unwrap();
-            store.set_config("agent", "claude").unwrap();
             store.conn.pragma_update(None, "user_version", 23).unwrap();
         }
         let store = Store::open(&path).unwrap();
@@ -3762,6 +3853,69 @@ mod tests {
             ["cyllama"],
             "removing one tag leaves the other"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The first open after the tables held the configuration writes them to
+    /// `settings.toml`; from then on the file is what the tables say.
+    #[test]
+    fn settings_toml_takes_over_the_configuration_tables() {
+        let dir = scratch("settings");
+        let path = dir.join("p.db");
+        {
+            let store = Store::open(&path).unwrap();
+            store
+                .conn
+                .execute_batch(
+                    "INSERT INTO config (key, value) VALUES ('agent_budget', '3');
+                 INSERT INTO roots (path) VALUES ('/r');
+                 INSERT INTO project_tags (project, tag) VALUES ('a', 'py');",
+                )
+                .unwrap();
+            store
+                .conn
+                .execute_batch("DELETE FROM settings_sync")
+                .unwrap();
+        }
+        std::fs::remove_file(dir.join(crate::settings::FILE)).unwrap();
+        let mut store = Store::open(&path).unwrap();
+        let text = std::fs::read_to_string(dir.join(crate::settings::FILE)).unwrap();
+        assert!(
+            text.contains("agent_budget = 3") && text.contains("roots = [\"/r\"]"),
+            "{text}"
+        );
+        assert!(
+            text.contains("[agents.claude]"),
+            "the seeded workers: {text}"
+        );
+
+        // A hand edit, applied on the next open; a tier waits for its scan.
+        std::fs::write(
+            dir.join(crate::settings::FILE),
+            text.replace("agent_budget = 3", "agent_budget = 4") + "\n[projects.b]\ntier = 2\n",
+        )
+        .unwrap();
+        drop(store);
+        store = Store::open(&path).unwrap();
+        assert!(
+            store
+                .config_rows()
+                .unwrap()
+                .contains(&("agent_budget".into(), "4".into()))
+        );
+        assert!(store.project("b").unwrap().is_none());
+        store.save_scan(&[facts("b", vec![])], true, 1).unwrap();
+        assert_eq!(store.project("b").unwrap().unwrap().tier, Some(2));
+
+        // An invalid file stops the store from opening, naming the key.
+        std::fs::write(
+            dir.join(crate::settings::FILE),
+            "[config]\nmax_parallel = 0\n",
+        )
+        .unwrap();
+        drop(store);
+        let e = Store::open(&path).err().expect("refused").to_string();
+        assert!(e.contains("config.max_parallel"), "{e}");
         let _ = std::fs::remove_dir_all(dir);
     }
 

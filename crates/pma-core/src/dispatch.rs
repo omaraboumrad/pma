@@ -1633,6 +1633,7 @@ pub fn reject(store: &Store, run: &mut Run, keep: bool, infra: bool) -> Result<(
 /// failed verify was counted by verify; one that did not apply was judged by
 /// no one.
 pub fn discard(store: &Store, run: &mut Run, keep: bool) -> Result<()> {
+    let read = run.state;
     if run.state == RunState::PrOpen {
         return Err(format!(
             "run #{} has an open pull request; merge or close it: {}",
@@ -1665,9 +1666,12 @@ pub fn discard(store: &Store, run: &mut Run, keep: bool) -> Result<()> {
         )
         .into());
     }
-    remove_worktree(&run.repo, &run.worktree, &run.branch)?;
+    // Written first, and only over the state that was read: a run another
+    // front end approved meanwhile is refused with its worktree intact.
     run.enter(RunState::Rejected);
-    store.update_run(run)
+    store.update_run_from(run, read)?;
+    remove_worktree(&run.repo, &run.worktree, &run.branch)
+        .map_err(|e| format!("run #{} is rejected, but its worktree stays: {e}", run.id).into())
 }
 
 /// Runs the agent again in the same worktree with the reviewer's feedback.

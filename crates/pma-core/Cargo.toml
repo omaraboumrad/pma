@@ -1,0 +1,15 @@
+[package]
+name = "pma-core"
+description = "pma's store, scanning, dispatch and workflows, and the Query/Action API its front ends share"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rhai.workspace = true
+rusqlite.workspace = true
+sanduk-sandbox.workspace = true
+serde_json.workspace = true
+toml_edit.workspace = true

@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>pma</title>
+<link rel="stylesheet" href="/app.css">
+<script src="/app.js" defer></script>
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar" aria-label="Views">
+    <div class="brand">
+      <span class="logo" aria-hidden="true">pma</span>
+      <span class="brand-text">portfolio</span>
+    </div>
+    <nav id="nav"></nav>
+    <div class="sidebar-foot">
+      <span id="busy" class="busy" role="status">Connecting</span>
+      <button id="help-button" class="link" type="button">Keyboard shortcuts <kbd>?</kbd></button>
+    </div>
+  </aside>
+
+  <main class="main" id="main">
+    <header class="topbar">
+      <div class="heading">
+        <h1 id="title">pma</h1>
+        <p id="subtitle"></p>
+      </div>
+      <div id="toolbar" class="toolbar" role="toolbar" aria-label="Actions on this view"></div>
+    </header>
+    <div id="content" class="content"></div>
+  </main>
+
+  <aside id="drawer" class="drawer" aria-label="Selected item" hidden>
+    <header class="drawer-head">
+      <div class="drawer-title">
+        <p id="drawer-kicker" class="kicker"></p>
+        <h2 id="drawer-heading"></h2>
+      </div>
+      <button id="drawer-close" class="icon-button" type="button" aria-label="Close">Close</button>
+    </header>
+    <div id="drawer-body" class="drawer-body"></div>
+    <footer id="drawer-actions" class="drawer-actions"></footer>
+  </aside>
+</div>
+
+<div id="toasts" class="toasts" aria-live="polite"></div>
+
+<dialog id="dialog" aria-labelledby="dialog-title">
+  <form id="dialog-form" method="dialog">
+    <h2 id="dialog-title"></h2>
+    <div id="dialog-text" class="dialog-text"></div>
+    <label id="dialog-label" class="field">
+      <span id="dialog-label-text"></span>
+      <input id="dialog-input" type="text" autocomplete="off">
+    </label>
+    <div class="dialog-buttons">
+      <button id="dialog-cancel" class="button" value="cancel" type="submit">Cancel</button>
+      <button id="dialog-ok" class="button primary" value="ok" type="submit">OK</button>
+    </div>
+  </form>
+</dialog>
+</body>
+</html>

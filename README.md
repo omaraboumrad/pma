@@ -29,7 +29,7 @@ pma pr 1                       # commit and open a pull request; or `pma push 1`
 
 - Failing CI, outdated dependencies, idle repositories and dirty working trees appear as tasks beside the written ones.
 
-- A terminal browser (`pma tui`) of `next` and the matrix, projects worst first by what needs attention (`pma status`), and an oldest-first list to prune (`pma stale`).
+- Two front ends with the same views and actions: `pma tui` in a terminal, over SSH too, and `pma web` in a local browser. Projects worst first by what needs attention (`pma status`), and an oldest-first list to prune (`pma stale`).
 
 - Portfolio notes that belong to no single project.
 
@@ -168,7 +168,11 @@ pma matrix                      # the ranked 2x2; -q q1 for one quadrant
 pma status --explain            # projects worst first, with what placed each
 pma status --all                # untiered projects too, e.g. to find failing CI
 pma stale                       # open items by age, oldest first
-pma tui                         # browse next; m for the matrix, q quits
+pma tui                         # every view and action; 0-9 switch tabs, ? lists keys, q quits
+pma web                         # the same in a browser, on 127.0.0.1 behind a one-time token
+pma web --app                   # as an app window, in Chrome or Chromium
+pma project show myproject      # one project: state, open tasks, runs; `o` in the TUI and web
+pma web --no-open --port 9000   # for `ssh -L 9000:127.0.0.1:9000 host` from another machine
 pma note add "move CI to a reusable workflow"
 ```
 
@@ -260,7 +264,7 @@ Each `## Critical` item gets an issue labelled `pma:critical`, and `gh:N` is wri
 
 - Worktrees, logs and artifacts sit under `~/.local/state/pma` (`$XDG_STATE_HOME/pma`), or `$PMA_HOME/state` when `PMA_HOME` is set; `PMA_STATE` overrides both. Worktrees are removed when a run is published or rejected. A workflow's agent nodes read the code in a worktree of their own and leave nothing behind; what they read and wrote stays in `artifacts/<instance>/<node>/<n>/`, numbered per run.
 
-- Settings live in the database rather than a file. `pma config` lists them, `pma config <key> <value>` sets one, and `--reset` clears one.
+- Settings live in `~/.config/pma/settings.toml`, beside the database: `config` keys, roots, workers, presets, and each project's tier and tags. Edit it by hand, or with `pma config <key> <value>`, `pma root`, `pma project`, `pma agent` and `pma preset`, which keep its comments. `pma config` lists the settings and `--reset` clears one. An invalid file stops every command and names the key. Workflow and route revisions stay in the database, because activating one checks its cost and records who did.
 
 One command that runs agents or edits worktrees runs at a time. `dispatch`, `pr`, `push`, `workflow run` and `review --reject` take a lock and name the process holding it. Reading commands run alongside.
 
@@ -270,6 +274,8 @@ One command that runs agents or edits worktrees runs at a time. `dispatch`, `pr`
 make test     # cargo test, then pytest on scripts/
 make check    # format check, clippy with warnings as errors, then test
 ```
+
+The code is a cargo workspace. `crates/pma-core` holds the store, scanning, dispatch, workflows and the `api` module every front end uses; it prints nothing. `crates/pma-tui` is the terminal UI, and `crates/pma` the binary with the CLI. Design: `docs/dev/frontends.md`.
 
 ## Licence
 

@@ -1,0 +1,522 @@
+//! `pma web`: the TUI's views and actions in a browser, strictly local.
+//!
+//! It listens on 127.0.0.1 only, at a random port, behind a random token made
+//! at each launch. The page trades the token for an `HttpOnly`,
+//! `SameSite=Strict` cookie, and every data request needs that cookie. Each
+//! request's `Host` must be a loopback name, against DNS rebinding; any port
+//! is taken, so an SSH forward to another local port works. Each POST must
+//! come from the origin its own `Host` names and send JSON, against
+//! cross-site requests.
+//! Rows, keys and actions come from `pma_core::screen` and `pma_core::keys`,
+//! as the TUI's do. Design: `docs/dev/frontends.md`.
+
+mod http;
+
+use std::io::Write;
+use std::net::{TcpListener, TcpStream};
+use std::sync::Arc;
+use std::time::Duration;
+
+use serde_json::{Value, json};
+
+use pma_core::api;
+use pma_core::keys::{self, Act, Ask, Command, Tab};
+use pma_core::report_runs::By;
+use pma_core::screen::{self, Body, Item, Pick, Screen};
+use pma_core::store::Store;
+
+use http::{Request, Response};
+
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+const INDEX: &str = include_str!("../assets/index.html");
+const SCRIPT: &str = include_str!("../assets/app.js");
+const STYLE: &str = include_str!("../assets/app.css");
+
+const COOKIE: &str = "pma_session";
+
+pub struct Server {
+    listener: TcpListener,
+    ctx: Arc<Ctx>,
+}
+
+struct Ctx {
+    port: u16,
+    token: String,
+    /// Opens the store for one request. A test passes its own.
+    open: Box<dyn Fn() -> Result<Store> + Send + Sync>,
+}
+
+/// 32 random bytes as hex, from the kernel's generator.
+fn token() -> Result<String> {
+    use std::io::Read;
+    let mut bytes = [0u8; 32];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+impl Server {
+    /// Binds 127.0.0.1 at `port`; 0 lets the kernel pick one.
+    pub fn bind(port: u16) -> Result<Server> {
+        Server::bind_with(port, Box::new(Store::open_default))
+    }
+
+    pub fn bind_with(
+        port: u16,
+        open: Box<dyn Fn() -> Result<Store> + Send + Sync>,
+    ) -> Result<Server> {
+        let listener =
+            TcpListener::bind(("127.0.0.1", port)).map_err(|e| format!("127.0.0.1:{port}: {e}"))?;
+        let port = listener.local_addr()?.port();
+        Ok(Server {
+            listener,
+            ctx: Arc::new(Ctx {
+                port,
+                token: token()?,
+                open,
+            }),
+        })
+    }
+
+    pub fn port(&self) -> u16 {
+        self.ctx.port
+    }
+
+    pub fn token(&self) -> &str {
+        &self.ctx.token
+    }
+
+    /// The address to open. The token rides in the fragment, which a browser
+    /// never sends in a request.
+    pub fn url(&self) -> String {
+        format!("http://127.0.0.1:{}/#{}", self.ctx.port, self.ctx.token)
+    }
+
+    /// Serves until the process ends, one thread per connection.
+    pub fn serve(self) -> Result<()> {
+        for stream in self.listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            let ctx = Arc::clone(&self.ctx);
+            std::thread::spawn(move || handle(stream, &ctx));
+        }
+        Ok(())
+    }
+}
+
+/// Equal without an early exit, so timing does not reveal a prefix.
+fn same(a: &str, b: &str) -> bool {
+    a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
+}
+
+fn handle(mut stream: TcpStream, ctx: &Ctx) {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+    let response = match http::read(&mut stream) {
+        Err(status) => Response::status(status),
+        Ok(req) => {
+            if req.path == "/api/events" && req.method == "GET" && checked(&req, ctx).is_none() {
+                let _ = events(&mut stream, ctx);
+                return;
+            }
+            route(&req, ctx)
+        }
+    };
+    let _ = http::write(&mut stream, &response);
+}
+
+/// Why a request is refused, if it is: the wrong `Host`; for a POST, another
+/// origin or a body that is not JSON; for data, no session cookie.
+fn checked(req: &Request, ctx: &Ctx) -> Option<Response> {
+    let Some(host) = req.header("host").filter(|h| loopback(h)) else {
+        return Some(Response::status(421));
+    };
+    if req.method == "POST" {
+        if req.header("origin") != Some(&format!("http://{host}")) {
+            return Some(Response::status(403));
+        }
+        if !req
+            .header("content-type")
+            .is_some_and(|t| t.starts_with("application/json"))
+        {
+            return Some(Response::status(415));
+        }
+    }
+    if req.path.starts_with("/api/") && !req.cookie(COOKIE).is_some_and(|c| same(c, &ctx.token)) {
+        return Some(Response::status(403));
+    }
+    None
+}
+
+/// `127.0.0.1:<port>` or `localhost:<port>`. A name an attacker controls,
+/// such as one rebound to 127.0.0.1, is not one of them.
+fn loopback(host: &str) -> bool {
+    host.rsplit_once(':').is_some_and(|(name, port)| {
+        matches!(name, "127.0.0.1" | "localhost") && port.parse::<u16>().is_ok()
+    })
+}
+
+fn route(req: &Request, ctx: &Ctx) -> Response {
+    if let Some(refused) = checked(req, ctx) {
+        return refused;
+    }
+    let body = || -> std::result::Result<Value, Response> {
+        serde_json::from_slice(&req.body).map_err(|_| Response::status(400))
+    };
+    match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/") => Response::new(200, "text/html; charset=utf-8", INDEX),
+        ("GET", "/app.js") => Response::new(200, "text/javascript; charset=utf-8", SCRIPT),
+        ("GET", "/app.css") => Response::new(200, "text/css; charset=utf-8", STYLE),
+        ("POST", "/session") => {
+            let Ok(b) = body() else {
+                return Response::status(400);
+            };
+            match b["token"].as_str() {
+                Some(t) if same(t, &ctx.token) => {
+                    let mut r = Response::status(204);
+                    r.body.clear();
+                    r.extra.push((
+                        "Set-Cookie",
+                        format!("{COOKIE}={}; HttpOnly; SameSite=Strict; Path=/", ctx.token),
+                    ));
+                    r
+                }
+                _ => Response::status(403),
+            }
+        }
+        ("GET", "/api/keys") => Response::json(200, &keys_json()),
+        ("GET", "/api/screen") => {
+            let Some(tab) = req.param("tab").as_deref().and_then(tab_named) else {
+                return Response::status(400);
+            };
+            let by = req
+                .param("by")
+                .as_deref()
+                .and_then(By::parse)
+                .unwrap_or(By::Class);
+            let project = req.param("project").unwrap_or_default();
+            answer(ctx, |store| {
+                Ok(screen_json(&screen::screen(api::query(
+                    store,
+                    tab.query(by, &project),
+                )?)))
+            })
+        }
+        ("POST", "/api/ask") => {
+            let Ok(b) = body() else {
+                return Response::status(400);
+            };
+            let (Some(tab), Some(act), Some(pick)) = (
+                b["tab"].as_str().and_then(tab_named),
+                act_named(&b["act"]),
+                pick_from(&b["pick"]),
+            ) else {
+                return Response::status(400);
+            };
+            answer(ctx, |store| {
+                // As the TUI does: an act that cannot apply to the pick is
+                // refused before the question, not after the answer.
+                let confirm = keys::BINDINGS
+                    .iter()
+                    .any(|b| b.command == Command::Act(act) && b.ask == Ask::Confirm);
+                if confirm {
+                    screen::action_in(
+                        act,
+                        &pick,
+                        &rows(store, tab, act, &b)?,
+                        "",
+                        b["project"].as_str().unwrap_or(""),
+                    )?;
+                }
+                Ok(json!({
+                    "question": screen::question(act, &pick),
+                    "input": screen::initial_input(act, &pick),
+                }))
+            })
+        }
+        ("POST", "/api/open") => {
+            let Ok(b) = body() else {
+                return Response::status(400);
+            };
+            let q = match pick_from(&b["pick"]) {
+                Some(Pick::Run { id, .. }) => api::Query::Run { id },
+                Some(Pick::Job { id, .. }) => api::Query::JobLog { id },
+                _ => return Response::status(400),
+            };
+            answer(ctx, |store| {
+                Ok(screen_json(&screen::screen(api::query(store, q)?)))
+            })
+        }
+        ("POST", "/api/act") => {
+            let Ok(b) = body() else {
+                return Response::status(400);
+            };
+            let (Some(tab), Some(act), Some(pick)) = (
+                b["tab"].as_str().and_then(tab_named),
+                act_named(&b["act"]),
+                pick_from(&b["pick"]),
+            ) else {
+                return Response::status(400);
+            };
+            let input = b["input"].as_str().unwrap_or("").to_string();
+            answer(ctx, |store| {
+                let action = screen::action_in(
+                    act,
+                    &pick,
+                    &rows(store, tab, act, &b)?,
+                    &input,
+                    b["project"].as_str().unwrap_or(""),
+                )?;
+                let out = api::act(store, action)?;
+                Ok(json!({ "said": out.said, "warnings": out.warnings }))
+            })
+        }
+        (_, "/" | "/app.js" | "/app.css" | "/session" | "/api/keys" | "/api/screen")
+        | (_, "/api/ask" | "/api/open" | "/api/act") => Response::status(405),
+        _ => Response::status(404),
+    }
+}
+
+/// The rows an act over many reads, as the store has them now rather than as
+/// the page last drew them. Other acts read none.
+fn rows(store: &Store, tab: Tab, act: Act, body: &Value) -> Result<Vec<Item>> {
+    if act != Act::ApproveRuns {
+        return Ok(Vec::new());
+    }
+    let project = body["project"].as_str().unwrap_or("");
+    Ok(
+        match screen::screen(api::query(store, tab.query(By::Class, project))?).body {
+            Body::Panes(panes) => panes.into_iter().flat_map(|p| p.items).collect(),
+            Body::Detail(_) => Vec::new(),
+        },
+    )
+}
+
+/// Runs `f` against a store opened for this request. An error goes back as
+/// JSON with status 400, for the page to show.
+fn answer(ctx: &Ctx, f: impl FnOnce(&Store) -> Result<Value>) -> Response {
+    let result = (ctx.open)().and_then(|store| f(&store));
+    match result {
+        Ok(v) => Response::json(200, &v),
+        Err(e) => Response::json(400, &json!({ "error": e.to_string() })),
+    }
+}
+
+/// A `tick` every 2 seconds while a job or a run is under way, every 30
+/// otherwise, until the page goes away. The page reloads its tab on each.
+fn events(stream: &mut TcpStream, ctx: &Ctx) -> std::io::Result<()> {
+    http::start_events(stream)?;
+    loop {
+        let busy = (ctx.open)().and_then(|s| api::busy(&s)).unwrap_or(false);
+        write!(stream, "event: tick\ndata: {{\"busy\":{busy}}}\n\n")?;
+        stream.flush()?;
+        std::thread::sleep(Duration::from_secs(if busy { 2 } else { 30 }));
+    }
+}
+
+fn tab_named(name: &str) -> Option<Tab> {
+    Tab::ALL.into_iter().find(|t| t.title() == name)
+}
+
+fn act_named(v: &Value) -> Option<Act> {
+    let name = v.as_str()?;
+    Act::ALL.into_iter().find(|a| a.name() == name)
+}
+
+fn keys_json() -> Value {
+    let bindings: Vec<Value> = keys::BINDINGS
+        .iter()
+        .map(|b| {
+            let command = match b.command {
+                Command::Tab(t) => json!({ "kind": "tab", "tab": t.title() }),
+                Command::Act(a) => json!({
+                    "kind": "act",
+                    "act": a.name(),
+                    "row": a.on_row(),
+                    "weight": a.weight(),
+                }),
+                other => json!({ "kind": format!("{other:?}") }),
+            };
+            let ask = match b.ask {
+                Ask::Nothing => json!({ "kind": "nothing" }),
+                Ask::Confirm => json!({ "kind": "confirm" }),
+                Ask::Text(label) => json!({ "kind": "text", "label": label }),
+            };
+            json!({
+                "key": b.key,
+                "command": command,
+                "tabs": b.tabs.iter().map(|t| t.title()).collect::<Vec<_>>(),
+                "ask": ask,
+                "label": b.label,
+            })
+        })
+        .collect();
+    json!({
+        "tabs": Tab::ALL.iter().map(|t| t.title()).collect::<Vec<_>>(),
+        "by": By::ALL.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+        "bindings": bindings,
+    })
+}
+
+fn cell_json(c: &screen::Cell) -> Value {
+    json!({ "text": c.text, "tone": c.tone.name() })
+}
+
+fn screen_json(s: &Screen) -> Value {
+    let body = match &s.body {
+        Body::Detail(d) => json!({ "detail": {
+            "title": d.title,
+            "badge": d.badge.as_ref().map(cell_json),
+            "notice": d.notice,
+            "fields": d.fields,
+            "sections": d.sections.iter().map(|(title, kind, text)| json!({
+                "title": title,
+                "kind": match kind {
+                    screen::Section::Prose => "prose",
+                    screen::Section::Diff => "diff",
+                    screen::Section::Log => "log",
+                },
+                "text": text,
+            })).collect::<Vec<_>>(),
+        }}),
+        Body::Panes(panes) => json!({
+            "panes": panes.iter().map(|p| json!({
+                "title": p.title,
+                "empty": p.empty,
+                "columns": p.columns.iter().map(|c| json!({
+                    "title": c.title,
+                    "kind": match c.kind {
+                        screen::Kind::Text => "text",
+                        screen::Kind::Wide => "wide",
+                        screen::Kind::Number => "number",
+                        screen::Kind::Badge => "badge",
+                    },
+                })).collect::<Vec<_>>(),
+                "items": p.items.iter().map(|i| json!({
+                    "cells": i.cells.iter().map(cell_json).collect::<Vec<_>>(),
+                    "pick": pick_json(&i.pick),
+                    "acts": Act::ALL
+                        .iter()
+                        .filter(|a| a.on_row() && screen::fits(**a, &i.pick))
+                        .map(|a| a.name())
+                        .collect::<Vec<_>>(),
+                })).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
+        }),
+    };
+    json!({
+        "tab": s.tab.map(|t| t.title()),
+        "header": s.header,
+        "summary": s.summary.iter().map(|(l, c)| json!([l, cell_json(c)])).collect::<Vec<_>>(),
+        "body": body,
+    })
+}
+
+fn pick_json(p: &Pick) -> Value {
+    match p {
+        Pick::Nothing => json!({ "kind": "nothing" }),
+        Pick::Task {
+            project,
+            target,
+            retry,
+        } => json!({ "kind": "task", "project": project, "target": target, "retry": retry }),
+        Pick::Manual { project } => json!({ "kind": "manual", "project": project }),
+        Pick::Run {
+            id,
+            clean,
+            state,
+            project,
+        } => {
+            json!({ "kind": "run", "id": id, "clean": clean, "state": state, "project": project })
+        }
+        Pick::Job { id, awaiting } => json!({ "kind": "job", "id": id, "awaiting": awaiting }),
+        Pick::Instance { id, workflow, open } => {
+            json!({ "kind": "instance", "id": id, "workflow": workflow, "open": open })
+        }
+        Pick::Note { id, text } => json!({ "kind": "note", "id": id, "text": text }),
+        Pick::Campaign { name } => json!({ "kind": "campaign", "name": name }),
+    }
+}
+
+/// A pick the page sent back. Anything malformed is `None`, so a request
+/// that names no real subject is refused rather than guessed at.
+fn pick_from(v: &Value) -> Option<Pick> {
+    let s = |k: &str| v[k].as_str().map(String::from);
+    let n = |k: &str| v[k].as_i64();
+    let b = |k: &str| v[k].as_bool();
+    Some(match v["kind"].as_str()? {
+        "nothing" => Pick::Nothing,
+        "task" => Pick::Task {
+            project: s("project")?,
+            target: s("target")?,
+            retry: b("retry")?,
+        },
+        "manual" => Pick::Manual {
+            project: s("project")?,
+        },
+        "run" => Pick::Run {
+            id: n("id")?,
+            clean: b("clean")?,
+            state: s("state")?,
+            project: s("project")?,
+        },
+        "job" => Pick::Job {
+            id: n("id")?,
+            awaiting: b("awaiting")?,
+        },
+        "instance" => Pick::Instance {
+            id: n("id")?,
+            workflow: s("workflow")?,
+            open: b("open")?,
+        },
+        "note" => Pick::Note {
+            id: n("id")?,
+            text: s("text")?,
+        },
+        "campaign" => Pick::Campaign { name: s("name")? },
+        _ => return None,
+    })
+}
+
+/// Opens the page in a Chrome or Chromium window with no browser controls:
+/// an app window, from the first such browser found.
+pub fn open_app(url: &str) -> Result<()> {
+    const BROWSERS: [&str; 5] = [
+        "google-chrome",
+        "google-chrome-stable",
+        "chromium",
+        "chromium-browser",
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    ];
+    for program in BROWSERS {
+        let spawned = std::process::Command::new(program)
+            .arg(format!("--app={url}"))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        if spawned.is_ok() {
+            return Ok(());
+        }
+    }
+    Err("no Chrome or Chromium found for --app; open the address in a browser".into())
+}
+
+/// Opens the page in the user's browser, without waiting for it.
+pub fn open_browser(url: &str) -> Result<()> {
+    let program = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    std::process::Command::new(program)
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("{program}: {e}"))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests;

@@ -156,7 +156,11 @@ pub struct StatusRow<'a> {
 /// Projects worst first: by the worst state each is in, then by tier, then by
 /// name. The state column names the worst, with a count of any others;
 /// `explain` lists every state and what put the project in it.
-pub fn status(cfg: &Config, rows: &[StatusRow], explain: bool) -> String {
+/// The projects in status order, worst state first, each with its states.
+fn placed<'a>(
+    cfg: &Config,
+    rows: &'a [StatusRow<'a>],
+) -> Vec<(Vec<(State, String)>, &'a StatusRow<'a>)> {
     let mut placed: Vec<(Vec<(State, String)>, &StatusRow)> = rows
         .iter()
         .map(|r| {
@@ -175,56 +179,77 @@ pub fn status(cfg: &Config, rows: &[StatusRow], explain: bool) -> String {
             .then_with(|| a.1.project.name.cmp(&b.1.project.name))
     });
 
-    let mut cells = vec![
-        [
-            "project", "tier", "state", "open", "idle", "ci", "deps", "local", "todo",
-        ]
-        .map(String::from)
-        .to_vec(),
-    ];
-    for (states, r) in &placed {
-        let p = r.project;
-        let local = [
-            (p.dirty > 0).then(|| format!("{} changed", p.dirty)),
-            p.ahead.filter(|n| *n > 0).map(|n| format!("{n} ahead")),
-            (p.leftover > 0).then(|| format!("{} leftover", p.leftover)),
-        ]
+    placed
+}
+
+/// The cells of one status row, as `status` prints them.
+fn status_cells(states: &[(State, String)], r: &StatusRow) -> Vec<String> {
+    let p = r.project;
+    let local = [
+        (p.dirty > 0).then(|| format!("{} changed", p.dirty)),
+        p.ahead.filter(|n| *n > 0).map(|n| format!("{n} ahead")),
+        (p.leftover > 0).then(|| format!("{} leftover", p.leftover)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(", ");
+    vec![
+        p.name.clone(),
+        if r.tiered {
+            p.tier.to_string()
+        } else {
+            "-".into()
+        },
+        match states.len() {
+            1 => states[0].0.name().to_string(),
+            n => format!("{} +{}", states[0].0.name(), n - 1),
+        },
+        p.open.len().to_string(),
+        p.idle_days.map_or("-".into(), |d| format!("{d}d")),
+        match &p.ci {
+            Ci::Failing(_) => "failing".to_string(),
+            Ci::Passing => "passing".into(),
+            Ci::NoRuns => "none".into(),
+            Ci::Unknown(_) => "unknown".into(),
+        },
+        p.deps.map_or("-".into(), |(n, _)| n.to_string()),
+        if local.is_empty() {
+            "clean".into()
+        } else {
+            local
+        },
+        match (r.has_todo, r.lint_errors, r.scan_error) {
+            (_, _, Some(_)) => "scan error".into(),
+            (false, _, _) => "missing".into(),
+            (true, 0, _) => "ok".into(),
+            (true, n, _) => format!("{n} lint errors"),
+        },
+    ]
+}
+
+pub const STATUS_HEADINGS: [&str; 9] = [
+    "project", "tier", "state", "open", "idle", "ci", "deps", "local", "todo",
+];
+
+/// A project's states, worst first, each with why; then its status cells.
+pub type StatusLine = (Vec<(State, String)>, Vec<String>);
+
+pub fn status_rows(cfg: &Config, rows: &[StatusRow]) -> Vec<StatusLine> {
+    placed(cfg, rows)
         .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join(", ");
-        cells.push(vec![
-            p.name.clone(),
-            if r.tiered {
-                p.tier.to_string()
-            } else {
-                "-".into()
-            },
-            match states.len() {
-                1 => states[0].0.name().to_string(),
-                n => format!("{} +{}", states[0].0.name(), n - 1),
-            },
-            p.open.len().to_string(),
-            p.idle_days.map_or("-".into(), |d| format!("{d}d")),
-            match &p.ci {
-                Ci::Failing(_) => "failing".to_string(),
-                Ci::Passing => "passing".into(),
-                Ci::NoRuns => "none".into(),
-                Ci::Unknown(_) => "unknown".into(),
-            },
-            p.deps.map_or("-".into(), |(n, _)| n.to_string()),
-            if local.is_empty() {
-                "clean".into()
-            } else {
-                local
-            },
-            match (r.has_todo, r.lint_errors, r.scan_error) {
-                (_, _, Some(_)) => "scan error".into(),
-                (false, _, _) => "missing".into(),
-                (true, 0, _) => "ok".into(),
-                (true, n, _) => format!("{n} lint errors"),
-            },
-        ]);
+        .map(|(states, r)| {
+            let cells = status_cells(&states, r);
+            (states, cells)
+        })
+        .collect()
+}
+
+pub fn status(cfg: &Config, rows: &[StatusRow], explain: bool) -> String {
+    let placed = placed(cfg, rows);
+    let mut cells = vec![STATUS_HEADINGS.map(String::from).to_vec()];
+    for (states, r) in &placed {
+        cells.push(status_cells(states, r));
     }
     let mut out = table(&cells, "");
 
@@ -330,15 +355,13 @@ pub fn runs(runs: &[Run]) -> String {
 
 /// One line per attempt, oldest first. A run with a single attempt says
 /// nothing the rows above it do not, so it is left out.
-fn attempt_lines(attempts: &[Attempt]) -> String {
-    if attempts.len() < 2 {
-        return String::new();
-    }
-    let rows: Vec<Vec<String>> = attempts
+/// One row per attempt: number, outcome, verify, model, cost, time.
+pub fn attempt_rows(attempts: &[Attempt]) -> Vec<Vec<String>> {
+    attempts
         .iter()
         .map(|a| {
             vec![
-                format!("  {}", a.n),
+                a.n.to_string(),
                 a.outcome.clone().unwrap_or_else(|| "?".into()),
                 match a.verify_ok {
                     Some(true) => "verify passed".into(),
@@ -351,13 +374,24 @@ fn attempt_lines(attempts: &[Attempt]) -> String {
                 duration(a.seconds),
             ]
         })
-        .collect();
+        .collect()
+}
+
+fn attempt_lines(attempts: &[Attempt]) -> String {
+    if attempts.len() < 2 {
+        return String::new();
+    }
+    let mut rows = attempt_rows(attempts);
+    for r in &mut rows {
+        r[0] = format!("  {}", r[0]);
+    }
     format!("\nattempts:\n{}", table(&rows, ""))
 }
 
 /// `changelog` is the run's drafted entries: `None` when its project keeps
 /// no `CHANGELOG.md`, empty when the agent drafted none.
-pub fn run_detail(run: &Run, attempts: &[Attempt], changelog: Option<&str>, diff: &str) -> String {
+/// A run's facts as label and value, in the order `run_detail` prints them.
+pub fn run_fields(run: &Run) -> Vec<Vec<String>> {
     let mut rows = vec![
         vec!["task".into(), run.text.clone()],
         vec![
@@ -451,6 +485,11 @@ pub fn run_detail(run: &Run, attempts: &[Attempt], changelog: Option<&str>, diff
             rows.push(vec![label.into(), v.clone()]);
         }
     }
+    rows
+}
+
+pub fn run_detail(run: &Run, attempts: &[Attempt], changelog: Option<&str>, diff: &str) -> String {
+    let rows = run_fields(run);
     let mut out = format!(
         "#{} {}  {}{}\n",
         run.id,

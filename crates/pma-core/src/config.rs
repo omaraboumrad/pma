@@ -245,6 +245,18 @@ impl Config {
         Ok(cfg)
     }
 
+    /// The kind of value `key` takes, so `settings.toml` stores it typed.
+    pub fn kind(key: &str) -> Option<&'static str> {
+        Some(match Config::default().slot(key)? {
+            Slot::Number(..) => "number",
+            Slot::Count(..) => "count",
+            Slot::Tier(_) => "tier",
+            Slot::List(_) => "list",
+            Slot::Switch(_) => "switch",
+            Slot::Priority(_) | Slot::Attribution(_) | Slot::OptText(_) | Slot::Text(_) => "text",
+        })
+    }
+
     pub fn get(&self, key: &str) -> Option<String> {
         let mut copy = self.clone();
         Some(match copy.slot(key)? {

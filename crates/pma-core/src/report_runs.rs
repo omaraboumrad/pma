@@ -110,19 +110,21 @@ impl Tally {
     }
 }
 
-const HEADINGS: [&str; 9] = [
+pub const HEADINGS: [&str; 9] = [
     "runs", "1st pass", "accepted", "landed", "open", "attempts", "cost", "agent", "review",
 ];
 
 /// A run still queued or running has not produced a result yet, so it is left
 /// out rather than counted as a failure.
-pub fn report(runs: &[Run], attempts: &[Attempt], by: By) -> String {
+/// The report as data: the summary line, the headings, then one row per
+/// group and a last row for all. `None` when no run has finished.
+pub fn table_of(runs: &[Run], attempts: &[Attempt], by: By) -> Option<(String, Vec<Vec<String>>)> {
     let done: Vec<&Run> = runs
         .iter()
         .filter(|r| !matches!(r.state, RunState::Queued | RunState::Running))
         .collect();
     if done.is_empty() {
-        return "no finished runs; dispatch some tasks first\n".into();
+        return None;
     }
 
     let mut total = Tally::default();
@@ -172,7 +174,14 @@ pub fn report(runs: &[Run], attempts: &[Attempt], by: By) -> String {
                 .join(" ")
         ),
     };
-    format!("{share}{pending}{infra}\n\n{}", table(&rows, ""))
+    Some((format!("{share}{pending}{infra}"), rows))
+}
+
+pub fn report(runs: &[Run], attempts: &[Attempt], by: By) -> String {
+    match table_of(runs, attempts, by) {
+        None => "no finished runs; dispatch some tasks first\n".into(),
+        Some((summary, rows)) => format!("{summary}\n\n{}", table(&rows, "")),
+    }
 }
 
 #[cfg(test)]

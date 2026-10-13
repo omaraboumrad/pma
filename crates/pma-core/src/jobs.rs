@@ -36,7 +36,7 @@ pub fn enqueue(store: &Store) -> Result<()> {
     Ok(())
 }
 
-fn queue(store: &Store, args: &[String], cwd: &std::path::Path) -> Result<i64> {
+pub fn queue(store: &Store, args: &[String], cwd: &std::path::Path) -> Result<i64> {
     let id = store.add_job(args, cwd)?;
     spawn_runner()?;
     Ok(id)

@@ -1,0 +1,1454 @@
+//! `pma tui`: every operating view and action, over SSH as well as at a
+//! desk. One tab per view; keys come from `pma_core::keys`, rows, tones and
+//! actions from `pma_core::screen`, so the web view shows and does the same.
+//!
+//! `App` is a state machine: a key returns a `Request` to load a view or take
+//! an action, and the run loop sends it through `pma_core::api` and hands the
+//! result back. Nothing here reads the store, so the tests need none.
+//!
+//! Colour carries meaning, from the terminal's own ANSI palette so it follows
+//! the user's theme: green done, yellow waits on you, red failed or critical,
+//! cyan under way, grey context. `NO_COLOR` turns it off; the selection is
+//! still reverse video and a `>` marker, so nothing depends on colour alone.
+
+use std::time::Duration;
+
+use ratatui::Frame;
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Cell as TableCell, Clear, Padding, Paragraph, Row, Table,
+    TableState, Wrap,
+};
+
+use pma_core::api::{self, Action, Outcome, Query, View};
+use pma_core::keys::{self, Act, Ask, Command, Tab};
+use pma_core::report_runs::By;
+use pma_core::screen::{self, Body, Detail, Item, Kind, Pane, Pick, Screen, Section, Tone};
+use pma_core::store::Store;
+
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+/// What the run loop does for a key.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Request {
+    Load(Query),
+    Act(Action),
+    Quit,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum Mode {
+    Normal,
+    Help,
+    /// A run's diff or a job's log, over the tab.
+    Detail {
+        screen: Screen,
+        scroll: u16,
+    },
+    Confirm {
+        action: Action,
+        question: String,
+    },
+    Prompt {
+        act: Act,
+        label: &'static str,
+        input: String,
+        pick: Pick,
+    },
+}
+
+/// The colours each meaning takes. All plain under `NO_COLOR`.
+#[derive(Debug, Clone, Copy)]
+struct Palette {
+    color: bool,
+}
+
+impl Palette {
+    fn from_env() -> Palette {
+        Palette {
+            color: std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty()),
+        }
+    }
+
+    fn fg(self, c: Color) -> Style {
+        match self.color {
+            true => Style::new().fg(c),
+            false => Style::new(),
+        }
+    }
+
+    fn tone(self, t: Tone) -> Style {
+        match t {
+            Tone::Plain => Style::new(),
+            Tone::Muted => self.fg(Color::DarkGray),
+            Tone::Accent => self.fg(Color::Cyan),
+            Tone::Good => self.fg(Color::Green),
+            Tone::Warn => self.fg(Color::Yellow),
+            Tone::Bad => self.fg(Color::Red).add_modifier(Modifier::BOLD),
+            Tone::Strong => Style::new().add_modifier(Modifier::BOLD),
+        }
+    }
+
+    fn accent(self) -> Style {
+        self.fg(Color::Cyan)
+    }
+
+    fn muted(self) -> Style {
+        self.fg(Color::DarkGray)
+    }
+}
+
+pub struct App {
+    tab: Tab,
+    /// The project the project tab shows, and the tab it was opened from.
+    project: String,
+    previous: Tab,
+    by: usize,
+    screens: Vec<Option<std::result::Result<Screen, String>>>,
+    /// Per tab: the focused pane, and the selection in each pane.
+    pane: Vec<usize>,
+    selected: Vec<Vec<TableState>>,
+    mode: Mode,
+    status: Option<(String, Tone)>,
+    busy: bool,
+    palette: Palette,
+}
+
+impl Default for App {
+    fn default() -> Self {
+        App::new()
+    }
+}
+
+fn index(tab: Tab) -> usize {
+    Tab::ALL.iter().position(|t| *t == tab).expect("every tab")
+}
+
+impl App {
+    pub fn new() -> App {
+        let n = Tab::ALL.len();
+        App {
+            tab: Tab::Next,
+            project: String::new(),
+            previous: Tab::Next,
+            by: 1,
+            screens: vec![None; n],
+            pane: vec![0; n],
+            selected: vec![Vec::new(); n],
+            mode: Mode::Normal,
+            status: None,
+            busy: false,
+            palette: Palette::from_env(),
+        }
+    }
+
+    /// The query that fills the current tab.
+    pub fn query(&self) -> Query {
+        self.tab.query(By::ALL[self.by].1, &self.project)
+    }
+
+    /// Whether a refresh may replace what is shown: not while a prompt, a
+    /// confirmation or a detail is open over it.
+    pub fn idle(&self) -> bool {
+        matches!(self.mode, Mode::Normal | Mode::Help)
+    }
+
+    /// Whether a job or an agent is under way, for the title bar.
+    pub fn set_busy(&mut self, busy: bool) {
+        self.busy = busy;
+    }
+
+    fn say(&mut self, text: impl Into<String>, tone: Tone) {
+        self.status = Some((text.into(), tone));
+    }
+
+    fn panes(&self) -> &[Pane] {
+        match &self.screens[index(self.tab)] {
+            Some(Ok(Screen {
+                body: Body::Panes(p),
+                ..
+            })) => p,
+            _ => &[],
+        }
+    }
+
+    /// The selected row and the pane it is in.
+    fn pick(&self) -> (Pick, Vec<Item>) {
+        let t = index(self.tab);
+        let Some(pane) = self.panes().get(self.pane[t]) else {
+            return (Pick::Nothing, Vec::new());
+        };
+        let row = self.selected[t]
+            .get(self.pane[t])
+            .and_then(|s| s.selected())
+            .and_then(|i| pane.items.get(i));
+        (
+            row.map_or(Pick::Nothing, |i| i.pick.clone()),
+            pane.items.clone(),
+        )
+    }
+
+    /// A view arrived. One for a tab replaces that tab's screen; a run or a
+    /// job log opens over the tab.
+    pub fn loaded(&mut self, view: std::result::Result<View, String>) {
+        let s = match view {
+            Ok(v) => screen::screen(v),
+            Err(e) => {
+                let t = index(self.tab);
+                self.screens[t] = Some(Err(e));
+                return;
+            }
+        };
+        let Some(tab) = s.tab else {
+            self.mode = Mode::Detail {
+                screen: s,
+                scroll: 0,
+            };
+            return;
+        };
+        let t = index(tab);
+        if let Body::Panes(panes) = &s.body {
+            // Keep each selection where it was, within the new length.
+            let states = &mut self.selected[t];
+            states.resize_with(panes.len(), TableState::default);
+            for (state, pane) in states.iter_mut().zip(panes) {
+                let len = pane.items.len();
+                state.select(match (len, state.selected()) {
+                    (0, _) => None,
+                    (n, Some(i)) => Some(i.min(n - 1)),
+                    (_, None) => Some(0),
+                });
+            }
+            if self.pane[t] >= panes.len() || panes[self.pane[t]].items.is_empty() {
+                self.pane[t] = panes
+                    .iter()
+                    .position(|p| !p.items.is_empty())
+                    .unwrap_or(self.pane[t].min(panes.len().saturating_sub(1)));
+            }
+        }
+        self.screens[t] = Some(Ok(s));
+    }
+
+    /// An action finished; what it said, or its error, shows in the footer.
+    pub fn acted(&mut self, outcome: std::result::Result<Outcome, String>) {
+        self.mode = Mode::Normal;
+        match outcome {
+            Ok(o) => {
+                let warned = !o.warnings.is_empty();
+                let lines: Vec<String> = o
+                    .said
+                    .into_iter()
+                    .chain(o.warnings.into_iter().map(|w| format!("warning: {w}")))
+                    .collect();
+                let tone = if warned { Tone::Warn } else { Tone::Good };
+                match lines.is_empty() {
+                    true => self.say("Done.", tone),
+                    false => self.say(lines.join("; "), tone),
+                }
+            }
+            Err(e) => self.say(e, Tone::Bad),
+        }
+    }
+
+    /// Applies one key, named as `KeyboardEvent.key` names it.
+    pub fn key(&mut self, key: &str) -> Option<Request> {
+        match &mut self.mode {
+            Mode::Help => {
+                self.mode = Mode::Normal;
+                return None;
+            }
+            Mode::Detail { scroll, .. } => {
+                match key {
+                    "j" | "ArrowDown" => *scroll = scroll.saturating_add(1),
+                    "k" | "ArrowUp" => *scroll = scroll.saturating_sub(1),
+                    "g" | "Home" => *scroll = 0,
+                    "PageDown" | " " => *scroll = scroll.saturating_add(20),
+                    "PageUp" => *scroll = scroll.saturating_sub(20),
+                    "Escape" | "q" | "Enter" => self.mode = Mode::Normal,
+                    _ => {}
+                }
+                return None;
+            }
+            Mode::Confirm { action, .. } => {
+                let action = action.clone();
+                self.mode = Mode::Normal;
+                return match key {
+                    "y" => Some(Request::Act(action)),
+                    _ => {
+                        self.say("Cancelled.", Tone::Muted);
+                        None
+                    }
+                };
+            }
+            Mode::Prompt { input, .. } => {
+                match key {
+                    "Escape" => {
+                        self.mode = Mode::Normal;
+                        self.say("Cancelled.", Tone::Muted);
+                    }
+                    "Backspace" => {
+                        input.pop();
+                    }
+                    "Enter" => {
+                        let Mode::Prompt {
+                            act, input, pick, ..
+                        } = std::mem::replace(&mut self.mode, Mode::Normal)
+                        else {
+                            unreachable!("in a prompt");
+                        };
+                        let (_, pane) = self.pick();
+                        return self.ask_done(act, &pick, &pane, &input);
+                    }
+                    k if k.chars().count() == 1 => input.push_str(k),
+                    _ => {}
+                }
+                return None;
+            }
+            Mode::Normal => {}
+        }
+        let binding = keys::lookup(key, self.tab)?;
+        let t = index(self.tab);
+        match binding.command {
+            Command::Tab(tab) => {
+                self.tab = tab;
+                self.status = None;
+                return Some(Request::Load(self.query()));
+            }
+            Command::Down | Command::Up | Command::First | Command::Last => {
+                let len = self.panes().get(self.pane[t]).map_or(0, |p| p.items.len());
+                let p = self.pane[t];
+                if let Some(state) = self.selected[t].get_mut(p)
+                    && len > 0
+                {
+                    let at = state.selected().unwrap_or(0);
+                    state.select(Some(match binding.command {
+                        Command::Down => (at + 1).min(len - 1),
+                        Command::Up => at.saturating_sub(1),
+                        Command::First => 0,
+                        _ => len - 1,
+                    }));
+                }
+            }
+            Command::NextPane | Command::PrevPane => {
+                let n = self.panes().len().max(1);
+                self.pane[t] = match binding.command {
+                    Command::NextPane => (self.pane[t] + 1) % n,
+                    _ => (self.pane[t] + n - 1) % n,
+                };
+            }
+            Command::Open => {
+                return match self.pick().0 {
+                    Pick::Run { id, .. } => Some(Request::Load(Query::Run { id })),
+                    Pick::Job { id, .. } => Some(Request::Load(Query::JobLog { id })),
+                    _ => None,
+                };
+            }
+            Command::Back => {
+                self.status = None;
+                if self.tab == Tab::Project {
+                    self.tab = self.previous;
+                    return Some(Request::Load(self.query()));
+                }
+            }
+            Command::OpenProject => match self.pick().0.project() {
+                Some(name) => {
+                    self.project = name.to_string();
+                    if self.tab != Tab::Project {
+                        self.previous = self.tab;
+                    }
+                    self.tab = Tab::Project;
+                    self.status = None;
+                    return Some(Request::Load(self.query()));
+                }
+                None => self.say("Select a row that names a project.", Tone::Warn),
+            },
+            Command::ReportBy => {
+                self.by = (self.by + 1) % By::ALL.len();
+                return Some(Request::Load(self.query()));
+            }
+            Command::Help => self.mode = Mode::Help,
+            Command::Quit => return Some(Request::Quit),
+            Command::Act(act) => {
+                let (pick, pane) = self.pick();
+                match binding.ask {
+                    Ask::Text(label) => {
+                        self.mode = Mode::Prompt {
+                            act,
+                            label,
+                            input: screen::initial_input(act, &pick),
+                            pick,
+                        };
+                    }
+                    Ask::Confirm => match screen::action_in(act, &pick, &pane, "", &self.project) {
+                        Ok(action) => {
+                            self.mode = Mode::Confirm {
+                                action,
+                                question: screen::question(act, &pick),
+                            }
+                        }
+                        Err(e) => self.say(e, Tone::Bad),
+                    },
+                    Ask::Nothing => return self.ask_done(act, &pick, &pane, ""),
+                }
+            }
+        }
+        None
+    }
+
+    fn ask_done(&mut self, act: Act, pick: &Pick, pane: &[Item], input: &str) -> Option<Request> {
+        match screen::action_in(act, pick, pane, input, &self.project) {
+            Ok(a) => {
+                self.say("Working...", Tone::Accent);
+                Some(Request::Act(a))
+            }
+            Err(e) => {
+                self.say(e, Tone::Bad);
+                None
+            }
+        }
+    }
+
+    pub fn render(&mut self, frame: &mut Frame) {
+        let [title, header, body, footer] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(6),
+            Constraint::Length(1),
+        ])
+        .areas(frame.area());
+        frame.render_widget(self.title_bar(title.width), title);
+        let t = index(self.tab);
+        let p = self.palette;
+        match self.screens[t].clone() {
+            None => frame.render_widget(Line::styled(" Loading...", p.muted()), header),
+            Some(Err(e)) => {
+                frame.render_widget(Line::styled(format!(" {e}"), p.tone(Tone::Bad)), header);
+            }
+            Some(Ok(s)) => {
+                if let Some(h) = &s.header {
+                    frame.render_widget(Line::styled(format!(" {h}"), p.muted()), header);
+                }
+                let body = match s.summary.is_empty() {
+                    true => body,
+                    false => {
+                        let [facts, rest] =
+                            Layout::vertical([Constraint::Length(3), Constraint::Min(4)])
+                                .areas(body);
+                        self.render_summary(frame, facts, &s.summary);
+                        rest
+                    }
+                };
+                if let Body::Panes(panes) = &s.body {
+                    self.render_body(frame, body, panes);
+                }
+            }
+        }
+        frame.render_widget(self.footer(), footer);
+        match self.mode.clone() {
+            Mode::Help => self.render_help(frame, body),
+            Mode::Detail { screen: s, scroll } => {
+                if let Body::Detail(d) = &s.body {
+                    self.render_detail(frame, body, d, s.header.as_deref(), scroll);
+                }
+            }
+            Mode::Confirm { question, .. } => self.render_confirm(frame, &question),
+            Mode::Prompt { label, input, .. } => self.render_prompt(frame, label, &input),
+            Mode::Normal => {}
+        }
+    }
+
+    fn title_bar(&self, width: u16) -> Line<'static> {
+        let p = self.palette;
+        let mut spans = vec![Span::styled(
+            " pma ",
+            p.accent().add_modifier(Modifier::BOLD | Modifier::REVERSED),
+        )];
+        spans.push(Span::raw(" "));
+        for b in keys::BINDINGS {
+            if let Command::Tab(tab) = b.command {
+                let current = tab == self.tab;
+                spans.push(Span::styled(
+                    format!(" {}", b.key),
+                    match current {
+                        true => p.accent().add_modifier(Modifier::BOLD),
+                        false => p.muted(),
+                    },
+                ));
+                spans.push(Span::styled(
+                    format!(" {} ", tab.title()),
+                    match current {
+                        true => p
+                            .accent()
+                            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                        false => Style::new(),
+                    },
+                ));
+            }
+        }
+        if self.tab == Tab::Project {
+            spans.push(Span::styled(
+                format!(" {} ", self.project),
+                p.accent()
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+            ));
+        }
+        let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+        let busy = match self.busy {
+            true => (
+                " working ",
+                p.tone(Tone::Accent).add_modifier(Modifier::BOLD),
+            ),
+            false => (" idle ", p.muted()),
+        };
+        let gap = (width as usize).saturating_sub(used + busy.0.len());
+        spans.push(Span::raw(" ".repeat(gap)));
+        spans.push(Span::styled(busy.0, busy.1));
+        Line::from(spans)
+    }
+
+    fn footer(&self) -> Line<'static> {
+        let p = self.palette;
+        match &self.mode {
+            Mode::Prompt { .. } => {
+                return hints(p, &[("Enter", "submit"), ("Esc", "cancel")]);
+            }
+            Mode::Confirm { .. } => return hints(p, &[("y", "yes"), ("any key", "no")]),
+            Mode::Detail { .. } => {
+                return hints(
+                    p,
+                    &[("j/k", "scroll"), ("PgDn/PgUp", "page"), ("Esc", "close")],
+                );
+            }
+            Mode::Help => return hints(p, &[("any key", "close")]),
+            Mode::Normal => {}
+        }
+        if let Some((text, tone)) = &self.status {
+            return Line::from(Span::styled(format!(" {text}"), p.tone(*tone)));
+        }
+        // The acts that fit the selected row, then the ones that need none.
+        let pick = self.pick().0;
+        let mut pairs: Vec<(&str, &str)> = keys::on_tab(self.tab)
+            .iter()
+            .filter(|b| match b.command {
+                Command::Act(a) => a.on_row() && screen::fits(a, &pick),
+                Command::Open => matches!(pick, Pick::Run { .. } | Pick::Job { .. }),
+                Command::OpenProject => pick.project().is_some(),
+                _ => false,
+            })
+            .chain(
+                keys::on_tab(self.tab)
+                    .iter()
+                    .filter(|b| matches!(b.command, Command::Act(a) if !a.on_row())),
+            )
+            .map(|b| (b.key, b.label))
+            .collect();
+        pairs.extend([("?", "keys"), ("q", "quit")]);
+        hints(p, &pairs)
+    }
+
+    fn render_body(&mut self, frame: &mut Frame, area: Rect, panes: &[Pane]) {
+        let [lists, preview] =
+            Layout::vertical([Constraint::Min(4), Constraint::Length(3)]).areas(area);
+        let t = index(self.tab);
+        let areas: Vec<Rect> = match panes.len() {
+            // The matrix: urgent on the left, important on top.
+            4 => {
+                let [upper, lower] =
+                    Layout::vertical([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
+                        .areas(lists);
+                let halves = |r| {
+                    Layout::horizontal([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
+                        .areas::<2>(r)
+                };
+                let [q1, q2] = halves(upper);
+                let [q3, q4] = halves(lower);
+                vec![q1, q2, q3, q4]
+            }
+            _ => Layout::vertical(
+                heights(panes, lists.height)
+                    .into_iter()
+                    .map(Constraint::Length),
+            )
+            .split(lists)
+            .to_vec(),
+        };
+        for (i, (pane, area)) in panes.iter().zip(areas).enumerate() {
+            let focused = i == self.pane[t];
+            let block = self.pane_block(pane, focused);
+            let inner = block.inner(area);
+            frame.render_widget(block, area);
+            if pane.items.is_empty() {
+                frame.render_widget(
+                    Paragraph::new(Line::styled(
+                        pane.empty,
+                        self.palette.muted().add_modifier(Modifier::ITALIC),
+                    ))
+                    .alignment(Alignment::Center)
+                    .wrap(Wrap { trim: true }),
+                    inner,
+                );
+                continue;
+            }
+            let table = self.table(pane, focused);
+            if let Some(state) = self.selected[t].get_mut(i) {
+                frame.render_stateful_widget(table, inner, state);
+            }
+        }
+        self.render_preview(frame, preview, panes);
+    }
+
+    /// A project's facts, label and value, toned and wrapped.
+    fn render_summary(&self, frame: &mut Frame, area: Rect, facts: &[(String, screen::Cell)]) {
+        let p = self.palette;
+        let mut spans = Vec::new();
+        for (label, value) in facts {
+            spans.push(Span::styled(format!("{label} "), p.muted()));
+            spans.push(Span::styled(
+                value.text.clone(),
+                p.tone(value.tone).add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::raw("    "));
+        }
+        frame.render_widget(
+            Paragraph::new(Line::from(spans))
+                .wrap(Wrap { trim: true })
+                .block(Block::new().padding(Padding::new(1, 1, 0, 0))),
+            area,
+        );
+    }
+
+    fn pane_block(&self, pane: &Pane, focused: bool) -> Block<'static> {
+        let p = self.palette;
+        let border = match focused {
+            true => p.accent(),
+            false => p.muted(),
+        };
+        let title = Line::from(vec![
+            Span::styled(
+                format!(" {} ", pane.title),
+                match focused {
+                    true => p.accent().add_modifier(Modifier::BOLD),
+                    false => Style::new().add_modifier(Modifier::BOLD),
+                },
+            ),
+            Span::styled(format!("{} ", pane.items.len()), p.muted()),
+        ]);
+        Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(border)
+            .title(title)
+    }
+
+    fn table(&self, pane: &Pane, focused: bool) -> Table<'static> {
+        let p = self.palette;
+        // A column no row fills says nothing; it is left out.
+        let shown: Vec<usize> = (0..pane.columns.len())
+            .filter(|i| {
+                pane.items
+                    .iter()
+                    .any(|it| it.cells.get(*i).is_some_and(|c| !c.text.is_empty()))
+            })
+            .collect();
+        let widths: Vec<Constraint> = shown
+            .iter()
+            .map(|i| (*i, &pane.columns[*i]))
+            .map(|(i, c)| match c.kind {
+                Kind::Wide => Constraint::Fill(1),
+                _ => {
+                    let longest = pane
+                        .items
+                        .iter()
+                        .map(|it| it.cells.get(i).map_or(0, |c| c.text.chars().count()))
+                        .max()
+                        .unwrap_or(0)
+                        .max(c.title.chars().count());
+                    Constraint::Length(longest.min(28) as u16)
+                }
+            })
+            .collect();
+        let header = Row::new(shown.iter().map(|i| &pane.columns[*i]).map(|c| {
+            let cell = TableCell::from(c.title.to_uppercase());
+            match c.kind {
+                Kind::Number => cell.content(Text::from(c.title.to_uppercase()).right_aligned()),
+                _ => cell,
+            }
+        }))
+        .style(p.muted().add_modifier(Modifier::BOLD));
+        let rows = pane.items.iter().map(|it| {
+            Row::new(
+                shown
+                    .iter()
+                    .map(|i| (&it.cells[*i], &pane.columns[*i]))
+                    .map(|(c, col)| {
+                        let text = Text::from(Span::styled(c.text.clone(), p.tone(c.tone)));
+                        TableCell::from(match col.kind {
+                            Kind::Number => text.right_aligned(),
+                            _ => text,
+                        })
+                    }),
+            )
+        });
+        Table::new(rows, widths)
+            .header(header)
+            .column_spacing(2)
+            // Only the focused pane marks its selection: one cursor on screen.
+            .highlight_symbol(match focused {
+                true => Span::styled("> ", p.accent().add_modifier(Modifier::BOLD)),
+                false => Span::raw("  "),
+            })
+            .highlight_spacing(ratatui::widgets::HighlightSpacing::Always)
+            .row_highlight_style(match focused {
+                true => Style::new().add_modifier(Modifier::REVERSED),
+                false => Style::new(),
+            })
+    }
+
+    /// The focused row in full, column by column: the table truncates what
+    /// this shows.
+    fn render_preview(&self, frame: &mut Frame, area: Rect, panes: &[Pane]) {
+        let p = self.palette;
+        let t = index(self.tab);
+        let block = Block::new()
+            .borders(Borders::TOP)
+            .border_style(p.muted())
+            .title(Span::styled(" selected ", p.muted()));
+        let row = panes.get(self.pane[t]).and_then(|pane| {
+            let i = self.selected[t].get(self.pane[t])?.selected()?;
+            Some((pane, pane.items.get(i)?))
+        });
+        let line = match row {
+            None => Line::styled("Nothing selected.", p.muted()),
+            Some((pane, item)) => {
+                let mut spans = Vec::new();
+                for (c, col) in item.cells.iter().zip(&pane.columns) {
+                    if c.text.is_empty() {
+                        continue;
+                    }
+                    spans.push(Span::styled(format!("{} ", col.title), p.muted()));
+                    spans.push(Span::styled(c.text.clone(), p.tone(c.tone)));
+                    spans.push(Span::raw("   "));
+                }
+                Line::from(spans)
+            }
+        };
+        frame.render_widget(
+            Paragraph::new(line)
+                .wrap(Wrap { trim: true })
+                .block(block.padding(Padding::horizontal(1))),
+            area,
+        );
+    }
+
+    fn render_help(&self, frame: &mut Frame, area: Rect) {
+        let p = self.palette;
+        let on = keys::on_tab(self.tab);
+        let group = |title: &str, f: &dyn Fn(&keys::Binding) -> bool| -> Vec<Line<'static>> {
+            let mut lines = vec![Line::styled(
+                title.to_string(),
+                p.accent().add_modifier(Modifier::BOLD),
+            )];
+            // Keys that do the same thing share a line: `j, ArrowDown`.
+            let mut seen: Vec<(Command, &str, Vec<&str>)> = Vec::new();
+            for b in on.iter().filter(|b| f(b)) {
+                match seen
+                    .iter_mut()
+                    .find(|(c, l, _)| *c == b.command && *l == b.label)
+                {
+                    Some((_, _, keys)) => keys.push(b.key),
+                    None => seen.push((b.command, b.label, vec![b.key])),
+                }
+            }
+            for (_, label, keys) in seen {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{:>16}  ", keys.join(", ")),
+                        Style::new().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(label),
+                ]));
+            }
+            lines.push(Line::raw(""));
+            lines
+        };
+        let mut left = group("Views", &|b| matches!(b.command, Command::Tab(_)));
+        left.extend(group("Move", &|b| {
+            !matches!(b.command, Command::Tab(_) | Command::Act(_))
+        }));
+        let mut right = group(&format!("On {}", self.tab.title()), &|b| {
+            matches!(b.command, Command::Act(_)) && !b.tabs.is_empty()
+        });
+        right.extend(group("Anywhere", &|b| {
+            matches!(b.command, Command::Act(_)) && b.tabs.is_empty()
+        }));
+        let height = (left.len().max(right.len()) as u16 + 2).min(area.height);
+        let area = centered(area, 84.min(area.width), height);
+        frame.render_widget(Clear, area);
+        let block = dialog(p, " Keys ", p.accent());
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let [l, r] =
+            Layout::horizontal([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)]).areas(inner);
+        frame.render_widget(Paragraph::new(left), l);
+        frame.render_widget(Paragraph::new(right), r);
+    }
+
+    fn render_detail(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        d: &Detail,
+        header: Option<&str>,
+        scroll: u16,
+    ) {
+        let p = self.palette;
+        let mut lines: Vec<Line> = Vec::new();
+        if let Some(n) = &d.notice {
+            lines.push(Line::styled(n.clone(), p.tone(Tone::Warn)));
+            lines.push(Line::raw(""));
+        }
+        let width = d
+            .fields
+            .iter()
+            .map(|(l, _)| l.chars().count())
+            .max()
+            .unwrap_or(0);
+        for (label, value) in &d.fields {
+            lines.push(Line::from(vec![
+                Span::styled(format!("{label:>width$}  "), p.muted()),
+                Span::raw(value.clone()),
+            ]));
+        }
+        for (title, kind, text) in &d.sections {
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                title.clone(),
+                p.accent().add_modifier(Modifier::BOLD),
+            ));
+            for l in text.lines() {
+                lines.push(match kind {
+                    Section::Diff => diff_line(p, l),
+                    Section::Log => Line::raw(l.to_string()),
+                    Section::Prose => prose_line(p, l),
+                });
+            }
+        }
+        let mut title = vec![Span::styled(
+            format!(" {} ", d.title),
+            Style::new().add_modifier(Modifier::BOLD),
+        )];
+        if let Some(b) = &d.badge {
+            title.push(Span::styled(format!("{} ", b.text), p.tone(b.tone)));
+        }
+        if let Some(h) = header {
+            title.push(Span::styled(format!(" {h} "), p.muted()));
+        }
+        frame.render_widget(Clear, area);
+        frame.render_widget(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .scroll((scroll, 0))
+                .block(
+                    dialog(p, "", p.accent())
+                        .title(Line::from(title))
+                        .padding(Padding::horizontal(1)),
+                ),
+            area,
+        );
+    }
+
+    fn render_confirm(&self, frame: &mut Frame, question: &str) {
+        let p = self.palette;
+        let width = (question.chars().count() as u16 + 8).clamp(40, 80);
+        let area = centered(frame.area(), width.min(frame.area().width), 5);
+        frame.render_widget(Clear, area);
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::styled(
+                    question.to_string(),
+                    Style::new().add_modifier(Modifier::BOLD),
+                ),
+                Line::raw(""),
+                Line::from(vec![
+                    Span::styled("y", p.tone(Tone::Warn).add_modifier(Modifier::BOLD)),
+                    Span::raw(" yes    "),
+                    Span::styled("any other key", Style::new().add_modifier(Modifier::BOLD)),
+                    Span::raw(" no"),
+                ]),
+            ])
+            .wrap(Wrap { trim: true })
+            .block(dialog(p, " Confirm ", p.tone(Tone::Warn)).padding(Padding::horizontal(1))),
+            area,
+        );
+    }
+
+    fn render_prompt(&self, frame: &mut Frame, label: &str, input: &str) {
+        let p = self.palette;
+        let area = centered(frame.area(), 70.min(frame.area().width), 5);
+        frame.render_widget(Clear, area);
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(vec![
+                    Span::raw(input.to_string()),
+                    Span::styled(" ", Style::new().add_modifier(Modifier::REVERSED)),
+                ]),
+                Line::raw(""),
+                Line::styled("Enter submits, Esc cancels", p.muted()),
+            ])
+            .wrap(Wrap { trim: false })
+            .block(dialog(p, &format!(" {label} "), p.accent()).padding(Padding::horizontal(1))),
+            area,
+        );
+    }
+}
+
+/// Key hints: the key bold in the accent colour, its label plain.
+fn hints(p: Palette, pairs: &[(&str, &str)]) -> Line<'static> {
+    let mut spans = vec![Span::raw(" ")];
+    for (key, label) in pairs {
+        spans.push(Span::styled(
+            key.to_string(),
+            p.accent().add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(format!(" {label}   "), p.muted()));
+    }
+    Line::from(spans)
+}
+
+fn dialog(_p: Palette, title: &str, border: Style) -> Block<'static> {
+    Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(border)
+        .title(Span::styled(
+            title.to_string(),
+            Style::new().add_modifier(Modifier::BOLD),
+        ))
+}
+
+fn centered(area: Rect, width: u16, height: u16) -> Rect {
+    let [v] = Layout::vertical([Constraint::Length(height.min(area.height))])
+        .flex(Flex::Center)
+        .areas(area);
+    let [h] = Layout::horizontal([Constraint::Length(width.min(area.width))])
+        .flex(Flex::Center)
+        .areas(v);
+    h
+}
+
+/// A line of an agent's summary, which is markdown: `**bold**` is bold,
+/// `code` is in the accent colour, and the markers go.
+fn prose_line(p: Palette, l: &str) -> Line<'static> {
+    let mut spans = Vec::new();
+    let (mut bold, mut code) = (false, false);
+    let mut word = String::new();
+    let mut chars = l.chars().peekable();
+    let flush = |word: &mut String, spans: &mut Vec<Span<'static>>, bold: bool, code: bool| {
+        if word.is_empty() {
+            return;
+        }
+        let mut style = match code {
+            true => p.accent(),
+            false => Style::new(),
+        };
+        if bold {
+            style = style.add_modifier(Modifier::BOLD);
+        }
+        spans.push(Span::styled(std::mem::take(word), style));
+    };
+    while let Some(c) = chars.next() {
+        match c {
+            '`' => {
+                flush(&mut word, &mut spans, bold, code);
+                code = !code;
+            }
+            '*' if !code && chars.peek() == Some(&'*') => {
+                chars.next();
+                flush(&mut word, &mut spans, bold, code);
+                bold = !bold;
+            }
+            c => word.push(c),
+        }
+    }
+    flush(&mut word, &mut spans, bold, code);
+    Line::from(spans)
+}
+
+/// Rows for each stacked pane: up to five of its own rows first, so a short
+/// pane is never squeezed out, then the rest shared by how many more each
+/// holds. Three rows hold a border pair and an empty pane's message.
+fn heights(panes: &[Pane], total: u16) -> Vec<u16> {
+    let chrome = 3u16;
+    let want: Vec<u16> = panes
+        .iter()
+        .map(|p| chrome + p.items.len().min(5) as u16)
+        .collect();
+    let base: u16 = want.iter().sum();
+    let mut out = want.clone();
+    let extra: Vec<u16> = panes
+        .iter()
+        .map(|p| p.items.len().saturating_sub(5) as u16)
+        .collect();
+    let spare = total.saturating_sub(base);
+    let weight: u16 = extra.iter().sum();
+    if weight == 0 {
+        if let Some(first) = out.first_mut() {
+            *first += spare;
+        }
+    } else {
+        for (h, e) in out.iter_mut().zip(&extra) {
+            *h += (spare as u32 * *e as u32 / weight as u32).min(*e as u32) as u16;
+        }
+        let used: u16 = out.iter().sum();
+        if let Some(i) = extra.iter().position(|e| *e > 0) {
+            out[i] += total.saturating_sub(used);
+        }
+    }
+    out
+}
+
+/// One line of a unified diff, coloured by what it is.
+fn diff_line(p: Palette, l: &str) -> Line<'static> {
+    let style = if l.starts_with("+++") || l.starts_with("---") || l.starts_with("diff ") {
+        Style::new().add_modifier(Modifier::BOLD)
+    } else if l.starts_with('+') {
+        p.tone(Tone::Good)
+    } else if l.starts_with('-') {
+        p.fg(Color::Red)
+    } else if l.starts_with("@@") {
+        p.accent()
+    } else if l.starts_with("index ") {
+        p.muted()
+    } else {
+        Style::new()
+    };
+    Line::styled(l.to_string(), style)
+}
+
+/// A terminal key as `KeyboardEvent.key` names it, the names the key table
+/// uses.
+pub fn key_name(code: KeyCode) -> Option<String> {
+    Some(match code {
+        KeyCode::Char(c) => c.to_string(),
+        KeyCode::Enter => "Enter".into(),
+        KeyCode::Esc => "Escape".into(),
+        KeyCode::Tab => "Tab".into(),
+        KeyCode::Backspace => "Backspace".into(),
+        KeyCode::Up => "ArrowUp".into(),
+        KeyCode::Down => "ArrowDown".into(),
+        KeyCode::Left => "h".into(),
+        KeyCode::Right => "l".into(),
+        KeyCode::Home => "Home".into(),
+        KeyCode::End => "G".into(),
+        KeyCode::PageUp => "PageUp".into(),
+        KeyCode::PageDown => "PageDown".into(),
+        _ => return None,
+    })
+}
+
+/// Sends a request through the API and gives the app the result. An action is
+/// followed by a reload of the tab, so the view shows what it changed.
+fn execute(store: &Store, app: &mut App, request: Request) {
+    match request {
+        Request::Load(q) => app.loaded(api::query(store, q).map_err(|e| e.to_string())),
+        Request::Act(a) => {
+            app.acted(api::act(store, a).map_err(|e| e.to_string()));
+            let q = app.query();
+            app.loaded(api::query(store, q).map_err(|e| e.to_string()));
+        }
+        Request::Quit => {}
+    }
+}
+
+/// Runs the TUI until `q`. It refreshes the tab every 2 seconds while a job
+/// or an agent run is under way, and every 30 otherwise.
+pub fn run(store: &Store) -> Result<()> {
+    let mut terminal = ratatui::try_init()?;
+    let mut app = App::new();
+    let result = (|| -> Result<()> {
+        let first = Request::Load(app.query());
+        execute(store, &mut app, first);
+        loop {
+            let busy = api::busy(store).unwrap_or(false);
+            app.set_busy(busy);
+            terminal.draw(|f| app.render(f))?;
+            let wait = match busy {
+                true => Duration::from_secs(2),
+                false => Duration::from_secs(30),
+            };
+            if !event::poll(wait)? {
+                if app.idle() {
+                    let again = Request::Load(app.query());
+                    execute(store, &mut app, again);
+                }
+                continue;
+            }
+            let Event::Key(k) = event::read()? else {
+                continue;
+            };
+            if k.kind != KeyEventKind::Press {
+                continue;
+            }
+            if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c') {
+                return Ok(());
+            }
+            let Some(name) = key_name(k.code) else {
+                continue;
+            };
+            match app.key(&name) {
+                Some(Request::Quit) => return Ok(()),
+                Some(request) => {
+                    // Draw "working" before a slow action blocks the loop.
+                    terminal.draw(|f| app.render(f))?;
+                    execute(store, &mut app, request);
+                }
+                None => {}
+            }
+        }
+    })();
+    ratatui::try_restore()?;
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pma_core::next::{Next, Row as NextRow, Subject};
+    use pma_core::store::{Job, Note};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn screen_text(app: &mut App) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(110, 30)).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The colour a piece of text was drawn in.
+    fn colour_of(app: &mut App, text: &str) -> Option<Color> {
+        let mut terminal = Terminal::new(TestBackend::new(110, 30)).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        for y in 0..buffer.area.height {
+            let line: String = (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect();
+            if let Some(at) = line.find(text) {
+                let x = line[..at].chars().count() as u16;
+                return Some(buffer[(x, y)].fg);
+            }
+        }
+        None
+    }
+
+    fn colour(app: App) -> App {
+        App {
+            palette: Palette { color: true },
+            ..app
+        }
+    }
+
+    fn next_view() -> View {
+        View::Next {
+            header: "last scan just now".into(),
+            limit: None,
+            lists: Next {
+                agents: vec![NextRow {
+                    cells: vec![
+                        "a:5".into(),
+                        "T1".into(),
+                        "critical".into(),
+                        "open 3d".into(),
+                        "text of a".into(),
+                    ],
+                    command: Some("pma dispatch a:5".into()),
+                    subject: Subject::Task {
+                        project: "a".into(),
+                        target: "a:5".into(),
+                        retry: false,
+                    },
+                }],
+                runs: vec![NextRow {
+                    cells: vec![
+                        "#4".into(),
+                        "ready".into(),
+                        "to review".into(),
+                        "b".into(),
+                        "a run".into(),
+                    ],
+                    command: Some("pma review 4".into()),
+                    subject: Subject::Run {
+                        id: 4,
+                        state: "ready".into(),
+                        project: "b".into(),
+                    },
+                }],
+                tasks: vec![],
+            },
+        }
+    }
+
+    fn job(id: i64, state: &str) -> Job {
+        Job {
+            id,
+            args: vec!["workflow".into(), "run".into(), "w".into()],
+            cwd: "/".into(),
+            state: state.into(),
+            created_at: 0,
+            started_at: None,
+            finished_at: None,
+            pid: None,
+            exit_code: None,
+            awaiting: None,
+        }
+    }
+
+    /// The app opens on `next`; a digit loads another tab; keys act on the
+    /// selected row as the table says.
+    #[test]
+    fn tabs_load_and_keys_act_on_the_selection() {
+        let mut app = App::new();
+        assert_eq!(app.query(), Tab::Next.query(By::Class, ""));
+        app.loaded(Ok(next_view()));
+        let out = screen_text(&mut app);
+        assert!(
+            out.contains("Ready for agents 1") && out.contains("Runs waiting on you 1"),
+            "{out}"
+        );
+        assert!(out.contains("TASK") && out.contains("PRIORITY"), "{out}");
+        assert!(out.contains("> a:5"), "{out}");
+        assert!(out.contains("Tasks for you 0"), "{out}");
+        assert!(
+            out.contains("No critical or urgent task needs you."),
+            "{out}"
+        );
+        assert!(out.contains("last scan just now"), "{out}");
+
+        // `d` asks first, then dispatches the selected task.
+        assert_eq!(app.key("d"), None);
+        assert!(screen_text(&mut app).contains("dispatch a:5?"));
+        let Some(Request::Act(Action::Dispatch { targets, .. })) = app.key("y") else {
+            panic!("a dispatch");
+        };
+        assert_eq!(targets, ["a:5"]);
+
+        app.key("Tab");
+        assert_eq!(app.key("Enter"), None, "not a key on next");
+        assert_eq!(app.key("4"), Some(Request::Load(Query::Jobs)));
+        app.loaded(Ok(View::Jobs(vec![
+            job(7, "awaiting-approval"),
+            job(6, "done"),
+        ])));
+        assert!(screen_text(&mut app).contains("> #7"));
+        assert_eq!(
+            app.key("a"),
+            Some(Request::Act(Action::ApproveJob { id: 7 }))
+        );
+        app.key("j");
+        assert_eq!(app.key("a"), None);
+        assert!(
+            app.status.as_ref().unwrap().0.contains("not waiting"),
+            "{:?}",
+            app.status
+        );
+        assert_eq!(
+            app.key("Enter"),
+            Some(Request::Load(Query::JobLog { id: 6 }))
+        );
+        app.loaded(Ok(View::JobLog {
+            id: 6,
+            text: Some("plan abc".into()),
+        }));
+        assert!(!app.idle(), "a detail holds off refreshes");
+        assert!(screen_text(&mut app).contains("plan abc"));
+        app.key("Escape");
+        assert!(app.idle());
+        assert_eq!(app.key("q"), Some(Request::Quit));
+    }
+
+    /// `o` opens the selected row's project; Escape goes back to where it was
+    /// opened from.
+    #[test]
+    fn a_project_opens_from_its_row_and_closes_back() {
+        let mut app = App::new();
+        app.loaded(Ok(next_view()));
+        assert_eq!(
+            app.key("o"),
+            Some(Request::Load(Query::Project { name: "a".into() }))
+        );
+        assert_eq!(app.tab, Tab::Project);
+        assert!(
+            screen_text(&mut app).contains(" a "),
+            "the title bar names it"
+        );
+        let Some(Request::Act(Action::Scan { of, .. })) = app.key("r") else {
+            panic!("a rescan");
+        };
+        assert_eq!(of.projects, ["a"], "that project, not the portfolio");
+        assert_eq!(
+            app.key("Escape"),
+            Some(Request::Load(Query::Next {
+                of: api::Selection::default(),
+                all: true
+            }))
+        );
+        assert_eq!(app.tab, Tab::Next);
+    }
+
+    /// Meaning is coloured: a critical priority red, a run waiting on you
+    /// yellow; `NO_COLOR` draws both plain.
+    #[test]
+    fn colour_carries_meaning_unless_turned_off() {
+        let mut app = colour(App::new());
+        app.loaded(Ok(next_view()));
+        assert_eq!(colour_of(&mut app, "critical"), Some(Color::Red));
+        assert_eq!(colour_of(&mut app, "ready"), Some(Color::Yellow));
+        let mut plain = App {
+            palette: Palette { color: false },
+            ..App::new()
+        };
+        plain.loaded(Ok(next_view()));
+        assert_eq!(colour_of(&mut plain, "critical"), Some(Color::Reset));
+    }
+
+    /// A prompt reads text, starts from the note's own, and builds the action
+    /// on Enter; Escape leaves it.
+    #[test]
+    fn prompts_read_text_for_the_action() {
+        let mut app = App::new();
+        app.key("9");
+        app.loaded(Ok(View::Notes(vec![Note {
+            id: 3,
+            created_at: 0,
+            updated_at: 0,
+            text: "old".into(),
+        }])));
+        app.key("e");
+        assert!(screen_text(&mut app).contains("old"));
+        app.key("Backspace");
+        app.key("!");
+        assert_eq!(
+            app.key("Enter"),
+            Some(Request::Act(Action::EditNote {
+                id: 3,
+                text: "ol!".into()
+            }))
+        );
+        app.key("n");
+        app.key("x");
+        assert_eq!(app.key("Escape"), None);
+        assert_eq!(app.status.as_ref().unwrap().0, "Cancelled.");
+        app.key("x");
+        assert!(screen_text(&mut app).contains("remove note #3?"));
+        assert_eq!(app.key("n"), None, "anything but y cancels");
+    }
+
+    #[test]
+    fn outcomes_and_errors_show_in_the_footer() {
+        let mut app = colour(App::new());
+        app.loaded(Err("nothing scanned yet; run `pma scan`".into()));
+        assert!(screen_text(&mut app).contains("nothing scanned yet"));
+        app.acted(Ok(Outcome {
+            said: vec!["job 3 queued".into()],
+            warnings: vec![],
+        }));
+        assert_eq!(colour_of(&mut app, "job 3 queued"), Some(Color::Green));
+        app.acted(Err("run #1 is now approved".into()));
+        assert_eq!(colour_of(&mut app, "run #1 is now"), Some(Color::Red));
+        app.key("?");
+        let help = screen_text(&mut app);
+        assert!(
+            help.contains("add note") && help.contains("Views"),
+            "{help}"
+        );
+        app.key("x");
+        assert!(app.idle());
+    }
+
+    /// A run's diff is coloured by line: additions green, removals red.
+    #[test]
+    fn a_diff_is_coloured_by_line() {
+        let mut app = colour(App::new());
+        app.loaded(Ok(View::JobLog { id: 1, text: None }));
+        let Mode::Detail { screen: s, .. } = app.mode.clone() else {
+            panic!("a detail");
+        };
+        let Body::Detail(mut d) = s.body else {
+            panic!("a detail body");
+        };
+        d.sections = vec![(
+            "Diff".into(),
+            Section::Diff,
+            "@@ -1 +1 @@\n-old line\n+new line\n".into(),
+        )];
+        app.mode = Mode::Detail {
+            screen: Screen {
+                tab: None,
+                header: None,
+                summary: Vec::new(),
+                body: Body::Detail(d),
+            },
+            scroll: 0,
+        };
+        assert_eq!(colour_of(&mut app, "+new line"), Some(Color::Green));
+        assert_eq!(colour_of(&mut app, "-old line"), Some(Color::Red));
+        assert_eq!(colour_of(&mut app, "@@ -1"), Some(Color::Cyan));
+    }
+
+    /// Every key the table binds on a tab does something there or says why
+    /// not: none is silently dropped.
+    #[test]
+    fn every_bound_key_is_handled() {
+        for tab in Tab::ALL {
+            for b in keys::on_tab(tab) {
+                let mut app = App::new();
+                app.tab = tab;
+                let before = (app.status.clone(), app.mode.clone(), app.tab, app.by);
+                let out = app.key(b.key);
+                let after = (app.status.clone(), app.mode.clone(), app.tab, app.by);
+                let quiet = matches!(
+                    b.command,
+                    Command::Down
+                        | Command::Up
+                        | Command::First
+                        | Command::Last
+                        | Command::NextPane
+                        | Command::PrevPane
+                        | Command::Back
+                        | Command::Open
+                );
+                assert!(
+                    out.is_some() || before != after || quiet,
+                    "`{}` on {tab:?} did nothing",
+                    b.key
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_keys_take_the_table_names() {
+        assert_eq!(key_name(KeyCode::Esc).as_deref(), Some("Escape"));
+        assert_eq!(key_name(KeyCode::Down).as_deref(), Some("ArrowDown"));
+        assert_eq!(key_name(KeyCode::Char('G')).as_deref(), Some("G"));
+        for b in keys::BINDINGS {
+            assert!(
+                b.key.chars().count() == 1
+                    || ["Enter", "Escape", "Tab", "ArrowDown", "ArrowUp"].contains(&b.key),
+                "the TUI cannot send `{}`",
+                b.key
+            );
+        }
+    }
+}

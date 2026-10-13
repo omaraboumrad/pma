@@ -24,11 +24,31 @@ pub enum Taken {
     Absent,
 }
 
-/// One row of either list: its cells, and the command that acts on it.
+/// One row of either list: its cells, the command that acts on it, and what
+/// it is about, for a front end that acts on it directly.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Row {
     pub cells: Vec<String>,
     pub command: Option<String>,
+    pub subject: Subject,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Subject {
+    /// A task, by its dispatch target; `retry` once its attempts are used.
+    Task {
+        project: String,
+        target: String,
+        retry: bool,
+    },
+    /// A task no agent may take.
+    Manual { project: String },
+    /// A run, with the state this row showed and its project.
+    Run {
+        id: i64,
+        state: String,
+        project: String,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -76,14 +96,27 @@ pub fn build(
             (true, Taken::Free) => next.agents.push(Row {
                 cells: cells(""),
                 command: Some(format!("pma dispatch {at}")),
+                subject: Subject::Task {
+                    project: t.project.clone(),
+                    target: at.clone(),
+                    retry: false,
+                },
             }),
             (true, Taken::Exhausted(n)) if needs_you => next.tasks.push(Row {
                 cells: cells(&format!("{n} attempts used")),
                 command: Some(format!("pma dispatch {at} --retry")),
+                subject: Subject::Task {
+                    project: t.project.clone(),
+                    target: at.clone(),
+                    retry: true,
+                },
             }),
             (false, _) if needs_you && t.line.is_some() => next.tasks.push(Row {
                 cells: cells("not for agents"),
                 command: None,
+                subject: Subject::Manual {
+                    project: t.project.clone(),
+                },
             }),
             _ => {}
         }
@@ -126,6 +159,11 @@ pub fn build(
                 report::truncate(&r.text, 80),
             ],
             command: Some(command),
+            subject: Subject::Run {
+                id: r.id,
+                state: r.state.name().into(),
+                project: r.project.clone(),
+            },
         });
     }
     next
@@ -167,6 +205,7 @@ pub fn render(next: &Next, limit: Option<usize>) -> String {
             .map(|r| Row {
                 cells: r.cells.iter().cloned().chain(r.command.clone()).collect(),
                 command: None,
+                subject: r.subject.clone(),
             })
             .collect();
         out.push_str(&section(&rows, "    "));

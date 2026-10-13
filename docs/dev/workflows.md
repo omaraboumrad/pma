@@ -607,7 +607,7 @@ Two `edit` nodes over the same project in one pass produce two worktrees and two
 
 Two match dimensions, no new mechanism. `Policy::route` stays first match wins.
 
-`src/route.rs`:
+`crates/pma-core/src/route.rs`:
 
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq)]

@@ -3243,6 +3243,481 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"ok","total
     );
 }
 
+/// A child process killed when dropped, so a failed assertion does not leave
+/// a server running that holds the test's output open.
+struct Killed(std::process::Child);
+
+impl Drop for Killed {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// One request to a local server, read to the end; the server closes the
+/// connection after each answer.
+fn http(port: u16, raw: &str) -> String {
+    use std::io::{Read, Write};
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .unwrap();
+    s.write_all(raw.as_bytes()).unwrap();
+    let mut out = String::new();
+    let _ = s.read_to_string(&mut out);
+    out
+}
+
+fn post(port: u16, path: &str, origin: &str, cookie: &str, body: &str) -> String {
+    http(
+        port,
+        &format!(
+            "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: {origin}\r\n\
+             Content-Type: application/json\r\nCookie: {cookie}\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        ),
+    )
+}
+
+/// `pma web` serves this machine only: a request naming another host, a POST
+/// from another origin or not in JSON, and a data request without the
+/// session cookie are each refused. With the cookie, the page reads and acts
+/// on the same store the CLI does.
+#[test]
+fn the_web_view_is_local_and_shares_the_store() {
+    use std::io::{BufRead, BufReader, Read};
+    let s = Scratch::new("web");
+    let env = Env {
+        home: s.0.join("home"),
+        bin: s.0.join("bin"),
+        push_log: s.0.join("push.log"),
+    };
+    let mut child = env
+        .command(&["web", "--no-open"])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .map(Killed)
+        .unwrap();
+    let mut first = String::new();
+    BufReader::new(child.0.stdout.take().unwrap())
+        .read_line(&mut first)
+        .unwrap();
+    let url = first.trim().strip_prefix("pma web: ").expect("the address");
+    let rest = url
+        .strip_prefix("http://127.0.0.1:")
+        .expect("loopback only");
+    let (port, token) = rest.split_once("/#").expect("the token in the fragment");
+    let port: u16 = port.parse().unwrap();
+    let origin = format!("http://127.0.0.1:{port}");
+    let get = |path: &str, host: &str, cookie: &str| {
+        http(
+            port,
+            &format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nCookie: {cookie}\r\n\r\n"),
+        )
+    };
+    let host = format!("127.0.0.1:{port}");
+
+    let page = get("/", &host, "");
+    assert!(page.starts_with("HTTP/1.1 200"), "{page}");
+    assert!(page.contains("Content-Security-Policy: default-src 'none'; script-src 'self'"));
+    assert!(!page.contains(token), "the page holds no secret");
+    assert!(get("/", &format!("evil.example:{port}"), "").starts_with("HTTP/1.1 421"));
+    assert!(get("/api/keys", &host, "").starts_with("HTTP/1.1 403"));
+    assert!(get("/api/keys", &host, "pma_session=nope").starts_with("HTTP/1.1 403"));
+
+    let ok = format!("{{\"token\":\"{token}\"}}");
+    assert!(post(port, "/session", "http://evil.example", "", &ok).starts_with("HTTP/1.1 403"));
+    assert!(
+        post(port, "/session", &origin, "", "{\"token\":\"0000\"}").starts_with("HTTP/1.1 403")
+    );
+    let session = post(port, "/session", &origin, "", &ok);
+    assert!(session.starts_with("HTTP/1.1 204"), "{session}");
+    assert!(session.contains("HttpOnly; SameSite=Strict"), "{session}");
+    let cookie = format!("pma_session={token}");
+
+    // Through `ssh -L 9000:127.0.0.1:<port>`, the browser names the local
+    // port: that works, as long as the origin is the host's own.
+    assert!(get("/api/keys", "127.0.0.1:9000", &cookie).starts_with("HTTP/1.1 200"));
+    let forwarded = http(
+        port,
+        &format!(
+            "POST /session HTTP/1.1\r\nHost: localhost:9000\r\nOrigin: http://localhost:9000\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{ok}",
+            ok.len()
+        ),
+    );
+    assert!(forwarded.starts_with("HTTP/1.1 204"), "{forwarded}");
+    let crossed = http(
+        port,
+        &format!(
+            "POST /session HTTP/1.1\r\nHost: 127.0.0.1:9000\r\nOrigin: {origin}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{ok}",
+            ok.len()
+        ),
+    );
+    assert!(crossed.starts_with("HTTP/1.1 403"), "{crossed}");
+
+    let keys = get("/api/keys", &host, &cookie);
+    assert!(keys.contains("\"AddNote\""), "{keys}");
+    let note =
+        r#"{"tab":"notes","act":"AddNote","pick":{"kind":"nothing"},"input":"from the web"}"#;
+    assert!(
+        post(port, "/api/act", "http://evil.example", &cookie, note).starts_with("HTTP/1.1 403")
+    );
+    let plain = http(
+        port,
+        &format!(
+            "POST /api/act HTTP/1.1\r\nHost: {host}\r\nOrigin: {origin}\r\nCookie: {cookie}\r\n\
+             Content-Type: text/plain\r\nContent-Length: {}\r\n\r\n{note}",
+            note.len()
+        ),
+    );
+    assert!(plain.starts_with("HTTP/1.1 415"), "{plain}");
+    let acted = post(port, "/api/act", &origin, &cookie, note);
+    assert!(acted.contains("\"said\":[\"#1\"]"), "{acted}");
+    assert!(
+        env.ok(&["note"]).contains("from the web"),
+        "the CLI sees it"
+    );
+    let notes = get("/api/screen?tab=notes", &host, &cookie);
+    assert!(
+        notes.contains("from the web") && notes.contains("\"kind\":\"note\""),
+        "{notes}"
+    );
+
+    // A confirmed act that cannot apply is refused before its question.
+    let ask = post(
+        port,
+        "/api/ask",
+        &origin,
+        &cookie,
+        r#"{"tab":"runs","act":"RejectRun","pick":{"kind":"nothing"}}"#,
+    );
+    assert!(
+        ask.starts_with("HTTP/1.1 400") && ask.contains("select a run first"),
+        "{ask}"
+    );
+    let runs = get("/api/screen?tab=runs", &host, &cookie);
+    assert!(
+        runs.contains("Runs not yet final") && runs.contains("\"items\":[]"),
+        "{runs}"
+    );
+
+    let mut events = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    events
+        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .unwrap();
+    std::io::Write::write_all(
+        &mut events,
+        format!("GET /api/events HTTP/1.1\r\nHost: {host}\r\nCookie: {cookie}\r\n\r\n").as_bytes(),
+    )
+    .unwrap();
+    let mut buf = [0u8; 2048];
+    let mut got = String::new();
+    while !got.contains("\n\n") || !got.contains("event: tick") {
+        let n = events.read(&mut buf).unwrap();
+        assert!(n > 0, "the stream closed: {got}");
+        got.push_str(&String::from_utf8_lossy(&buf[..n]));
+    }
+    assert!(got.contains("text/event-stream"), "{got}");
+
+    drop(child);
+}
+
+/// `--port` names the port, so an SSH forward can be written once.
+#[test]
+fn the_web_view_listens_on_the_port_named() {
+    use std::io::{BufRead, BufReader};
+    let s = Scratch::new("webport");
+    let env = Env {
+        home: s.0.join("home"),
+        bin: s.0.join("bin"),
+        push_log: s.0.join("push.log"),
+    };
+    let free = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let mut child = env
+        .command(&["web", "--no-open", "--port", &free.to_string()])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .map(Killed)
+        .unwrap();
+    let mut first = String::new();
+    BufReader::new(child.0.stdout.take().unwrap())
+        .read_line(&mut first)
+        .unwrap();
+    assert!(
+        first.starts_with(&format!("pma web: http://127.0.0.1:{free}/#")),
+        "{first}"
+    );
+    let page = http(
+        free,
+        &format!("GET / HTTP/1.1\r\nHost: 127.0.0.1:{free}\r\n\r\n"),
+    );
+    assert!(page.starts_with("HTTP/1.1 200"), "{page}");
+    drop(child);
+    let (_, err, success) = env.run(&["web", "--no-open", "--app"]);
+    assert!(!success && err.contains("--app"), "{err}");
+}
+
+/// Starts `pma web` for `env` and signs in: the child, its port and the
+/// session cookie.
+fn start_web(env: &Env) -> (Killed, u16, String) {
+    use std::io::{BufRead, BufReader};
+    let mut child = env
+        .command(&["web", "--no-open"])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .map(Killed)
+        .unwrap();
+    let mut first = String::new();
+    BufReader::new(child.0.stdout.take().unwrap())
+        .read_line(&mut first)
+        .unwrap();
+    let rest = first
+        .trim()
+        .strip_prefix("pma web: http://127.0.0.1:")
+        .expect("the address");
+    let (port, token) = rest.split_once("/#").unwrap();
+    let port: u16 = port.parse().unwrap();
+    let signed = post(
+        port,
+        "/session",
+        &format!("http://127.0.0.1:{port}"),
+        "",
+        &format!("{{\"token\":\"{token}\"}}"),
+    );
+    assert!(signed.starts_with("HTTP/1.1 204"), "{signed}");
+    (child, port, format!("pma_session={token}"))
+}
+
+/// A web request's status and JSON body.
+fn web(
+    port: u16,
+    cookie: &str,
+    path: &str,
+    body: Option<serde_json::Value>,
+) -> (u16, serde_json::Value) {
+    let raw = match body {
+        None => http(
+            port,
+            &format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nCookie: {cookie}\r\n\r\n"),
+        ),
+        Some(b) => post(
+            port,
+            path,
+            &format!("http://127.0.0.1:{port}"),
+            cookie,
+            &b.to_string(),
+        ),
+    };
+    let status = raw[9..12].parse().unwrap();
+    let body = raw.split_once("\r\n\r\n").map_or("", |(_, b)| b);
+    (
+        status,
+        serde_json::from_str(body).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+/// The first row of a tab, as the page sees it.
+fn first_pick(port: u16, cookie: &str, tab: &str) -> serde_json::Value {
+    let (status, screen) = web(port, cookie, &format!("/api/screen?tab={tab}"), None);
+    assert_eq!(status, 200, "{screen}");
+    screen["body"]["panes"][0]["items"][0]["pick"].clone()
+}
+
+/// Two front ends on one store: what one was shown is what it may act on.
+/// The web saw run #1 ready; the CLI approved it since; the web's reject is
+/// refused until it reads the run again.
+#[test]
+fn front_ends_racing_on_one_run_act_only_on_what_they_were_shown() {
+    let s = Scratch::new("racerun");
+    let (env, _origin, _alpha) = dispatch_env(&s, &[("claude", FAKE_CLAUDE)]);
+    env.ok(&["dispatch", "alpha:5"]);
+    let (child, port, cookie) = start_web(&env);
+    let seen = first_pick(port, &cookie, "runs");
+    assert_eq!(seen["state"], "ready", "{seen}");
+
+    env.ok(&["review", "1", "--approve"]);
+    let reject = |pick: &serde_json::Value| {
+        web(
+            port,
+            &cookie,
+            "/api/act",
+            Some(serde_json::json!({ "tab": "runs", "act": "RejectRun", "pick": pick })),
+        )
+    };
+    let (status, body) = reject(&seen);
+    assert_eq!(status, 400);
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("is now approved, not ready"),
+        "{body}"
+    );
+    assert!(
+        env.ok(&["review"]).contains("#1  approved"),
+        "nothing changed"
+    );
+
+    let fresh = first_pick(port, &cookie, "runs");
+    assert_eq!(fresh["state"], "approved");
+    let (status, body) = reject(&fresh);
+    assert_eq!(status, 200, "{body}");
+    let (_, err, success) = env.run(&["review", "1", "--approve"]);
+    assert!(!success && err.contains("rejected"), "{err}");
+    drop(child);
+}
+
+/// A plan a job waits on is approved once, whichever front end gets there
+/// first: the web approves the job, and the CLI's approval of the same job,
+/// and of the same plan, are refused.
+#[test]
+fn front_ends_racing_on_one_plan_approve_it_once() {
+    let s = Scratch::new("raceplan");
+    let worker = r#"#!/bin/sh
+echo hi > hello.txt
+echo '{"type":"result","subtype":"success","is_error":false,"result":"ok","total_cost_usd":0.1}'
+"#;
+    let (env, _origin, alpha) = dispatch_env(&s, &[("claude", worker)]);
+    let wf = s.0.join("greet.rhai");
+    fs::write(&wf, GREET).unwrap();
+    env.ok(&["config", "workflow_budget", "20"]);
+    env.ok(&["workflow", "propose", wf.to_str().unwrap()]);
+    env.ok(&["workflow", "activate", "1"]);
+    env.ok(&[
+        "workflow", "run", "greet", "alpha", "--local", "-m", "haiku", "--detach",
+    ]);
+    wait_for_job(&env, 60, |j| j.contains("awaiting-approval"));
+    let log = env.ok(&["job", "log", "1"]);
+    let at = log.find("\nplan ").expect("a plan") + "\nplan ".len();
+    let plan: String = log[at..]
+        .chars()
+        .take_while(|c| c.is_ascii_hexdigit())
+        .collect();
+
+    let (child, port, cookie) = start_web(&env);
+    let job = first_pick(port, &cookie, "jobs");
+    assert_eq!(job["awaiting"], true, "{job}");
+    let (status, body) = web(
+        port,
+        &cookie,
+        "/api/act",
+        Some(serde_json::json!({ "tab": "jobs", "act": "ApproveJob", "pick": job })),
+    );
+    assert_eq!(status, 200, "{body}");
+    let (_, err, success) = env.run(&["job", "approve", "1"]);
+    assert!(!success && err.contains("not awaiting approval"), "{err}");
+
+    wait_for_job(&env, 60, |j| j.contains("#2") && j.contains("done"));
+    assert_eq!(fs::read_to_string(alpha.join("hello.txt")).unwrap(), "hi\n");
+    let (_, err, success) = env.run(&[
+        "workflow",
+        "run",
+        "greet",
+        "--instance",
+        "1",
+        "-m",
+        "haiku",
+        "--approve",
+        &plan,
+    ]);
+    assert!(!success, "a spent plan runs again: {err}");
+    drop(child);
+}
+
+/// Every act the key table binds is one the web server takes by name: asked
+/// about with no row selected, it answers with a question or with the reason
+/// it cannot apply, never with a request it could not read.
+#[test]
+fn the_web_understands_every_act_in_the_key_table() {
+    let s = Scratch::new("webacts");
+    let env = Env {
+        home: s.0.join("home"),
+        bin: s.0.join("bin"),
+        push_log: s.0.join("push.log"),
+    };
+    let (child, port, cookie) = start_web(&env);
+    let (_, keys) = web(port, &cookie, "/api/keys", None);
+    let mut asked = 0;
+    for b in keys["bindings"].as_array().unwrap() {
+        if b["command"]["kind"] != "act" {
+            continue;
+        }
+        let tab = b["tabs"][0].as_str().unwrap_or("next");
+        let (status, body) = web(
+            port,
+            &cookie,
+            "/api/ask",
+            Some(serde_json::json!({
+                "tab": tab,
+                "act": b["command"]["act"],
+                "pick": { "kind": "nothing" },
+            })),
+        );
+        assert!(
+            status == 200 || body["error"].is_string(),
+            "{}: {status} {body}",
+            b["command"]["act"]
+        );
+        asked += 1;
+    }
+    assert!(asked >= 21, "{asked}");
+    drop(child);
+}
+
+/// `pma project show` gives one project's state, open tasks and runs.
+#[test]
+fn a_project_shows_its_state_tasks_and_runs() {
+    let s = Scratch::new("projectshow");
+    let (env, _origin, _alpha) = dispatch_env(&s, &[("claude", FAKE_CLAUDE)]);
+    env.ok(&["dispatch", "alpha:5"]);
+    let out = env.ok(&["project", "show", "alpha"]);
+    assert!(out.starts_with("alpha  "), "{out}");
+    assert!(
+        out.contains("Open tasks:") && out.contains("add greeting"),
+        "{out}"
+    );
+    assert!(out.contains("Runs: 1") && out.contains("#1"), "{out}");
+    let (_, err, success) = env.run(&["project", "show", "nope"]);
+    assert!(!success && err.contains("unknown project `nope`"), "{err}");
+}
+
+/// Configuration lives in `settings.toml`. `pma config` writes it, keeping
+/// what the user wrote; a hand edit is what the next command reads; and an
+/// invalid file stops every command, naming the key.
+#[test]
+fn settings_toml_is_the_configuration() {
+    let s = Scratch::new("settingstoml");
+    let env = Env {
+        home: s.0.join("home"),
+        bin: s.0.join("bin"),
+        push_log: s.0.join("push.log"),
+    };
+    let file = env.home.join("settings.toml");
+    env.ok(&["config", "agent_budget", "3"]);
+    let text = fs::read_to_string(&file).unwrap();
+    assert!(text.contains("[config]\nagent_budget = 3\n"), "{text}");
+
+    fs::write(
+        &file,
+        text.replace("agent_budget = 3", "# mine\nagent_budget = 4"),
+    )
+    .unwrap();
+    assert_eq!(env.ok(&["config", "agent_budget"]).trim(), "4");
+    env.ok(&["config", "max_parallel", "1"]);
+    let text = fs::read_to_string(&file).unwrap();
+    assert!(text.contains("# mine\nagent_budget = 4\n"), "{text}");
+    assert!(text.contains("max_parallel = 1"), "{text}");
+
+    fs::write(&file, text.replace("max_parallel = 1", "max_parallel = 0")).unwrap();
+    let (_, err, success) = env.run(&["job"]);
+    assert!(!success && err.contains("config.max_parallel"), "{err}");
+}
+
 /// An agent drafts changelog entries in `.pma/changelog.md` rather than in
 /// `CHANGELOG.md`. pma keeps the file out of the change and shows it in
 /// `pma review`; a run that drafted none is flagged, not discarded.
@@ -4819,7 +5294,7 @@ fn next_lists_work_for_agents_and_for_you() {
 #[test]
 fn the_documented_workflow_library_reads_as_documented() {
     let doc = fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/dev/workflows.md"),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/dev/workflows.md"),
     )
     .unwrap();
     let blocks = |text: &str| -> Vec<serde_json::Value> {

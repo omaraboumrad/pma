@@ -1,0 +1,13 @@
+[package]
+name = "pma-web"
+description = "pma's local web front end"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+pma-core.workspace = true
+serde_json.workspace = true
+httparse.workspace = true

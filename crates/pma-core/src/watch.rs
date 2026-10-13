@@ -78,7 +78,7 @@ fn latest_log(state: &Path, run: i64) -> Option<PathBuf> {
         .last()
 }
 
-fn age(seconds: i64) -> String {
+pub fn age(seconds: i64) -> String {
     match seconds {
         s if s < 60 => format!("{s}s"),
         s if s < 3600 => format!("{}m{:02}s", s / 60, s % 60),
@@ -86,13 +86,51 @@ fn age(seconds: i64) -> String {
     }
 }
 
+/// A running agent: its run, how long it has run, how long its log has been
+/// quiet, and what the log says.
+pub struct Agent<'a> {
+    pub run: &'a Run,
+    pub running: String,
+    pub quiet: String,
+    pub progress: Progress,
+}
+
+/// The jobs not yet settled.
+pub fn open_jobs(jobs: &[Job]) -> Vec<&Job> {
+    jobs.iter()
+        .filter(|j| matches!(j.state.as_str(), "queued" | "running" | "awaiting-approval"))
+        .collect()
+}
+
+/// Each running run, with its progress read from its newest log.
+pub fn agents<'a>(state: &Path, runs: &'a [Run], now: i64) -> Vec<Agent<'a>> {
+    runs.iter()
+        .filter(|r| r.state == RunState::Running)
+        .map(|r| {
+            let log = latest_log(state, r.id);
+            let quiet = log
+                .as_ref()
+                .and_then(|l| std::fs::metadata(l).ok())
+                .and_then(|m| m.modified().ok())
+                .and_then(|m| m.elapsed().ok())
+                .map_or("?".into(), |d| age(d.as_secs() as i64));
+            Agent {
+                run: r,
+                running: r.dispatched_at.map_or("?".into(), |t| age(now - t)),
+                quiet,
+                progress: log
+                    .and_then(|l| std::fs::read_to_string(l).ok())
+                    .map(|text| progress(&text))
+                    .unwrap_or_default(),
+            }
+        })
+        .collect()
+}
+
 /// One screen: the jobs not yet settled, then each running run.
 pub fn screen(state: &Path, jobs: &[Job], runs: &[Run], now: i64) -> String {
     let mut out = String::new();
-    let open: Vec<&Job> = jobs
-        .iter()
-        .filter(|j| matches!(j.state.as_str(), "queued" | "running" | "awaiting-approval"))
-        .collect();
+    let open = open_jobs(jobs);
     for j in &open {
         out.push_str(&format!(
             "job #{} {}: pma {}\n",
@@ -101,26 +139,12 @@ pub fn screen(state: &Path, jobs: &[Job], runs: &[Run], now: i64) -> String {
             j.args.join(" ")
         ));
     }
-    let running: Vec<&Run> = runs
-        .iter()
-        .filter(|r| r.state == RunState::Running)
-        .collect();
+    let running = agents(state, runs, now);
     if running.is_empty() {
         out.push_str("no agent is running\n");
     }
-    for r in running {
-        let since = r.dispatched_at.map_or("?".into(), |t| age(now - t));
-        let log = latest_log(state, r.id);
-        let quiet = log
-            .as_ref()
-            .and_then(|l| std::fs::metadata(l).ok())
-            .and_then(|m| m.modified().ok())
-            .and_then(|m| m.elapsed().ok())
-            .map_or("?".into(), |d| age(d.as_secs() as i64));
-        let p = log
-            .and_then(|l| std::fs::read_to_string(l).ok())
-            .map(|text| progress(&text))
-            .unwrap_or_default();
+    for a in running {
+        let (r, since, quiet, p) = (a.run, a.running, a.quiet, a.progress);
         out.push_str(&format!(
             "#{} {} {}  {}  running {since}, last output {quiet} ago, {} tool calls\n",
             r.id,

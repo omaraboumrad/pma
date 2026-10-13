@@ -6,6 +6,34 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+**A view of each project.** `pma project show <name>`, the TUI's `o` on any row that names a project, and the web's PROJECTS list in the sidebar each show one project: its tier, states with their reasons, CI, dependencies, local changes, verify command and tags, then its open tasks and every run it has had, newest first. Tasks dispatch and runs are approved or rejected from there. The view says when a scan last read the project, in yellow once that is over a day old, since a stale "failing CI" reads like a current one; `r` rescans that project alone. The status tab now lists every project, untiered ones too, since it is where a project is opened from. Each front end offers only the actions that fit the selected row, from `pma_core::screen::fits`.
+
+**`pma web`, and a TUI with every view and action.** `pma tui` now has ten tabs (next, matrix, runs, jobs, agents, workflows, campaigns, report, notes, status) and acts on the selected row: dispatch, approve, reject, rework, publish, approve or stop a job, resume or start a workflow, notes, scan. It draws tables with column headers, colours states and priorities by meaning from the terminal's palette (`NO_COLOR` turns it off), previews the selected row, and colours a run's diff. The web is designed for a browser rather than after the terminal: a sidebar, tables with status pills, a drawer with the selected row's actions, toasts, and light and dark themes. `pma web` serves the same in a browser: it listens on 127.0.0.1 only, behind a token made for each launch, and refuses another `Host`, a POST from another origin or not in JSON, and data requests without the session cookie. Both read one key table (`pma_core::keys`) and one model of rows and actions (`pma_core::screen`), so neither can show or do what the other cannot; tests hold them to it. Long actions run as jobs. A build without the `web` feature has no HTTP server. Design: `docs/dev/frontends.md`.
+
+```sh
+pma tui
+pma web            # opens the page; --no-open prints the address
+pma web --app      # in a Chrome or Chromium window with no browser controls
+pma web --no-open --port 9000   # then, elsewhere: ssh -L 9000:127.0.0.1:9000 host
+```
+
+**A shared API for front ends, and a cargo workspace.** `pma_core::api` defines what a front end may read (`Query`, returning a `View` of plain data) and do (`Action`, returning an `Outcome`). A long action, such as a dispatch or an approved plan, is queued as a job running the same CLI command. The CLI now renders each `View`; its output is unchanged. The code moves into `crates/pma-core` (no printing, no UI dependency), `crates/pma-tui` and `crates/pma`, so the TUI and the coming web view can each depend on the core alone. Design: `docs/dev/frontends.md`.
+
+**Configuration moves to `~/.config/pma/settings.toml`.** It holds the `config` keys, roots, workers, presets, and each project's tier and tags. Edit it by hand, or with `pma config`, `pma root`, `pma project`, `pma agent` and `pma preset`, which keep its comments. The first command writes it from the database; schema 35. An invalid file stops every command, naming the key. The tables of the same names stay as a mirror the file refills when its text changes, so queries that join a project's tier keep working; the file wins. Workflow and route revisions stay in the database: activating one checks its cost and records who did, which a hand edit would skip. Design: `docs/dev/frontends.md`.
+
+```toml
+roots = ["/home/me/projects"]
+
+[config]
+agent_budget = 3
+tiers.2 = 0.7
+
+[projects.argdec]
+tier = 2
+tags = ["py"]
+verify = "make test"
+```
+
 **`pma workflow run --unattended` and `--local`.** `--unattended` approves each plan as it is reached and runs until the instance finishes or waits. Each plan is still sized by `batch_budget`, and the caps and the activated worst case still bound the instance. `--local` starts each edit from a commit of the clone's working tree, built in a temporary index, with no fetch and no remote. An edit that passes verify is written into the clone as unstaged changes, and one that fails is discarded; the run becomes `applied` or `rejected`, and its patch stays in `runs/<id>/change.patch`. Nothing is staged or committed. Edits run in groups of `max_parallel`, so at 1 each sees the ones applied before it; edits in one group share a base, and one that no longer applies is discarded with that reason. A discard consumes no attempt beyond what verify consumed.
 
 ```sh
@@ -29,6 +57,8 @@ pma watch
 **Agents draft changelog entries; pma keeps them out of the change.** In a project with a `CHANGELOG.md`, the agent is told not to edit it and to write one entry per separable change to `.pma/changelog.md`. pma moves the file to `runs/<id>/changelog.md` before the diff, and `pma review <id>` and a local apply show the entries or say none was drafted. A run without entries is flagged, not discarded. Drafting rather than editing `CHANGELOG.md` avoids conflicts between edits that run together.
 
 ### Fixed
+
+**Rejecting a run no longer overwrites an approval made meanwhile.** Reject read the run, removed its worktree, then wrote `rejected` whatever the row held by then, so a run approved from elsewhere in between lost its tree and its approval. It now writes `rejected` only over the state it read, before it removes anything. A front end's approve or reject also carries the state its row showed, and is refused once the run has left it.
 
 **A workflow review run is `done`, not left `ready`.** A run of a node that is not an `edit` changes no files and has its tree removed once its output is read, yet it stayed `ready` in `pma review`. Showing it then reported the removed tree as "tampered with" and advised rejecting the run. Such a run now ends `done`, which is final, and `pma review <id>` shows no diff for it. Schema 34 moves existing ones.
 

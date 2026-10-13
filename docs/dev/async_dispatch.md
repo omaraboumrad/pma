@@ -21,10 +21,10 @@ Wanted: start work, return at once, read progress while it runs, and be told whe
 
 ## What exists
 
-- Workflow state lives in SQLite. A pass re-derives its frontier from the store on each invocation, so any process can resume an instance (`src/pass.rs`, `advance`).
-- `Session` is an `flock` on `session.lock` (`src/store.rs:593`). The kernel releases it on exit, so a crash leaves no stale lock. One process at a time may run agents.
+- Workflow state lives in SQLite. A pass re-derives its frontier from the store on each invocation, so any process can resume an instance (`crates/pma-core/src/pass.rs`, `advance`).
+- `Session` is an `flock` on `session.lock` (`crates/pma-core/src/store.rs:593`). The kernel releases it on exit, so a crash leaves no stale lock. One process at a time may run agents.
 - `fail_interrupted_runs` marks `queued` and `running` runs `failed` when the next session starts.
-- The `claude` worker runs with `--output-format json`, which yields one record at exit. `stream-json` yields one per event and is already read on the `sanduk` path (`src/worker.rs`).
+- The `claude` worker runs with `--output-format json`, which yields one record at exit. `stream-json` yields one per event and is already read on the `sanduk` path (`crates/pma-core/src/worker.rs`).
 
 ## Decision
 
