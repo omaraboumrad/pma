@@ -3083,6 +3083,41 @@ const GREET: &str = r#"
     ])
 "#;
 
+/// `--unattended` without `--local` approves each plan, not each change: the
+/// edit runs in its own worktree of the remote default branch and waits in
+/// `pma review` like any other run. Nothing is pushed and the clone is left
+/// as it was.
+#[test]
+fn an_unattended_instance_without_local_leaves_its_edits_for_review() {
+    let s = Scratch::new("wfunattended");
+    let worker = r#"#!/bin/sh
+echo hi > hello.txt
+echo '{"type":"result","subtype":"success","is_error":false,"result":"ok","total_cost_usd":0.1}'
+"#;
+    let (env, origin, alpha) = dispatch_env(&s, &[("claude", worker)]);
+    let wf = s.0.join("greet.rhai");
+    fs::write(&wf, GREET).unwrap();
+    env.ok(&["config", "workflow_budget", "20"]);
+    env.ok(&["workflow", "propose", wf.to_str().unwrap()]);
+    env.ok(&["workflow", "activate", "1"]);
+    let before = git_out(&origin, &["rev-parse", "HEAD"]);
+
+    let out = env.ok(&["workflow", "run", "greet", "alpha", "--unattended"]);
+    assert!(out.contains("approved unattended"), "{out}");
+    assert!(out.contains("nothing left to run"), "{out}");
+    assert!(
+        env.ok(&["review"]).contains("#1  ready"),
+        "the edit waits for a person"
+    );
+    assert!(!alpha.join("hello.txt").exists(), "the clone is untouched");
+    assert_eq!(
+        git_out(&origin, &["rev-parse", "HEAD"]),
+        before,
+        "nothing pushed"
+    );
+    assert!(!env.push_log.exists(), "no push was attempted");
+}
+
 /// `--detach` queues the command and returns; a runner it started runs it
 /// to the end with no terminal, and `pma job` reports how it ended.
 #[test]
@@ -3252,6 +3287,68 @@ impl Drop for Killed {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
+}
+
+/// Two local edits in one group that change the same line: the first lands,
+/// the second no longer applies to the clone it changed, and its unit goes
+/// back in the queue to be done again from that clone, rather than lost.
+#[test]
+fn a_local_edit_overtaken_in_its_group_is_done_again() {
+    let s = Scratch::new("wfconflict");
+    let worker = r#"#!/bin/sh
+case "$2" in
+  *"findings to "*)
+    out=$(printf '%s' "$2" | sed -n 's/.*findings to //p')
+    printf '[{"title":"one"},{"title":"two"}]' > "$out" ;;
+  *"Fix one"*) echo hi > hello.txt; echo one > notes.txt ;;
+  *"Fix two"*) echo hi > hello.txt; echo two > notes.txt ;;
+esac
+echo '{"type":"result","subtype":"success","is_error":false,"result":"ok","total_cost_usd":0.1}'
+"#;
+    let (env, _origin, alpha) = dispatch_env(&s, &[("claude", worker)]);
+    fs::write(alpha.join("notes.txt"), "base\n").unwrap();
+    git(&alpha, &["add", "notes.txt"], None);
+    git(&alpha, &["commit", "-qm", "notes"], None);
+    let wf = s.0.join("review-fix.rhai");
+    fs::write(
+        &wf,
+        r#"
+        let graph = source("project")
+            .expand("review", "finding", 2, "Review `{name}`. Write findings to {out}")
+            .edit("fix", "verify", "Fix {title}.")
+            .output();
+        document(#{ finding: #{ fields: #{ title: req(line(200)) }}}, [
+            workflow("review-fix", graph, #{ caps: #{ max_units: 10, max_edits: 4 }}),
+        ])
+        "#,
+    )
+    .unwrap();
+    env.ok(&["config", "workflow_budget", "20"]);
+    env.ok(&["config", "max_parallel", "2"]);
+    env.ok(&["workflow", "propose", wf.to_str().unwrap()]);
+    env.ok(&["workflow", "activate", "1"]);
+
+    let out = env.ok(&[
+        "workflow",
+        "run",
+        "review-fix",
+        "alpha",
+        "--local",
+        "--unattended",
+    ]);
+    assert_eq!(
+        out.matches("its unit goes back in the queue").count(),
+        1,
+        "one of the two was overtaken: {out}"
+    );
+    assert_eq!(
+        out.matches(": applied to").count(),
+        2,
+        "both landed in the end: {out}"
+    );
+    assert!(out.contains("nothing left to run"), "{out}");
+    let notes = fs::read_to_string(alpha.join("notes.txt")).unwrap();
+    assert!(notes == "one\n" || notes == "two\n", "{notes}");
 }
 
 /// One request to a local server, read to the end; the server closes the

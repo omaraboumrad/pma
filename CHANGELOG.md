@@ -4,6 +4,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+**A map node is held to the width the instance was given, not the parameter's maximum.** `review-fix` declares `breadth` with a maximum of 15. `--set breadth=2` was recorded, but the review was told "at most 15" and accepted 4 findings, so the fix plan was twice the size asked for. The prompt and the check now read the given value, capped at the maximum; pricing still uses the maximum, which bounds any value given.
+
+**A local edit that another edit overtook is done again, not lost.** With `max_parallel` above 1, `--local` edits in one group start from the same clone. When an earlier one changed the lines a later one also changed, the later edit passed verify but no longer applied, and its finding was marked done. Its unit now goes back in the queue, and the next plan does it again from the clone as the edits before it left it; the discarded run still uses no attempt, and `max_edits` bounds the retries. Running local edits one at a time was the alternative; it gives up the parallelism for every edit to save the few that collide.
+
 ## [0.7.0]
 
 Upgrading from 0.6:

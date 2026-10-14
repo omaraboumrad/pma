@@ -79,30 +79,22 @@ A job queue in SQLite, drained by a runner that `pma` spawns on demand. Progress
 
 ## Remaining work
 
-As of 2026-10-13, most urgent first.
+As of 2026-10-14, most urgent first.
 
-### First real run
+### Real runs
 
-`review-fix` on `argdec`, instance 3, detached, in approval mode. 1 review and 6 fixes; all 6 passed verify and were applied unstaged. About $2.50.
+- 2026-10-13: `review-fix` on `argdec`, detached, in approval mode. 1 review and 6 fixes, all applied unstaged; about $2.50. Confirmed `--detach`, the runner, `pma job`, `job log`, two `job approve` cycles, settling a job by a foreground `--approve`, and `pma watch` on `stream-json`.
+- 2026-10-14, on a throwaway repo under its own `PMA_HOME`, with `haiku`: `--unattended --detach` ran a review and 4 fixes to the end with no terminal, all applied unstaged and passing; `notify` fired once per job, for `done` and for `stopped`; `job stop` during a review killed the agent (3 processes before, none after), and the run was marked `failed`. Under $0.10 for 8 runs.
 
-Confirmed with a real agent: `--detach`, the runner, `pma job`, `job log`, two `job approve` cycles, settling a job by a foreground `--approve`, and `pma watch` reading `stream-json`.
-
-Found and fixed: a review run stayed `ready`, and `pma review` called its removed tree "tampered with". Fix agents edited `CHANGELOG.md` unevenly (2 of 6). Every dispatched agent now drafts entries in `.pma/changelog.md`, which pma keeps out of the change and shows in `pma review`.
-
-Not yet run for real: `notify`, `--unattended --detach`, `job stop`.
+Found and fixed on the way: a review run stayed `ready` and was called "tampered with"; fix agents edited `CHANGELOG.md` unevenly; a map node was held to its parameter's maximum, not the value given, so `--set breadth=2` yielded 4 findings; a local edit overtaken in its group was lost, and is now queued again.
 
 ### Known defects
 
 | Issue | Effect | Fix size (estimate) |
 |-|-|-|
-| Local fixes in one chunk conflict when `max_parallel` > 1 | The conflicting fix is discarded, using no attempt | medium: rebase onto the prior result, or keep 1 as the default |
-| The working-tree snapshot leaves a dangling commit in the clone | Disk use until `git gc` | ignore, or prune after the run |
+| The working-tree snapshot leaves a dangling commit in the clone | Disk use until `git gc` | ignore; a prune would also drop the user's own dangling objects |
 | `pma watch` parses only `claude` logs | Other workers show their last log line | defer until a second worker is in use |
 | The review agent may not run code to confirm a finding | Findings rest on reading alone | a worker setting, not a code change |
-
-### Missing tests
-
-- `--unattended` without `--local`: auto-approve, then publish a branch or PR.
 
 ### Open questions, answered by default
 

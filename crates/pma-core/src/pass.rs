@@ -910,12 +910,21 @@ fn capped(node: &str, why: String) -> Box<dyn std::error::Error> {
 }
 
 /// What one input unit may yield at a `0..n` map: the declared width, read at
-/// its parameter's maximum, which is the figure the worst case used.
-fn width(w: &Workflow, node: &Node) -> Option<i64> {
+/// the value this instance was given, and never over the parameter's maximum,
+/// which is the figure the worst case was priced at. Reading the maximum here
+/// told the agent, and let it return, more than `--set` asked for.
+fn width(w: &Workflow, node: &Node, params: &BTreeMap<String, Value>) -> Option<i64> {
     match &node.op {
-        Op::Map(m) if m.out == Out::Grows => {
-            Some(m.max_units.as_ref().map_or(0, |c| c.ceiling(&w.params)))
-        }
+        Op::Map(m) if m.out == Out::Grows => Some(m.max_units.as_ref().map_or(0, |c| {
+            let ceiling = c.ceiling(&w.params);
+            match c {
+                crate::workflow::Count::Param(p) => params
+                    .get(p)
+                    .and_then(Value::as_i64)
+                    .map_or(ceiling, |given| given.min(ceiling)),
+                crate::workflow::Count::Fixed(_) => ceiling,
+            }
+        })),
         _ => None,
     }
 }
@@ -1072,7 +1081,7 @@ fn run_free(ctx: &Ctx<'_>, node: &Node, waiting: &[WorkflowUnit], known: &Known)
                         continue;
                     }
                 };
-                if let Some(width) = width(w, node)
+                if let Some(width) = width(w, node, &ctx.params)
                     && produced.len() as i64 > width
                 {
                     return Err(capped(
@@ -1937,7 +1946,14 @@ fn read_base(ctx: &Ctx<'_>, repo: &Path, project: &str) -> std::result::Result<S
 /// it applies, and appended to its prompt. `accept` checks exactly this, so
 /// an agent is told the limits it will be held to rather than a prompt
 /// author restating them by hand.
-fn contract(doc: &Document, w: &Workflow, node: &Node, input: &Path, out: &Path) -> Option<String> {
+fn contract(
+    doc: &Document,
+    w: &Workflow,
+    params: &BTreeMap<String, Value>,
+    node: &Node,
+    input: &Path,
+    out: &Path,
+) -> Option<String> {
     let (emits, shape, writes) = match &node.op {
         Op::Map(m) => (m.emits.as_str(), Some(m.out), m.writes.as_slice()),
         Op::Reduce(r) => (r.emits.as_str(), None, &[][..]),
@@ -1949,7 +1965,7 @@ fn contract(doc: &Document, w: &Workflow, node: &Node, input: &Path, out: &Path)
     text.push_str(&match shape {
         Some(Out::Grows) => format!(
             "- Put in {out} a JSON array of new objects, at most {}. Put [] there if there are none.\n",
-            width(w, node).unwrap_or(0)
+            width(w, node, params).unwrap_or(0)
         ),
         Some(Out::Same) => format!(
             "- Put in {out} a JSON array holding every object of {input}, each with its `@id`.\n"
@@ -2105,7 +2121,7 @@ fn stage(
             ),
         ],
     );
-    let prompt = match contract(ctx.doc, ctx.w, node, &in_file, &out_file) {
+    let prompt = match contract(ctx.doc, ctx.w, &ctx.params, node, &in_file, &out_file) {
         Some(c) => format!("{prompt}\n\n{c}"),
         None => prompt,
     };
@@ -2345,7 +2361,7 @@ fn accept(
         .ok_or_else(|| format!("node `{}`: unknown type `{emits}`", node.name))?;
 
     let mut reasons = Vec::new();
-    if let (Some(Out::Grows), Some(width)) = (out, width(ctx.w, node))
+    if let (Some(Out::Grows), Some(width)) = (out, width(ctx.w, node, &ctx.params))
         && produced.len() as i64 > width
     {
         reasons.push(format!(
@@ -2749,10 +2765,27 @@ fn run_edit(ctx: &Ctx<'_>, node: &Node, units: &[WorkflowUnit], known: &Known) -
             }
             known.runs.insert(unit.id.clone(), run.id);
             if ctx.local {
-                let line = match crate::publish::land_local(ctx.store, ctx.home, &mut run) {
-                    Ok((_, said)) => format!("#{} {}: {said}", run.id, run.text),
-                    Err(e) => format!("#{} {}: left in `pma review`: {e}", run.id, run.text),
-                };
+                let (line, conflict) =
+                    match crate::publish::land_local(ctx.store, ctx.home, &mut run) {
+                        Ok((landed, said)) => (
+                            format!("#{} {}: {said}", run.id, run.text),
+                            landed == crate::publish::Landed::Conflict,
+                        ),
+                        Err(e) => (
+                            format!("#{} {}: left in `pma review`: {e}", run.id, run.text),
+                            false,
+                        ),
+                    };
+                // An edit another one in its group overtook keeps its unit in
+                // the frontier: the next plan does it again from the clone as
+                // the edits before it left it.
+                if conflict {
+                    ctx.landed
+                        .borrow_mut()
+                        .push(format!("{line}; its unit goes back in the queue"));
+                    known.runs.remove(&unit.id);
+                    continue;
+                }
                 ctx.landed.borrow_mut().push(line);
             }
             ctx.store.atomically(|| {
@@ -2862,7 +2895,15 @@ mod tests {
         let doc = Document::parse(DOC).unwrap();
         let w = doc.flatten("w").unwrap();
         let (input, out) = (Path::new("/t/in.json"), Path::new("/t/out.json"));
-        let review = contract(&doc, &w, w.node("review").unwrap(), input, out).unwrap();
+        let review = contract(
+            &doc,
+            &w,
+            &BTreeMap::new(),
+            w.node("review").unwrap(),
+            input,
+            out,
+        )
+        .unwrap();
         assert!(
             review.contains("Put in /t/out.json a JSON array of new objects, at most 7."),
             "{review}"
@@ -2880,7 +2921,15 @@ mod tests {
             "{review}"
         );
 
-        let confirm = contract(&doc, &w, w.node("confirm").unwrap(), input, out).unwrap();
+        let confirm = contract(
+            &doc,
+            &w,
+            &BTreeMap::new(),
+            w.node("confirm").unwrap(),
+            input,
+            out,
+        )
+        .unwrap();
         assert!(
             confirm.contains("the objects of /t/in.json you keep, each with its `@id`"),
             "{confirm}"
@@ -2889,6 +2938,43 @@ mod tests {
         assert!(
             confirm.contains("`reason`") && !confirm.contains("`title`"),
             "only what it may set: {confirm}"
+        );
+    }
+
+    /// A width given by a parameter is the value the instance was given, held
+    /// to the parameter's maximum; with none given, its default.
+    #[test]
+    fn a_step_is_held_to_the_width_it_was_given() {
+        let doc = Document::parse(
+            &DOC.replace(
+                r#""caps": {"max_units": 20, "max_edits": 0},"#,
+                r#""caps": {"max_units": 20, "max_edits": 0},
+               "params": {"breadth": {"type": "int", "default": 10, "max": 15}},"#,
+            )
+            .replace(r#""max_units": 7,"#, r#""max_units": "{$breadth}","#),
+        )
+        .unwrap();
+        let w = doc.flatten("w").unwrap();
+        let review = w.node("review").unwrap();
+        let given = |v: Option<i64>| {
+            w.arguments(&match v {
+                Some(n) => serde_json::json!({ "breadth": n }),
+                None => serde_json::json!({}),
+            })
+        };
+        assert_eq!(width(&w, review, &given(Some(2))), Some(2));
+        assert_eq!(width(&w, review, &given(None)), Some(10), "the default");
+        assert_eq!(
+            width(&w, review, &given(Some(99))),
+            Some(15),
+            "never over the maximum"
+        );
+        let (input, out) = (Path::new("/t/in.json"), Path::new("/t/out.json"));
+        assert!(
+            contract(&doc, &w, &given(Some(2)), review, input, out)
+                .unwrap()
+                .contains("at most 2."),
+            "the agent is told the width it was given"
         );
     }
 }

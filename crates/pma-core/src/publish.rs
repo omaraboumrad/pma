@@ -76,9 +76,13 @@ pub fn publish(
 /// Writes a run that passed verify into its clone as unstaged changes, then
 /// removes its worktree; a run that did not pass is rejected. Nothing is
 /// staged or committed: the developer stages, commits or discards. Returns
-/// whether it was applied, with what to report. The patch stays in the run's
-/// log directory either way.
-pub fn land_local(store: &Store, home: &std::path::Path, run: &mut Run) -> Result<(bool, String)> {
+/// what became of it, with what to report. The patch stays in the run's log
+/// directory either way.
+pub fn land_local(
+    store: &Store,
+    home: &std::path::Path,
+    run: &mut Run,
+) -> Result<(Landed, String)> {
     let passed = run.state == RunState::Ready && run.verify_ok == Some(true) && run.error.is_none();
     let refused = if !passed {
         Some(match (&run.verify, run.verify_ok) {
@@ -126,10 +130,7 @@ pub fn land_local(store: &Store, home: &std::path::Path, run: &mut Run) -> Resul
                 &["apply", "--binary", crate::dispatch::path_arg(&file)?],
             ) {
                 Ok(_) => None,
-                Err(e) => Some(format!(
-                    "does not apply to the clone: {e}; patch: {}",
-                    file.display()
-                )),
+                Err(e) => Some(format!("{NO_APPLY}{e}; patch: {}", file.display())),
             }
         }
     };
@@ -151,14 +152,31 @@ pub fn land_local(store: &Store, home: &std::path::Path, run: &mut Run) -> Resul
                 false => format!("applied to {} unstaged", run.repo.display()),
             });
             store.update_run(run)?;
-            Ok((true, run.outcome.clone().unwrap_or_default()))
+            Ok((Landed::Applied, run.outcome.clone().unwrap_or_default()))
         }
         Some(why) => {
             run.outcome = Some(format!("discarded: {why}"));
             crate::dispatch::discard(store, run, false)?;
-            Ok((false, format!("discarded: {why}")))
+            let landed = match why.starts_with(NO_APPLY) {
+                true => Landed::Conflict,
+                false => Landed::Discarded,
+            };
+            Ok((landed, format!("discarded: {why}")))
         }
     }
+}
+
+const NO_APPLY: &str = "does not apply to the clone: ";
+
+/// What became of a local edit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Landed {
+    Applied,
+    /// It failed verify, had no changes, or had no verify command.
+    Discarded,
+    /// It passed verify against a base that another edit has since changed,
+    /// and no longer applies. Its unit is done again, from the new clone.
+    Conflict,
 }
 
 fn publish_one(home: &std::path::Path, cfg: &Config, run: &Run, target: Target) -> Result<String> {
