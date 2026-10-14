@@ -2,6 +2,8 @@
 
 Design note, 2026-09-19. Whether to run dispatched agents inside containers, how the pieces divide, and what `pma` needs from each.
 
+Revised 2026-10-14: the minos parts follow minos's broker design ([recommended-architecture.md](https://github.com/shakfu/minos/blob/main/docs/dev/recommended-architecture.md)). minos rejected the earlier design here: `minosd` on the sealed network, a minos client in the container, and a wire client in `pma` (section 11 there). Current integration state: [pma-minos-integration.md](pma-minos-integration.md).
+
 Three projects are in scope:
 
 - `pma` (Rust): portfolio scan, ranking, worktrees, dispatch, verify, ship.
@@ -32,7 +34,7 @@ State the boundary or the layers grow into each other.
 
 4. Carry a conversation between two agents. `pma-agent` reads a worker's output and instructs it; the developer reads both and intervenes. Driving `pma-agent` is what the dispatcher is for, so this is the requirement the others serve, not an extension of them. It rules out a report-only channel.
 
-`minos` answers 2, 3 and 4 together: `minosd` on the agent's own network is a bidirectional channel for the agent and a readable room for a person. See [Reaching minosd from a sealed container](#reaching-minosd-from-a-sealed-container).
+`minos` answers 2, 3 and 4 together: a per-run broker on the host gives the agent a bidirectional channel and a person a readable room. See [Reaching minos from a container](#reaching-minos-from-a-container).
 
 An earlier version of this note said two agents never need to converse, and treated dispatch as fan-out and review as fan-in with nothing in between. That was wrong. What is open is the shape of `pma-agent`, not whether it exists: see open question 5.
 
@@ -89,43 +91,22 @@ The cost is toolchain images. `sanduk`'s stock images carry `git`, `ripgrep`, `c
 
 A regression check needs two runs: `base_verify` against the base tree already exists (`src/dispatch.rs:306`) and has to move into the container too, or the comparison is between two different environments.
 
-## Reaching minosd from a sealed container
+## Reaching minos from a container
 
-`--internal` blocks routes off the host. It does not block traffic between containers on that network. `sanduk` already relies on this: a placeholder container is attached to the sealed network so the vmnet host bridge exists at all (`sanduk/src/sanduk/runtime.py:252`).
+`pma` starts `minosb`, a per-run broker, as a child on the host. `minosb` logs in to `minosd`, holds the room's cursor, and starts the run command with the agent's stdin and stdout on its own pipes. In a contained run the run command is `sanduk run`. The container gets a unix socket, mounted outside the work mount, and `minosa`, a shim on `PATH`. The socket answers six operations: `messages`, `say`, `submit`, `await`, `progress`, `status`.
 
-So `minosd` attached to `sanduk-net` is reachable from the agent container with `sealed` intact. The agent is not reaching across the boundary; the server is inside it. This is the design, and it needs no change to the relay.
+The broker relays each turn's final reply to the room, and pushes room messages onto the agent's stdin between turns. `pma` still holds the container handle and stops a run directly, never through `minosb`.
 
-An earlier draft of this note rejected the option. The rejection was wrong.
+What this does to the four problems an earlier draft listed for `minosd` on the sealed network:
 
-The contract is also less of an obstacle than it looked. Section 12 of [wire-contract.md](https://github.com/shakfu/minos/blob/main/docs/wire-contract.md) puts the message bus, its topics, storage, worker leases, liveness locks and their sweep outside the contract. What is frozen is the wire shapes, not the server's internals, so queueing for agent traffic can be added without touching the OS.js format.
+1. **Credential.** None enters the container; `minosb` holds it on the host. A per-run grant is still minos phase 1 work. Until it lands, `minosb` logs in with a password, which an unsandboxed agent on the host can read (issue 5 in [pma-minos-integration.md](pma-minos-integration.md)).
+2. **VFS exfiltration.** Closed. `minosb` implements no file or settings operation, so the container cannot reach them at any credential.
+3. **A dual-homed `minosd`.** Gone. `minosd` needs no presence on `sanduk-net`. The boundary is the socket, whose file mode admits only the container's uid.
+4. **The audit trail splits.** Unchanged; see below.
 
-Four real problems remain. None is a reason not to do it; all are work. What `minosd` needs in order to take them is specified in [minos_agent_reqs.md](https://github.com/shakfu/minos/blob/main/docs/dev/minos_agent_reqs.md), beside minos's own [agents.md](https://github.com/shakfu/minos/blob/main/docs/dev/agents.md).
+`sanduk` needs two changes (minos phase 0 item 3): the agent's stdin passed through with `--input-format stream-json`, and a socket mount outside the work mount.
 
-### 1. minos has no per-run credential
-
-Authentication is `POST /login {username, password}`, answered with a cookie session: 12 hours, refreshed per request, 7 days maximum. There is no token grant and no machine account. `system` is server-written only and cannot be impersonated.
-
-A password in the container is what the relay exists to avoid. `sanduk` gives a container a per-run token that is worthless anywhere else; minos has no equivalent, so an agent would hold a credential valid for 7 days against every room its user can enter.
-
-One property helps. `groups` is the only authority channel, and a server must read the role from the issued session rather than from its user table (wire-contract.md:55). A session issued to a non-admin keeps non-admin rights for its life. So a scoped short-lived session is compatible with the model; what is missing is a way to mint one.
-
-Needed in minos: a grant that `pma` can mint per run, carrying one room, no admin group, and an expiry matching the run's timeout.
-
-### 2. The VFS is a 100 MiB exfiltration channel
-
-`home:` is writable per user, and a `writefile` body may be 100 MiB. One session covers chat and the whole of `/vfs`. An agent granted chat is therefore granted file transfer, and a sealed run's central property -- that source cannot leave -- is gone. The agent writes the tree to `home:/`, and a person on the host reads it out.
-
-Detection exists, prevention does not: a successful VFS mutation posts an event to `system` (wire-contract.md:371), so every write announces itself to every account. That makes exfiltration noisy, not impossible.
-
-Needed in minos: agent sessions answer 403 at `/vfs`. `groups` is the authority channel, so a group whose sessions are refused there is the smallest change that fits the existing model.
-
-### 3. minosd is dual-homed, so minosd is the boundary
-
-A person has to reach minosd, and the agent's network has no route off the host. So minosd sits on both, which makes it a bridge across the containment boundary by construction.
-
-That is the right place for the bridge: minosd is one Go server, it is inspectable, and its archive is a record. But the property changes, and the change has to be stated rather than assumed. `sealed` stops meaning "nothing leaves" and starts meaning "nothing leaves except what minosd accepts". Every control that matters then lives in minosd, which is why (1) and (2) are prerequisites and not refinements.
-
-### 4. The audit trail splits
+### The audit trail splits
 
 Today a sealed run's record is complete because the relay sees every call, and `--log-bodies` writes the bodies. A second channel the relay does not see ends that. minos keeps its own record -- the archive, with a retention period and search -- so nothing is lost, but the record is now in two stores with two retention policies and two clocks.
 
@@ -135,7 +116,7 @@ Decide which one is authoritative for a dispute about what an agent did, and set
 
 Two roles, and only the second was in the earlier draft.
 
-**A worker to `pma-agent`, inside the sealed network.** What requirements 2 and 4 ask for. A room per task, per minos design.md D5. The worker posts a request or a report; `pma-agent` answers within policy; `pma` the tool executes and escalates what policy will not decide. A person reads the room while it happens, which is requirement 3, and reads it later from the archive. The developer writes into the same room, which is how a correction reaches both at once and how a worker stays reachable when `pma-agent` is down.
+**A worker to `pma-agent`, through the run's broker.** What requirements 2 and 4 ask for. The worker posts a request or a report through `minosa`; `pma-agent` answers within policy; `pma` the tool executes and escalates what policy will not decide. A person reads the room while it happens, which is requirement 3, and reads it later from the archive. The developer writes into the same room, which is how a correction reaches both at once and how a worker stays reachable when `pma-agent` is down. `pma-agent` does not exist yet. Without it, the room is the developer's lane alone; that is minos option 4.2, which runs on the host before containment.
 
 **`pma` to a person.** Escalation to a channel, answered with `/approve <id>` or `/reject <id> [why]`, which already match `pma review --approve` and `--rework "feedback"`. `/queue` is the pending set.
 
@@ -145,7 +126,7 @@ Keep the mailbox anyway, for the case it is better at: a single fire-and-forget 
 
 The escalation policy stays in `pma` the tool, which already holds the inputs: `route.rs` (`Policy`, `Subject`), `class.rs`, `complexity.rs`, tiers and `agent_budget`. `pma-agent` proposes within that policy and holds no authority to execute (minos design.md D2, D3). minos transports and records decisions; it does not make them.
 
-`sanduk` stays out of it. It ships no messaging adapters and holds no messaging credential, and it should keep holding none: the minos grant is minted by `pma` and passed in as an argument, like the model or the budget.
+`sanduk` stays out of it. It ships no messaging adapters and holds no messaging credential, and it should keep holding none: `minosb` holds the credential and starts `sanduk run` as its child.
 
 ## Three gates, three points
 
@@ -173,7 +154,7 @@ Two ways to get there:
 
 Prefer (1) until a task needs a container across two dispatches. A `minos` channel raises the odds that it will: a room outliving one `sanduk run` is only useful if the peer on the other end outlives it too. Expect (2) in stage (b).
 
-`minosd` itself is a third container, on the same network, with a lifetime of its own. It is not swept by `runs.py`, because no run owns it. Whoever starts it owns stopping it.
+`minosd` is an operator's service on the host, not on the container network. No run owns it, so `runs.py` does not sweep it. Each run's `minosb` lives as long as that run.
 
 ## Tool, not a Rust library
 
@@ -189,7 +170,7 @@ Keep `sanduk` as a subprocess. Reasons, strongest first.
 
 Against: `pma` stops being one `cargo install`. It already requires `git`, `gh`, `claude` and a container engine, so the marginal cost is small but real.
 
-Every feature the plan needs belongs to one of the three projects already: `sanduk` (`--json`, `--network`, a session verb), `minos` (a minted grant, `/vfs` denied to agent sessions), or `pma` (escalation policy, one parser, the minos client). None of them is a port.
+Every feature the plan needs belongs to one of the three projects already: `sanduk` (`--json`, stdin passthrough, a socket mount, a session verb), `minos` (`minosb`, a minted grant), or `pma` (escalation policy, one parser, a worker template that starts `minosb`). None of them is a port. `minosb` follows the same rule: `pma` runs it as a child, with no library link (minos implementation-plan ruling 2.2).
 
 ## Work items
 
@@ -211,19 +192,21 @@ Stage (b):
 
 7. Mailbox protocol: request and decision schemas under the workspace, and the `pma` side that reads, decides and answers. Keeps single runs serverless, and is the fallback when `minosd` is not up.
 
-The `minos` channel, in dependency order. Items 8 and 9 gate the rest: without them an agent holds a 7-day credential and a 100 MiB file channel.
+The `minos` channel, in dependency order. The `pma` side is listed in [pma-minos-integration.md](pma-minos-integration.md).
 
-8. `minos`: a grant `pma` can mint per run -- one room, no admin group, expiring with the run's timeout. No password reaches the container.
+8. `minos`: `minosb -task`, `-events` and `-linger`. Built 2026-10-14.
 
-9. `minos`: `/vfs` answers 403 for agent sessions, keyed on the group.
+9. `minos`: `minos room ensure`, so `pma` can file a room under project and task. Proposed.
 
-10. `sanduk`: `--network <name>` so a run joins a network `minosd` is already on, and the agent image carries the `minos` client.
+10. `pma`: a worker template that starts `minosb`, and the room id on the run row. Runs on the host first (minos option 4.2).
 
-11. `pma`: a `minos` client. Open the room, mint the grant, read requests, apply policy, answer, and escalate what policy declines. `pma-agent` speaks over the same room under a grant of its own, minted by `pma` and never shared with a worker.
+11. `sanduk`: stdin passthrough and a socket mount outside the work mount, so `sanduk run` can be `minosb`'s run command. The agent image carries `minosa`.
 
-12. `pma`: escalation as a channel post, with `/approve` and `/reject <why>` mapped to `review --approve` and `--rework`.
+12. `minos`: a grant `pma` can mint per run -- one room, no admin group, expiring with the run's timeout. Replaces the password `minosb` holds today.
 
-13. Retention for agent rooms set to at least the relay's log retention, so the two records cover the same period.
+13. `pma`: escalation as a channel post, with `/approve` and `/reject <why>` mapped to `review --approve` and `--rework`.
+
+14. Retention for agent rooms set to at least the relay's log retention, so the two records cover the same period.
 
 ## Open questions
 
@@ -233,10 +216,10 @@ The `minos` channel, in dependency order. Items 8 and 9 gate the rest: without t
 
 3. In (b), does `pma` still diff the worktree, or does it trust what the container wrote into the bind mount? The worktree is on the host either way, so the diff stays available and should stay authoritative.
 
-4. Is a room per run, per task or per project? Per run is out: a rework reuses the worktree and the second run should read what the first was told. minos design.md D5 says per task; [pma_feedback.md](https://github.com/shakfu/minos/blob/main/docs/dev/pma_feedback.md) argues per project on the count, 1031 open tasks against 96 projects, against a model with no deletion rule.
+4. Is a room per run, per task or per project? Per run is out: a rework reuses the worktree and the second run should read what the first was told. minos design.md D5 says per task; [pma_feedback.md](https://github.com/shakfu/minos/blob/main/docs/dev/pma_feedback.md) argues per project on the count, 1031 open tasks against 96 projects, against a model with no deletion rule. Filing a room on dispatch, not on backlog, bounds the count by work done.
 
 5. Is `pma-agent` one context across the fleet, or one instance per task? A fleet context reads every task room, which makes it a channel between workers and puts every worker inside every repository's content (minos design.md section 3, D10). One instance per task keeps the isolation dispatch already has, and gives up a cross-project judgement `rank.rs` and `route.rs` already compute from stored scores.
 
 6. Which record is authoritative for a dispute: the relay's bodies or the minos archive?
 
-7. Does `pma` run `minosd`, or is it an operator's service `pma` finds? The second is cleaner and means `pma` must degrade to the mailbox when it is absent.
+7. Does `pma` run `minosd`, or is it an operator's service `pma` finds? The second, per [pma_feedback.md](https://github.com/shakfu/minos/blob/main/docs/dev/pma_feedback.md) 7.1. Open: when it is down, does a run fail or run without a room?
