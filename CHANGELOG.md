@@ -4,6 +4,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+**`docs/dev/pma-minos-integration.md`, the state of running a worker under minos's `minosb`.** No code depends on minos yet. Measured on Claude Code 2.1.299 with several turns in one session: `total_cost_usd` is cumulative for the session, so `parse_claude`'s last `result` record gives the right cost. The same choice makes the summary the last turn's reply, not the task's outcome, and makes a run whose last turn was interrupted read as failed (`error_during_execution`). Both matter only for a worker that takes corrections mid-run; see issues 2-4 there. `using-containers.md` and `implementation-plan.md` 2b.6-2b.8 now follow minos's broker design.
+
 ### Fixed
 
 **A map node is held to the width the instance was given, not the parameter's maximum.** `review-fix` declares `breadth` with a maximum of 15. `--set breadth=2` was recorded, but the review was told "at most 15" and accepted 4 findings, so the fix plan was twice the size asked for. The prompt and the check now read the given value, capped at the maximum; pricing still uses the maximum, which bounds any value given.

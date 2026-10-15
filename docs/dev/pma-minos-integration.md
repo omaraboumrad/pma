@@ -26,9 +26,13 @@ minosb -user worker -room {room} -interrupters demo -task {prompt} -linger 2m \
 
 `2m` is unvalidated. It sets how long a finished run holds the single job runner waiting for corrections.
 
+pma's template decides what runs and how it is launched. `minosb` runs whatever follows `--` as a child, with `MINOS_PASSWORD` and `MINOS_USER` removed from its environment. It has no code that chooses an agent and none that names sanduk, so replacing `claude` with `sanduk run` changes only the template. `minosb` knows only the agent's stream format, through the adapter `-agent` selects (`claude`, the only one): how to frame a message on stdin, that a `result` record ends a turn, and how to frame an interrupt. `minosd` never touches the agent process.
+
 ## Issues
 
 1. **Run end. Resolved in minos.** `claude --input-format stream-json` reads stdin until it closes, and `minosb` never closed it. A run held the job runner until the timeout and counted as killed. `-linger` fixes it; a real `claude` exits 0 on end of input.
+
+   `-linger DUR` waits until the agent is between turns with nothing held, then for DUR more. Any message or interrupt restarts the wait, and a turn is never cut short. On expiry `minosb` posts `[closed: this run reads no more messages and is ending]` to the room, closes stdin, and reports `closed`. After that, a room message is reported as `undelivered`, and an interrupt as outcome `closed`. The default, 0, never closes stdin, so a template without the flag hangs until pma's timeout.
 
 2. **Summary.** `parse_claude` (`agent.rs`) takes the last `result` record. In a corrected run that is the reply to the last correction, not the task's outcome.
 
