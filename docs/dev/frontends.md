@@ -8,7 +8,7 @@ Phase 1, settings:
 
 - The configuration tables stay, as a mirror of `settings.toml`. Opening the store refills them when the file's text differs from the text they were last filled from (`settings_sync`); every write edits the file, then refills them. Queries that join `projects.tier` or `project_tags` are unchanged. A migration that changes a configuration row must also change the file, or the next refill undoes it.
 - A tier for a project no scan has recorded waits in the file; the scan that adds the project applies it.
-- `project forget` removes the project's tier and tags from the file, and keeps its `verify` and `sandbox`.
+- `project forget` removes the project's whole `[projects.<name>]` table from the file.
 
 Phase 2, the API (`crates/pma-core/src/api.rs`):
 

@@ -615,6 +615,8 @@ pub struct Footprint {
     pub runs: i64,
     /// Runs that are not final; each may own a worktree.
     pub open_runs: Vec<i64>,
+    /// Its `projects.<name>.*` settings, such as `verify`.
+    pub settings: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -694,10 +696,22 @@ impl Session {
     }
 }
 
+/// A directory named by a variable, `None` when unset or empty. A relative
+/// one is refused: the database and session lock would follow the working
+/// directory.
+fn dir_var(name: &str) -> Result<Option<PathBuf>> {
+    match std::env::var_os(name).filter(|v| !v.is_empty()) {
+        Some(v) if Path::new(&v).is_relative() => {
+            Err(format!("{name} must be an absolute path, not `{}`", v.display()).into())
+        }
+        v => Ok(v.map(PathBuf::from)),
+    }
+}
+
 /// `~/.config/pma`, or `PMA_HOME` when set.
 pub fn home() -> Result<PathBuf> {
-    if let Some(dir) = std::env::var_os("PMA_HOME") {
-        return Ok(PathBuf::from(dir));
+    if let Some(dir) = dir_var("PMA_HOME")? {
+        return Ok(dir);
     }
     let home = std::env::var_os("HOME").ok_or("HOME is not set")?;
     Ok(PathBuf::from(home).join(".config").join("pma"))
@@ -707,14 +721,14 @@ pub fn home() -> Result<PathBuf> {
 /// when `PMA_HOME` is set, else `$XDG_STATE_HOME/pma` or `~/.local/state/pma`.
 /// Kept apart from the database, whose directory holds nothing else.
 pub fn state_home() -> Result<PathBuf> {
-    let var = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty());
-    if let Some(dir) = var("PMA_STATE") {
-        return Ok(PathBuf::from(dir));
+    if let Some(dir) = dir_var("PMA_STATE")? {
+        return Ok(dir);
     }
-    if let Some(dir) = var("PMA_HOME") {
-        return Ok(PathBuf::from(dir).join("state"));
+    if let Some(dir) = dir_var("PMA_HOME")? {
+        return Ok(dir.join("state"));
     }
-    if let Some(dir) = var("XDG_STATE_HOME") {
+    // The XDG specification says a relative path is ignored.
+    if let Some(dir) = std::env::var_os("XDG_STATE_HOME").filter(|v| Path::new(v).is_absolute()) {
         return Ok(PathBuf::from(dir).join("pma"));
     }
     let home = std::env::var_os("HOME").ok_or("HOME is not set")?;
@@ -1214,12 +1228,21 @@ impl Store {
             campaigns: count("SELECT count(*) FROM campaign_members WHERE project = ?1")?,
             runs: count("SELECT count(*) FROM runs WHERE project = ?1")?,
             open_runs,
+            settings: self
+                .config_rows()?
+                .into_iter()
+                .filter_map(|(k, _)| {
+                    k.strip_prefix(&format!("projects.{name}."))
+                        .map(String::from)
+                })
+                .collect(),
         })
     }
 
-    /// Deletes a project's record and everything keyed to it but its runs,
-    /// whose worktrees may still exist and which the design keeps beyond a
-    /// project's removal. Caller checks that nothing holds it back.
+    /// Deletes a project's record, its settings, and everything keyed to it
+    /// but its runs, whose worktrees may still exist and which the design
+    /// keeps beyond a project's removal. Caller checks that nothing holds it
+    /// back.
     pub fn forget_project(&mut self, name: &str) -> Result<()> {
         let tx = self.conn.transaction()?;
         for sql in [
@@ -3790,9 +3813,12 @@ mod tests {
         run.project = "a".into();
         store.insert_run(&mut run).unwrap();
         store.consume_attempt("a", "t").unwrap();
+        store.set_config("projects.a.verify", "make test").unwrap();
+        store.set_config("projects.a.sandbox", "off").unwrap();
 
         let f = store.project_footprint("a").unwrap();
         assert_eq!((f.tasks, f.tags, f.runs), (1, 1, 1));
+        assert_eq!(f.settings, ["sandbox", "verify"]);
         assert_eq!(f.open_runs, [run.id], "an open run holds a worktree");
 
         let mut open = store.run(run.id).unwrap();
@@ -3809,6 +3835,10 @@ mod tests {
             "another project keeps the tag"
         );
         assert_eq!(store.consumed_attempts("a", "t").unwrap(), 0);
+        assert!(
+            store.project_footprint("a").unwrap().settings.is_empty(),
+            "a later repository of the name inherits no settings"
+        );
         assert_eq!(store.run(run.id).unwrap().project, "a", "the run is kept");
         let _ = std::fs::remove_dir_all(dir);
     }

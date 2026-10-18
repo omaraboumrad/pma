@@ -64,6 +64,14 @@ pub struct Item {
 }
 
 impl Item {
+    /// The line number of the first open checkbox nested under the item.
+    pub fn open_child(&self) -> Option<usize> {
+        self.description
+            .iter()
+            .position(|l| checkbox_mark(l.trim_start()) == Some(' '))
+            .map(|j| self.line + 1 + j)
+    }
+
     /// Identity across scans and edits: `id:`, else `gh:N`, else the text in
     /// comparable form. Text that reads as another kind of task's key, such
     /// as an item named `CI`, is prefixed with `item:`, so it cannot be taken
@@ -221,7 +229,13 @@ pub fn parse(text: &str) -> Parsed {
 
         if first_content {
             first_content = false;
-            if line != "# TODO" {
+            if line.starts_with('\u{feff}') {
+                out.report(
+                    n,
+                    Severity::Error,
+                    "the file starts with a byte-order mark; save it as UTF-8 without one",
+                );
+            } else if line != "# TODO" {
                 out.report(n, Severity::Error, "the file must start with `# TODO`");
             }
         }
@@ -497,7 +511,8 @@ fn item_line(line: &str, n: usize, priority: Priority, out: &mut Parsed) -> Opti
             }
         } else if let Some(number) = word.strip_prefix("gh:") {
             match number.parse::<u64>() {
-                Ok(v) if v > 0 && !number.starts_with('0') => {
+                // The store keeps an `i64`.
+                Ok(v) if v > 0 && v <= i64::MAX as u64 && !number.starts_with('0') => {
                     if item.gh.replace(v).is_some() {
                         out.report(n, Severity::Error, "more than one `gh:`");
                     }
@@ -637,16 +652,26 @@ pub struct Pruned {
     pub items: Vec<Item>,
     /// Each removed `## Done` section.
     pub done_sections: Vec<DoneSection>,
+    /// Finished items kept because a `- [ ]` nested under them is open, with
+    /// that line's number.
+    pub held: Vec<(Item, usize)>,
 }
 
 /// Removes finished items with their descriptions, and each `## Done`
 /// section whole. Blank lines before a section that ends the file go too.
-/// Other lines are unchanged.
+/// A finished item with an open nested checkbox is kept. Other lines are
+/// unchanged.
 pub fn prune(text: &str) -> Pruned {
     let parsed = parse(text);
     let lines: Vec<&str> = text.split_inclusive('\n').collect();
     let mut drop = vec![false; lines.len()];
-    let items: Vec<Item> = parsed.items.into_iter().filter(|i| i.done).collect();
+    let (mut items, mut held) = (Vec::new(), Vec::new());
+    for item in parsed.items.into_iter().filter(|i| i.done) {
+        match item.open_child() {
+            Some(n) => held.push((item, n)),
+            None => items.push(item),
+        }
+    }
     for item in &items {
         drop[item.line - 1..item.line + item.description.len()].fill(true);
     }
@@ -668,26 +693,30 @@ pub fn prune(text: &str) -> Pruned {
             .collect(),
         items,
         done_sections: parsed.done_sections,
+        held,
     }
 }
 
 /// Removes the finished item that `is_task(key, task_text)` names, with its
-/// description. `None` when no finished item matches.
-pub fn remove_done(text: &str, key: &str, task_text: &str) -> Option<String> {
+/// description. Refused when no finished item matches, or when a checkbox
+/// nested under it is open.
+pub fn remove_done(text: &str, key: &str, task_text: &str) -> Result<String, String> {
     let item = parse(text)
         .items
         .into_iter()
-        .find(|i| i.done && i.is_task(key, task_text))?;
+        .find(|i| i.done && i.is_task(key, task_text))
+        .ok_or_else(|| format!("no finished item `{task_text}`"))?;
+    if let Some(n) = item.open_child() {
+        return Err(format!("`{task_text}` is kept: line {n} under it is open"));
+    }
     let lines: Vec<&str> = text.split_inclusive('\n').collect();
     let span = item.line - 1..item.line + item.description.len();
-    Some(
-        lines
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| !span.contains(i))
-            .map(|(_, l)| *l)
-            .collect(),
-    )
+    Ok(lines
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !span.contains(i))
+        .map(|(_, l)| *l)
+        .collect())
 }
 
 /// Inserts an item into its priority section, with its description indented
@@ -776,14 +805,19 @@ pub fn add_token(text: &str, line: usize, token: &str) -> Option<String> {
 /// and the file keeps its permissions.
 pub fn save(path: &std::path::Path, text: &str) -> std::io::Result<()> {
     use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
     let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let name = target
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "TODO.md".into());
-    let tmp = target.with_file_name(format!(".{name}.pma-tmp"));
+    // Unique to this writer, and created new: two writers never share it, and
+    // a file or symlink already at the name is never written through.
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let tmp = target.with_file_name(format!(".{name}.{}-{n}.pma-tmp", std::process::id()));
     let written = (|| {
-        let mut file = std::fs::File::create(&tmp)?;
+        let mut file = std::fs::File::create_new(&tmp)?;
         file.write_all(text.as_bytes())?;
         file.sync_all()?;
         if let Ok(meta) = std::fs::metadata(&target) {
@@ -1032,6 +1066,12 @@ mod tests {
         );
         assert_reports("", 1, Severity::Error, "must start with `# TODO`");
         assert_reports(
+            "\u{feff}# TODO\n",
+            1,
+            Severity::Error,
+            "starts with a byte-order mark",
+        );
+        assert_reports(
             "# TODO\n\n# Other\n",
             3,
             Severity::Error,
@@ -1120,6 +1160,12 @@ mod tests {
             "more than one `due:`",
         );
         assert_reports(&item("gh:0"), 5, Severity::Error, "not an issue number");
+        assert_reports(
+            &item("gh:9223372036854775808"),
+            5,
+            Severity::Error,
+            "not an issue number",
+        );
         assert_reports(&item("gh:x1"), 5, Severity::Error, "not an issue number");
         assert_reports(
             &item("gh:1 gh:2"),
@@ -1194,6 +1240,23 @@ mod tests {
     }
 
     #[test]
+    fn prune_keeps_a_finished_item_with_an_open_nested_checkbox() {
+        let text = "# TODO\n\n## High\n\n- [x] parent\n  - [x] child\n  - [ ] open child\n- [x] done\n  - [x] child\n";
+        let pruned = prune(text);
+        assert_eq!(
+            pruned.text,
+            "# TODO\n\n## High\n\n- [x] parent\n  - [x] child\n  - [ ] open child\n"
+        );
+        let held: Vec<_> = pruned
+            .held
+            .iter()
+            .map(|(i, n)| (i.line, i.text.as_str(), *n))
+            .collect();
+        assert_eq!(held, [(5, "parent", 7)]);
+        assert_eq!(pruned.items.len(), 1);
+    }
+
+    #[test]
     fn prune_removes_done_sections_whole() {
         let text = "# TODO\n\n## Low\n\n- [ ] a\n\n## Done\n\n### old\n\n- [x] b\n  why\nprose\n- [ ] open\n```\n## Notes\n```\n\n## Notes\n\nkept\n\n## Done\n\n- [x] c\n\n";
         assert_reports(text, 11, Severity::Warning, "`pma prune` removes it");
@@ -1225,12 +1288,19 @@ mod tests {
             remove_done(text, "done", "done").unwrap(),
             "# TODO\n\n## High\n\n- [x] other\n- [ ] open\n"
         );
-        assert_eq!(
-            remove_done(text, "open", "open"),
-            None,
+        assert!(
+            remove_done(text, "open", "open").is_err(),
             "an open item stays"
         );
-        assert_eq!(remove_done(text, "missing", "missing"), None);
+        assert_eq!(
+            remove_done(text, "missing", "missing").unwrap_err(),
+            "no finished item `missing`"
+        );
+        let nested = "# TODO\n\n## High\n\n- [x] done\n  - [x] a\n  - [ ] b\n";
+        assert_eq!(
+            remove_done(nested, "done", "done").unwrap_err(),
+            "`done` is kept: line 7 under it is open"
+        );
     }
 
     #[test]
@@ -1276,6 +1346,28 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(left.len(), 2, "no temporary file is left: {left:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Writers that overlap each use their own temporary file, so none fails
+    /// on another's rename.
+    #[test]
+    fn concurrent_saves_all_succeed() {
+        let dir = std::env::temp_dir().join(format!("pma-todo-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("TODO.md");
+        std::thread::scope(|s| {
+            for t in 0..8 {
+                let path = &path;
+                s.spawn(move || {
+                    for _ in 0..50 {
+                        save(path, &format!("# TODO\n{t}\n")).unwrap();
+                    }
+                });
+            }
+        });
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
         let _ = std::fs::remove_dir_all(dir);
     }
 

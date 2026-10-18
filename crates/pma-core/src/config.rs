@@ -116,7 +116,8 @@ impl Default for Config {
 enum Slot<'a> {
     /// A finite number of at least the given minimum.
     Number(&'a mut f64, f64),
-    Count(&'a mut i64, i64),
+    /// A whole number from the minimum to the maximum.
+    Count(&'a mut i64, i64, i64),
     /// 1 to 5, or `never` for none.
     Tier(&'a mut Option<i64>),
     Priority(&'a mut Priority),
@@ -261,7 +262,7 @@ impl Config {
         let mut copy = self.clone();
         Some(match copy.slot(key)? {
             Slot::Number(v, _) => v.to_string(),
-            Slot::Count(v, _) => v.to_string(),
+            Slot::Count(v, ..) => v.to_string(),
             Slot::Tier(v) => v.map_or("never".into(), |n| n.to_string()),
             Slot::Priority(p) => p.name().into(),
             Slot::List(v) => v.join(","),
@@ -297,12 +298,15 @@ impl Config {
                     .filter(|n| n.is_finite() && *n >= min)
                     .ok_or_else(|| format!("expected a number >= {min}"))?;
             }
-            Slot::Count(v, min) => {
+            Slot::Count(v, min, max) => {
                 *v = value
                     .parse::<i64>()
                     .ok()
-                    .filter(|n| *n >= min)
-                    .ok_or_else(|| format!("expected a whole number >= {min}"))?;
+                    .filter(|n| (min..=max).contains(n))
+                    .ok_or_else(|| match max {
+                        i64::MAX => format!("expected a whole number >= {min}"),
+                        _ => format!("expected a whole number from {min} to {max}"),
+                    })?;
             }
             Slot::Tier(v) => {
                 *v = match value {
@@ -362,17 +366,19 @@ impl Config {
         Some(match key.split_once('.') {
             None => match key {
                 "important_threshold" => Slot::Number(&mut self.important_threshold, 0.0),
-                "urgent_within" => Slot::Count(&mut self.urgent_within, 0),
-                "quadrant_limit" => Slot::Count(&mut self.quadrant_limit, 1),
+                "urgent_within" => Slot::Count(&mut self.urgent_within, 0, i64::MAX),
+                "quadrant_limit" => Slot::Count(&mut self.quadrant_limit, 1, i64::MAX),
                 "agent" => Slot::Text(&mut self.agent),
                 "preset" => Slot::OptText(&mut self.preset),
                 "default_tier" => Slot::Tier(&mut self.default_tier),
                 "attribution" => Slot::Attribution(&mut self.attribution),
-                "max_parallel" => Slot::Count(&mut self.max_parallel, 1),
+                "max_parallel" => Slot::Count(&mut self.max_parallel, 1, i64::MAX),
                 "batch_budget" => Slot::Number(&mut self.batch_budget, 0.0),
                 "agent_budget" => Slot::Number(&mut self.agent_budget, 0.0),
                 "workflow_budget" => Slot::Number(&mut self.workflow_budget, 0.0),
-                "timeout" => Slot::Count(&mut self.timeout, 1),
+                // Four hours. Minutes become seconds, which must not overflow, and a
+                // value meant as seconds is refused.
+                "timeout" => Slot::Count(&mut self.timeout, 1, 240),
                 "notify" => Slot::OptText(&mut self.notify),
                 _ => return None,
             },
@@ -391,7 +397,7 @@ impl Config {
             Some(("activity", "ignore")) => Slot::List(&mut self.activity_ignore),
             Some(("activity", rest)) => {
                 let t = rest.strip_prefix("horizon.")?;
-                Slot::Count(&mut self.activity_horizon[tier(t)?], 1)
+                Slot::Count(&mut self.activity_horizon[tier(t)?], 1, i64::MAX)
             }
             Some(("projects", rest)) => {
                 let (name, field) = rest.rsplit_once('.')?;
@@ -526,6 +532,8 @@ mod tests {
             ("agent", ""),
             ("attribution", "agent"),
             ("max_parallel", "0"),
+            ("timeout", "241"),
+            ("timeout", "9223372036854775807"),
             ("projects.a.b.verify", "x"),
             ("projects.a.colour", "x"),
             ("projects.a.sandbox", "no"),

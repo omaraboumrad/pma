@@ -518,17 +518,12 @@ pub fn tag_project(doc: &mut DocumentMut, project: &str, tag: &str, on: bool) ->
     on != had
 }
 
-/// Drops a project's tier and tags, as `pma project forget` drops its record.
-/// Its `verify` and `sandbox` stay: they are settings, not facts.
+/// Drops `[projects.<name>]` whole, as `pma project forget` drops its
+/// record. Settings are keyed by name, so a kept `verify` or `sandbox = false`
+/// would apply to an unrelated repository that later takes the name.
 pub fn forget_project(doc: &mut DocumentMut, name: &str) {
-    if let Some(t) = doc
-        .get_mut("projects")
-        .and_then(Item::as_table_mut)
-        .and_then(|t| t.get_mut(name))
-        .and_then(Item::as_table_mut)
-    {
-        t.remove("tier");
-        t.remove("tags");
+    if let Some(t) = doc.get_mut("projects").and_then(Item::as_table_mut) {
+        t.remove(name);
     }
     prune(doc, "projects", name);
 }
@@ -722,12 +717,10 @@ mod tests {
         assert_eq!(s.tiers.get("a"), Some(&2));
         edit(&path, |doc| forget_project(doc, "a")).unwrap();
         let (text, s) = read(&path).unwrap();
-        assert!(s.tags.is_empty() && s.tiers.is_empty(), "{text}");
-        assert_eq!(
-            s.config,
-            [("projects.a.verify".to_string(), "make".to_string())]
+        assert!(
+            s.tags.is_empty() && s.tiers.is_empty() && s.config.is_empty(),
+            "{text}"
         );
-        edit(&path, |doc| reset_config(doc, "projects.a.verify")).unwrap();
-        assert!(!std::fs::read_to_string(&path).unwrap().contains("projects"));
+        assert!(!text.contains("projects"), "{text}");
     }
 }

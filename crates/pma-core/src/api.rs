@@ -580,7 +580,7 @@ pub fn query(store: &Store, q: Query) -> Result<View> {
             store.job(id)?;
             View::JobLog {
                 id,
-                text: std::fs::read_to_string(jobs::log_path(id)?).ok(),
+                text: crate::agent::read_log(&jobs::log_path(id)?),
             }
         }
         Query::Notes => View::Notes(store.notes()?),

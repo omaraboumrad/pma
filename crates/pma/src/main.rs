@@ -1043,6 +1043,14 @@ fn prune(paths: &[PathBuf], apply: bool) -> ExitCode {
         for item in &pruned.items {
             println!("{}:{}: remove `{}`", file.display(), item.line, item.text);
         }
+        for (item, open) in &pruned.held {
+            println!(
+                "{}:{}: kept `{}`: line {open} under it is open",
+                file.display(),
+                item.line,
+                item.text
+            );
+        }
         let removals = pruned.done_sections.len() + pruned.items.len();
         if apply
             && removals > 0
@@ -1126,6 +1134,9 @@ fn forget(name: &str, apply: bool) -> Result<()> {
         "{name}: {} tasks, {} tags, {} campaign memberships",
         f.tasks, f.tags, f.campaigns
     );
+    if !f.settings.is_empty() {
+        println!("{name}: settings {}", f.settings.join(", "));
+    }
     if f.runs > 0 {
         println!("{name}: {} finished runs are kept", f.runs);
     }
@@ -1816,9 +1827,6 @@ fn run_dispatch(
                     eprintln!("warning: {at}: {why}");
                     continue;
                 }
-                if retry {
-                    store.reset_attempts(project, &dispatch::revision(&text))?;
-                }
                 picks.push(dispatch::Pick {
                     workflow: None,
                     project: project.into(),
@@ -1851,7 +1859,7 @@ fn run_dispatch(
         }
         return Err("nothing to dispatch: every task named was passed over".into());
     }
-    run_picks(&store, &home, &p.cfg, over, &picks, wanted).map(|_| ())
+    run_picks(&store, &home, &p.cfg, over, &picks, wanted, retry).map(|_| ())
 }
 
 /// The project's open items from the last scan, one priority or all of them.
@@ -1972,6 +1980,7 @@ fn run_picks(
     over: &dispatch::Overrides,
     picks: &[dispatch::Pick],
     wanted: usize,
+    retry: bool,
 ) -> Result<Vec<store::Run>> {
     let mut queued = Vec::new();
     // A project-level failure, such as a failed fetch, skips the project.
@@ -1998,7 +2007,7 @@ fn run_picks(
     if queued.is_empty() {
         return Err("no run started".into());
     }
-    let finished = dispatch::execute(store, home, cfg, over, queued, |run| {
+    let finished = dispatch::execute(store, home, cfg, over, queued, retry, |run| {
         println!("{}", report::run_line(run));
     })?;
     let ready = finished
@@ -2186,7 +2195,15 @@ fn run_campaign(name: &str, count: Option<usize>) -> Result<()> {
         return Ok(());
     }
     let wanted = count.unwrap_or(picks.len());
-    let finished = run_picks(&store, &home, &cfg, &Default::default(), &picks, wanted)?;
+    let finished = run_picks(
+        &store,
+        &home,
+        &cfg,
+        &Default::default(),
+        &picks,
+        wanted,
+        false,
+    )?;
     for run in &finished {
         store.set_campaign_run(name, &run.project, run.id)?;
     }

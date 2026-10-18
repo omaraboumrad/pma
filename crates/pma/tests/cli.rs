@@ -86,7 +86,7 @@ fn warnings_alone_exit_zero() {
 #[test]
 fn prune_lists_then_removes_finished_items() {
     let s = Scratch::new("prune");
-    let text = "# TODO\n\n## High\n\n- [x] finished\n  notes\n- [ ] open\n\n## Done\n\n- [x] old\n- [ ] stray\n";
+    let text = "# TODO\n\n## High\n\n- [x] finished\n  notes\n- [ ] open\n- [x] parent\n  - [ ] child\n\n## Done\n\n- [x] old\n- [ ] stray\n";
     let a = s.project("a", text);
     let bad = s.project("bad", "## High\n\n- [x] kept\n");
     let todo = a.join("TODO.md");
@@ -96,9 +96,10 @@ fn prune_lists_then_removes_finished_items() {
     assert_eq!(
         stdout(&out),
         format!(
-            "{0}:9: remove `## Done`, lines 9-12\n\
-             {0}:12: remove open item with `## Done`: `- [ ] stray`\n\
+            "{0}:11: remove `## Done`, lines 11-14\n\
+             {0}:14: remove open item with `## Done`: `- [ ] stray`\n\
              {0}:5: remove `finished`\n\
+             {0}:8: kept `parent`: line 9 under it is open\n\
              {1}: skipped: lint errors; see `pma lint`\n\
              2 removals; run `pma prune --apply` to make them\n",
             todo.display(),
@@ -116,7 +117,7 @@ fn prune_lists_then_removes_finished_items() {
     );
     assert_eq!(
         fs::read_to_string(&todo).unwrap(),
-        "# TODO\n\n## High\n\n- [ ] open\n"
+        "# TODO\n\n## High\n\n- [ ] open\n- [x] parent\n  - [ ] child\n"
     );
     let out = pma(&[
         "prune".as_ref(),
@@ -226,6 +227,32 @@ fn pma_in(home: &std::path::Path, args: &[&str]) -> (String, String, bool) {
         String::from_utf8_lossy(&out.stderr).into_owned(),
         out.status.success(),
     )
+}
+
+/// An empty `PMA_HOME` is unset; a relative one is refused, since the
+/// database would follow the working directory.
+#[test]
+fn pma_home_must_be_absolute_when_set() {
+    let s = Scratch::new("pma-home");
+    let run = |value: &str| {
+        command(env!("CARGO_BIN_EXE_pma"))
+            .env("PMA_HOME", value)
+            .env("HOME", &s.0)
+            .env_remove("PMA_STATE")
+            .current_dir(&s.0)
+            .args(["config", "timeout"])
+            .output()
+            .unwrap()
+    };
+    let out = run("rel");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success() && err.contains("PMA_HOME must be an absolute path"),
+        "{err}"
+    );
+    assert!(!s.0.join("rel").exists());
+    assert!(run("").status.success());
+    assert!(s.0.join(".config/pma").exists());
 }
 
 fn ok(home: &std::path::Path, args: &[&str]) -> String {
@@ -709,11 +736,14 @@ fn dispatch_review_rework_and_push() {
     let (_, err, ok) = env.run(&["report", "--by", "model"]);
     assert!(!ok && err.contains("unknown dimension `model`"), "{err}");
 
-    // The budget refusal never reached the agent, so neither it nor its
-    // rejection uses an attempt: the two after it each use one.
+    // The budget refusal never reached the agent, so `--retry` reset nothing,
+    // and neither it nor its rejection uses an attempt.
     env.ok(&["config", "batch_budget", "5.0"]);
     env.ok(&["review", "4", "--reject"]);
-    env.ok(&["dispatch", "alpha:8"]);
+    let (_, err, success) = env.run(&["dispatch", "alpha:8"]);
+    assert!(!success && err.contains("2 attempts on"), "{err}");
+    // A retry that starts resets the count: the two runs after it each use one.
+    env.ok(&["dispatch", "alpha:8", "--retry"]);
     env.ok(&["review", "5", "--reject"]);
     env.ok(&["dispatch", "alpha:8"]);
     env.ok(&["review", "6", "--reject"]);
@@ -830,6 +860,50 @@ fn a_pull_request_holds_its_task_until_merged_or_closed() {
     );
     assert!(!alpha.join("hello.txt").exists(), "the clone is untouched");
     assert!(env.ok(&["review", "3"]).starts_with("#3 merged  alpha"));
+}
+
+/// A pull request closed without merging is a reviewer refusing the work, so
+/// it uses an attempt as a rejection does.
+#[test]
+fn a_closed_pull_request_uses_an_attempt() {
+    let s = Scratch::new("pr-closed");
+    let (env, _origin, _alpha) = dispatch_env(&s, &[("claude", FAKE_CLAUDE), ("gh", FAKE_GH_PR)]);
+    fs::write(env.home.join("pr-state"), "CLOSED\n").unwrap();
+    for id in ["1", "2"] {
+        env.ok(&["dispatch", "alpha:5"]);
+        env.ok(&["review", id, "--approve"]);
+        env.ok(&["pr", id]);
+        env.ok(&["review"]);
+    }
+    let (_, err, success) = env.run(&["dispatch", "alpha:5"]);
+    assert!(
+        !success && err.contains("2 attempts on `add greeting`"),
+        "{err}"
+    );
+}
+
+/// The agent controls the worktree, so a `TODO.md` it turned into a symlink is
+/// refused rather than ticked through.
+#[test]
+fn publishing_refuses_a_todo_md_the_agent_made_a_symlink() {
+    let s = Scratch::new("pr-symlink");
+    let outside = s.0.join("outside.md");
+    let text = "# TODO\n\n## High\n\n- [ ] add greeting #agent\n";
+    fs::write(&outside, text).unwrap();
+    let agent = format!(
+        "#!/bin/sh\necho hi > hello.txt\nrm TODO.md\nln -s {} TODO.md\n\
+         echo '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"ok\",\"total_cost_usd\":0.1}}'\n",
+        outside.display()
+    );
+    let (env, _origin, _alpha) = dispatch_env(&s, &[("claude", &agent), ("gh", FAKE_GH_PR)]);
+    env.ok(&["dispatch", "alpha:5"]);
+    env.ok(&["review", "1", "--approve"]);
+    let (out, err, _) = env.run(&["pr", "1"]);
+    assert!(
+        format!("{out}{err}").contains("TODO.md: is a symlink"),
+        "{out}{err}"
+    );
+    assert_eq!(fs::read_to_string(&outside).unwrap(), text);
 }
 
 #[test]

@@ -1026,12 +1026,14 @@ pub const INNER_GRACE: Duration = Duration::from_secs(30);
 
 /// Runs queued runs, at most `max_parallel` at once, starting a run only while
 /// the batch stays within `batch_budget`. `done` sees each run as it finishes.
+/// With `retry`, a run's consumed attempts are reset once its agent starts.
 pub fn execute(
     store: &Store,
     home: &Path,
     cfg: &Config,
     over: &Overrides,
     runs: Vec<Run>,
+    retry: bool,
     mut done: impl FnMut(&Run),
 ) -> Result<Vec<Run>> {
     let workers = store.agents()?;
@@ -1119,6 +1121,14 @@ pub fn execute(
         drop(tx);
         for (run, attempts) in rx {
             if let Err(e) = store.update_run(&run) {
+                save_error.get_or_insert(e.to_string());
+            }
+            // A run is sent once as it starts, before any attempt is charged.
+            if retry
+                && run.state == RunState::Running
+                && attempts.is_empty()
+                && let Err(e) = store.reset_attempts(&run.project, &attempt_key(&run))
+            {
                 save_error.get_or_insert(e.to_string());
             }
             for a in &attempts {
@@ -1229,7 +1239,7 @@ fn attempt(
         }
     };
     let report = worker.parse.report(
-        &std::fs::read_to_string(&log).unwrap_or_default(),
+        &agent::read_log(&log).unwrap_or_default(),
         finished.success == Some(true),
     );
     a.seconds = Some(finished.seconds);

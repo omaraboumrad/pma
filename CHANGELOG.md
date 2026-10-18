@@ -14,6 +14,28 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 **A local edit that another edit overtook is done again, not lost.** With `max_parallel` above 1, `--local` edits in one group start from the same clone. When an earlier one changed the lines a later one also changed, the later edit passed verify but no longer applied, and its finding was marked done. Its unit now goes back in the queue, and the next plan does it again from the clone as the edits before it left it; the discarded run still uses no attempt, and `max_edits` bounds the retries. Running local edits one at a time was the alternative; it gives up the parallelism for every edit to save the few that collide.
 
+**A task's attempts are charged when its work is judged, and a retry resets them only once its agent starts.** A pull request closed without merging used no attempt, so a task whose pull requests kept being closed was dispatched without limit; closing now uses one, as `--reject` does. `dispatch --retry` cleared the count while choosing tasks, so a run then refused at `batch_budget` still left its task with none used.
+
+**An agent log with invalid UTF-8 keeps its result.** One stray byte made the whole log read as empty, so the run failed and recorded no cost; bad bytes are now replaced. `parse_claude` also took the last JSON line before checking its type, so a later non-result line hid the result.
+
+**A finished item with an open checkbox under it is neither pruned nor removed.** `pma prune` and a workflow's `todo` sink `remove` deleted the item with its description, open sub-items included; the prune dry run listed only the parent. `prune` now keeps the item and names the open line. `remove` fails the step with the same reason.
+
+**`TODO.md` writes cannot lose or misdirect the file.**
+
+- The tick made when publishing wrote the file in place, so a crash could leave it truncated. It now uses the same atomic save as every other writer.
+- All writers shared one temporary file, so two at once could fail, or leave a mix of both texts. Each now has its own, created new, so a file or symlink planted at the name is never written through.
+- Publishing refuses a `TODO.md` that the agent replaced with a symlink. The tick followed the link and wrote outside the worktree.
+
+**`pma project forget` removes all of the project's settings.** It kept `verify` and `sandbox`, and settings are matched by project name. A later, unrelated repository with the same name ran the old `verify` command, and with `sandbox = false` its agent ran without a sandbox no one chose for it. The dry run lists the settings it will remove.
+
+**Malformed input is read, or refused with its cause.**
+
+- `pma project import` reads a file that starts with a byte-order mark. It read the CSV header as a project.
+- A `TODO.md` that starts with one is an error that names the mark, not "must start with `# TODO`".
+- An empty `PMA_HOME` counts as unset. A relative `PMA_HOME` or `PMA_STATE` is refused, since the database and session lock followed the working directory. A relative `XDG_STATE_HOME` is ignored, as the XDG specification says.
+- `timeout` is at most 240 minutes. A larger value could overflow when converted to seconds; the cap also refuses a value meant as seconds.
+- `gh:N` above `i64::MAX` is a lint error. The store wrapped it negative.
+
 ## [0.7.0]
 
 Upgrading from 0.6:

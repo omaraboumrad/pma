@@ -1751,8 +1751,8 @@ fn emit(
                     None => return Ok(Err(format!("no open item `{item}`"))),
                 },
                 Action::Remove => match todo::remove_done(&text, &key, &item) {
-                    Some(t) => t,
-                    None => return Ok(Err(format!("no finished item `{item}`"))),
+                    Ok(t) => t,
+                    Err(why) => return Ok(Err(why)),
                 },
             };
             todo::save(&file, &updated).map_err(|e| format!("{}: {e}", file.display()))?;
@@ -2210,7 +2210,7 @@ fn work(cfg: &Config, job: &Staged) -> Ran {
         }
     };
     let report = job.worker.parse.report(
-        &std::fs::read_to_string(&job.log).unwrap_or_default(),
+        &crate::agent::read_log(&job.log).unwrap_or_default(),
         finished.success == Some(true),
     );
     let changed = crate::dispatch::unchanged_git(&job.run).map_err(|e| e.to_string());
@@ -2746,8 +2746,15 @@ fn run_edit(ctx: &Ctx<'_>, node: &Node, units: &[WorkflowUnit], known: &Known) -
         if queued.is_empty() {
             continue;
         }
-        let done =
-            crate::dispatch::execute(ctx.store, ctx.home, ctx.cfg, ctx.over, queued, |_| {})?;
+        let done = crate::dispatch::execute(
+            ctx.store,
+            ctx.home,
+            ctx.cfg,
+            ctx.over,
+            queued,
+            false,
+            |_| {},
+        )?;
         for mut run in done {
             let Some(unit) = driving.get(&run.id) else {
                 continue;

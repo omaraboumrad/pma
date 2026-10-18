@@ -204,11 +204,11 @@ pub struct Report {
 /// Reads `claude -p --output-format json` output. Anything else is reported as
 /// a failure with the output's tail as the summary.
 pub fn parse_claude(output: &str) -> Report {
-    let value = output
-        .lines()
-        .rev()
-        .find_map(|l| serde_json::from_str::<serde_json::Value>(l.trim()).ok())
-        .filter(|v| v.get("type").and_then(|t| t.as_str()) == Some("result"));
+    let value = output.lines().rev().find_map(|l| {
+        serde_json::from_str::<serde_json::Value>(l.trim())
+            .ok()
+            .filter(|v| v.get("type").and_then(|t| t.as_str()) == Some("result"))
+    });
     match value {
         Some(v) => Report {
             ok: !v["is_error"].as_bool().unwrap_or(true)
@@ -226,6 +226,13 @@ pub fn parse_claude(output: &str) -> Report {
             cost_usd: None,
         },
     }
+}
+
+/// A log's text, with invalid UTF-8 replaced: one stray byte from an agent
+/// must not cost the result line. `None` when the file cannot be read.
+pub fn read_log(path: &Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 pub fn tail(text: &str, lines: usize) -> String {
@@ -275,6 +282,16 @@ mod tests {
     }
 
     #[test]
+    fn a_log_with_invalid_utf8_keeps_its_result() {
+        let dir = scratch("utf8");
+        let log = dir.join("log");
+        let ok = r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","total_cost_usd":0.1}"#;
+        std::fs::write(&log, [b"noise \xff\n".as_slice(), ok.as_bytes()].concat()).unwrap();
+        assert_eq!(parse_claude(&read_log(&log).unwrap()).cost_usd, Some(0.1));
+        assert_eq!(read_log(&dir.join("missing")), None);
+    }
+
+    #[test]
     fn claude_results_are_read() {
         let ok = r#"{"type":"result","subtype":"success","is_error":false,"result":"Fixed it.","total_cost_usd":0.42}"#;
         assert_eq!(
@@ -292,6 +309,9 @@ mod tests {
             (r.summary.as_str(), r.cost_usd),
             ("error_max_budget_usd", Some(1.01))
         );
+        // A later JSON line, such as a hook's, does not hide the result.
+        let r = parse_claude(&format!("{ok}\n{{\"type\":\"system\"}}\n"));
+        assert_eq!(r.cost_usd, Some(0.42));
         let junk = parse_claude("Error: not logged in\n");
         assert!(!junk.ok);
         assert_eq!(junk.summary, "Error: not logged in");

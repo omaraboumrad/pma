@@ -67,6 +67,8 @@ pub fn write(entries: &[Entry], format: Format) -> Result<String, String> {
 }
 
 pub fn read(text: &str, format: Format) -> Result<Vec<Entry>, String> {
+    // Spreadsheets on Windows save one.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let entries = match format {
         Format::Csv => from_csv(text)?,
         Format::Json => from_json(text)?,
@@ -225,6 +227,12 @@ mod tests {
         let read = read(text, Format::Csv).unwrap();
         assert_eq!(read[0].tags, ["rust"]);
         assert_eq!((read[1].tier, read[2].tier), (None, None));
+    }
+
+    #[test]
+    fn a_byte_order_mark_is_ignored() {
+        let read = read("\u{feff}name,tier,tags\nalpha,1\n", Format::Csv).unwrap();
+        assert_eq!((read.len(), read[0].name.as_str()), (1, "alpha"));
     }
 
     #[test]

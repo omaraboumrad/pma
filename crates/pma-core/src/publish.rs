@@ -258,10 +258,15 @@ fn publish_one(home: &std::path::Path, cfg: &Config, run: &Run, target: Target) 
     // do not conflict.
     if !crate::dispatch::without_item(&run.task_key) {
         let path = wt.join("TODO.md");
+        // The agent controls the worktree, and a symlink would point the
+        // read and the write outside it.
+        if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(format!("{}: is a symlink; pma edits only a file", path.display()).into());
+        }
         let text =
             std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         if let Some(edited) = todo::mark_done(&text, &run.task_key, &run.text) {
-            std::fs::write(&path, edited).map_err(|e| format!("{}: {e}", path.display()))?;
+            todo::save(&path, &edited).map_err(|e| format!("{}: {e}", path.display()))?;
             wt_git(run, &["add", "TODO.md"])?;
             wt_git(run, &["commit", "--quiet", "--amend", "--no-edit"])?;
         }
@@ -420,6 +425,11 @@ pub fn settle(
             }
         };
         store.update_run(&run)?;
+        // Closing judges the work, as a rejection does. Charged after the
+        // update, so a failed save cannot charge it twice.
+        if run.state == RunState::Closed {
+            store.consume_attempt(&run.project, &crate::dispatch::attempt_key(&run))?;
+        }
         done(&run, &Ok(outcome));
     }
     Ok(())
