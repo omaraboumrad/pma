@@ -45,10 +45,10 @@ Every item is class B: `Class::of` gives B to an item with no class tag, and `#a
 | 4 | pma | `##Critical` without a space is a lint error | one-liner | 1 | #1, #2 | no (#1, infrastructure) | yes (#2) | yes ([PR 1](https://github.com/shakfu/pma/pull/1)) | 3 |
 | 5 | pma | a dotted project name can take `projects.<name>.*` | one-liner | 2 | | | | | |
 | 6 | pma | `review 3 4 --approve --minutes 5` drops the minutes | one-liner | 2 | | | | | |
-| 7 | pma | `pma config <retired key>` says unknown | one-liner | 1 | | | | | |
-| 8 | pma | `project import` refuses a CSV with a byte-order mark | one-liner | 1 | | | | | |
-| 9 | pma | a PR closed unmerged does not count as an attempt | one-liner | 2 | | | | | |
-| 10 | pma | `dispatch --retry` resets the count before the run starts | one-liner | 2 | | | | | |
+| 7 | pma | `prune --apply` exits 0 when it skips a file for lint errors | one-liner | 1 | | | | | |
+| 8 | pma | `project export` CSV does not read back a tag with a comma or a project named `#x` | one-liner | 2 | | | | | |
+| 9 | pma | one failed dependency tool is counted as zero outdated | one-liner | 2 | | | | | |
+| 10 | pma | a code fence indented 1-3 spaces does not hide its content | one-liner | 2 | | | | | |
 | 11 | pkgdb | backup/restore | one-liner | 3 | | | | | |
 | 12 | pkgdb | import packages from `pyproject.toml` | one-liner | 2 | | | | | |
 | 13 | pkgdb | report CI failures as `pkgdb check` events | one-liner | 3 | | | | | |
@@ -60,7 +60,7 @@ Every item is class B: `Class::of` gives B to an item with no class tag, and `#a
 | 19 | margo | 10.2 per-workspace MCP server scoping | one-liner | 5 | | | | | |
 | 20 | pma | `pma merge` merges a run's pull request and settles it | described | 4 | | | | | |
 
-Item 20 was added after the first shipped run, which had to be merged on GitHub by hand. Its difficulty is a draft, as the others were. The rest of `pkgdb` and `margo` failed the exclusions below.
+Item 20 was added after the first shipped run, which had to be merged on GitHub by hand. Its difficulty is a draft, as the others were. Items 7-10 were replaced on 2026-10-18, before any was dispatched: the originals (retired-key message, CSV byte-order mark, closed pull request as an attempt, `--retry` reset) were fixed by hand during a `TODO.md` triage. The replacements come from the same code review and are one-liners too. Item 8 is rated 2, not 1 as the original was, so items 7-10 now total 7 rather than 6. The rest of `pkgdb` and `margo` failed the exclusions below.
 
 Confounds, stated so the result is not over-read:
 

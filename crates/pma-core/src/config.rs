@@ -182,6 +182,14 @@ pub const RETIRED: [(&str, &str); 14] = [
 const WEIGHTS: &str =
     "the health score is gone; `pma status` sorts by the worst state a project is in";
 
+/// Why `key` names no setting: retired, with what replaced it, or unknown.
+pub fn not_a_setting(key: &str) -> String {
+    match retired(key) {
+        Some(why) => format!("`{key}` was retired: {why}"),
+        None => format!("unknown setting `{key}`"),
+    }
+}
+
 pub fn retired(key: &str) -> Option<&'static str> {
     // Per project as well as global: every `projects.<name>.publish` went too.
     if key.starts_with("projects.") && key.ends_with(".publish") {
@@ -285,10 +293,7 @@ impl Config {
     }
 
     fn set_in_place(&mut self, key: &str, value: &str) -> Result<(), String> {
-        let slot = self.slot(key).ok_or_else(|| match retired(key) {
-            Some(why) => format!("`{key}` was retired: {why}"),
-            None => format!("unknown setting `{key}`"),
-        })?;
+        let slot = self.slot(key).ok_or_else(|| not_a_setting(key))?;
         let value = value.trim();
         match slot {
             Slot::Number(v, min) => {

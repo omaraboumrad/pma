@@ -457,20 +457,15 @@ fn activity(decision: &str, comments: usize, reviews: usize) -> Option<String> {
 
 /// Runs `gh` in `dir`, so it finds the repository from the git remote.
 fn gh_in(dir: &std::path::Path, args: &[&str]) -> Result<String> {
-    let out = Command::new("gh")
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .map_err(|e| format!("gh: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "gh {}: {}",
-            args[..2].join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
-        )
-        .into());
+    let mut cmd = Command::new("gh");
+    cmd.args(args).current_dir(dir);
+    let what = args[..2].join(" ");
+    let out = crate::scan::bounded(cmd, crate::sync::GH_TIMEOUT)
+        .map_err(|e| format!("gh {what}: {e}"))?;
+    if !out.success {
+        return Err(format!("gh {what}: {}", out.stderr.trim()).into());
     }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    Ok(out.stdout.trim().to_string())
 }
 
 /// The task text as subject; `Closes #N` and the co-author trailer as body.

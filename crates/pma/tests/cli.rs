@@ -2734,6 +2734,151 @@ fn an_agent_node_is_priced_then_run_on_approval() {
     );
 }
 
+/// `todo-audit` from the shipped library, end to end: a claim that an open
+/// item is done, confirmed, becomes a note, and `TODO.md` is left alone.
+#[test]
+fn the_library_todo_audit_notes_a_confirmed_claim() {
+    let s = Scratch::new("audit");
+    let home = s.0.join("home");
+    let root = s.0.join("root");
+    let alpha = root.join("alpha");
+    fs::create_dir_all(&alpha).unwrap();
+    git(&alpha, &["init", "-q"], None);
+    let todo = "# TODO\n\n## High\n\n- [ ] add greeting\n";
+    fs::write(alpha.join("TODO.md"), todo).unwrap();
+    git(&alpha, &["add", "."], None);
+    git(&alpha, &["commit", "-qm", "init"], None);
+
+    // The claim step writes one unit; the confirm step keeps what it reads.
+    let bin = s.0.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(
+        bin.join("claude"),
+        r#"#!/usr/bin/env python3
+import json, re, sys
+prompt = sys.argv[2]
+out = re.search(r"(\S+/out\.json)", prompt).group(1)
+if "claims the TODO.md item" in prompt:
+    units = json.load(open(out.replace("out.json", "in.json")))
+    for u in units:
+        u["reason"] = ["hello.txt exists"]
+else:
+    units = [{"text": "add greeting", "verdict": "done", "evidence": "hello.txt:1"}]
+json.dump(units, open(out, "w"))
+print(json.dumps({"type": "result", "subtype": "success", "is_error": False,
+                  "result": "ok", "total_cost_usd": 0.1}))
+"#,
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(bin.join("claude"), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let run = |args: &[&str]| {
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let out = command(env!("CARGO_BIN_EXE_pma"))
+            .env("PMA_HOME", &home)
+            .env("PATH", path)
+            .args(args)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        let err = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(out.status.success(), "pma {args:?}: {text}{err}");
+        text
+    };
+    run(&["root", "add", root.to_str().unwrap()]);
+    run(&["scan", "--offline"]);
+    let library = s.0.join("library.json");
+    fs::write(&library, run(&["workflow", "library"])).unwrap();
+    run(&["workflow", "propose", library.to_str().unwrap()]);
+    run(&["config", "workflow_budget", "100"]);
+    run(&["workflow", "activate", "1"]);
+
+    // Two agent steps, each approved by the plan it was shown.
+    let out = run(&["workflow", "run", "todo-audit", "alpha"]);
+    let out = run(&[
+        "workflow",
+        "run",
+        "todo-audit",
+        "--instance",
+        "1",
+        "--approve",
+        &plan_id(&out),
+    ]);
+    let out = run(&[
+        "workflow",
+        "run",
+        "todo-audit",
+        "--instance",
+        "1",
+        "--approve",
+        &plan_id(&out),
+    ]);
+    assert!(out.contains("nothing left to run"), "{out}");
+    let notes = run(&["note"]);
+    assert!(
+        notes.contains("TODO.md item looks done: add greeting. hello.txt:1"),
+        "{notes}"
+    );
+    assert_eq!(fs::read_to_string(alpha.join("TODO.md")).unwrap(), todo);
+}
+
+/// The `doc` sink appends one block per unit to a file in the clone, left
+/// uncommitted, and a second pass adds nothing it already wrote.
+#[test]
+fn the_doc_sink_appends_a_block_per_unit() {
+    let s = Scratch::new("doc-sink");
+    let home = s.0.join("home");
+    let root = s.0.join("root");
+    let alpha = root.join("alpha");
+    fs::create_dir_all(&alpha).unwrap();
+    git(&alpha, &["init", "-q"], None);
+    fs::write(
+        alpha.join("TODO.md"),
+        "# TODO\n\n## High\n\n- [ ] first thing\n- [ ] second thing\n",
+    )
+    .unwrap();
+    git(&alpha, &["add", "."], None);
+    git(&alpha, &["commit", "-qm", "init"], None);
+    ok(&home, &["root", "add", root.to_str().unwrap()]);
+    ok(&home, &["scan", "--offline"]);
+
+    let wf = s.0.join("list.rhai");
+    fs::write(
+        &wf,
+        r#"
+        let graph = source("project")
+            .rule_expand("items", "item", "todo-items", 10)
+            .emit_doc("write", #{ path: "OPEN.md", text: "- {text}" })
+            .output();
+        document(#{}, [
+            workflow("list", graph, #{ caps: #{ max_units: 20, max_edits: 0 }}),
+        ])
+        "#,
+    )
+    .unwrap();
+    ok(&home, &["workflow", "propose", wf.to_str().unwrap()]);
+    ok(&home, &["workflow", "activate", "1"]);
+    ok(&home, &["workflow", "run", "list", "alpha"]);
+    let doc = alpha.join("OPEN.md");
+    assert_eq!(
+        fs::read_to_string(&doc).unwrap(),
+        "- first thing\n\n- second thing\n"
+    );
+    ok(&home, &["workflow", "run", "list", "alpha"]);
+    assert_eq!(
+        fs::read_to_string(&doc).unwrap(),
+        "- first thing\n\n- second thing\n",
+        "a second instance writes nothing twice"
+    );
+    assert!(git_out(&alpha, &["status", "--porcelain"]).contains("?? OPEN.md"));
+}
+
 /// Tiering a portfolio by hand is the pain this file replaces: a dump of every
 /// project, edited, read back.
 #[test]
@@ -3879,6 +4024,11 @@ fn settings_toml_is_the_configuration() {
     )
     .unwrap();
     assert_eq!(env.ok(&["config", "agent_budget"]).trim(), "4");
+    let (_, err, success) = env.run(&["config", "dispatch_quadrants"]);
+    assert!(
+        !success && err.contains("`dispatch_quadrants` was retired: "),
+        "{err}"
+    );
     env.ok(&["config", "max_parallel", "1"]);
     let text = fs::read_to_string(&file).unwrap();
     assert!(text.contains("# mine\nagent_budget = 4\n"), "{text}");
@@ -5481,7 +5631,7 @@ fn the_documented_workflow_library_reads_as_documented() {
     let types = blocks(&section("## 6. The document", "### 6.1"))[0]["types"].clone();
     let library = section("## 15. A library", "## 16. Acceptance");
     let workflows: Vec<serde_json::Value> = blocks(&library);
-    assert_eq!(workflows.len(), 12, "the library's twelve examples");
+    assert_eq!(workflows.len(), 14, "the library's fourteen examples");
     let named = |name: &str| {
         workflows
             .iter()
@@ -5501,6 +5651,8 @@ fn the_documented_workflow_library_reads_as_documented() {
         "record",
         "settle",
         "portfolio-sweep",
+        "todo-audit",
+        "doc-drift",
     ];
     for w in &workflows {
         let name = w["name"].as_str().unwrap();
@@ -5534,6 +5686,24 @@ fn the_documented_workflow_library_reads_as_documented() {
             if runnable.contains(&name) { "" } else { "not " }
         );
     }
+    // `pma workflow library` is the runnable examples, in the text's order,
+    // with the text's types, and it proposes as printed.
+    let shipped: serde_json::Value =
+        serde_json::from_str(&ok(&home, &["workflow", "library"])).unwrap();
+    let expected: Vec<serde_json::Value> = workflows
+        .iter()
+        .filter(|w| runnable.contains(&w["name"].as_str().unwrap()))
+        .cloned()
+        .collect();
+    assert_eq!(
+        shipped,
+        serde_json::json!({"types": types, "workflow": expected}),
+        "crates/pma-core/workflows/library.json differs from docs/dev/workflows.md"
+    );
+    let file = s.0.join("library.json");
+    fs::write(&file, shipped.to_string()).unwrap();
+    let out = ok(&home, &["workflow", "propose", file.to_str().unwrap()]);
+    assert!(out.contains("stored as a draft"), "{out}");
 }
 
 /// A review that writes no `out.json` failed; it did not find nothing. Its

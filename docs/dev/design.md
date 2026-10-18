@@ -43,7 +43,7 @@ Goal 5 is not built. The manager is deterministic today, in scoring formulas and
 | Agent quadrants | Q1 and Q2; Q3 optional once Q1 and Q2 are exhausted |
 | Signal tasks | In the matrix alongside written tasks |
 | Portfolio store | SQLite at `~/.config/pma/projects.db`; one user, one machine, one session |
-| Agents | `claude`, `codex`, `cursor-agent`, `opencode` |
+| Agents | `claude`, `opencode`, `omp` seeded; `codex`, `cursor-agent` by an `agent` record |
 | Agent output | Uncommitted changes, reviewed, then committed and pushed by `pma` |
 | Publish | Per run, by command: `pma push` to the default branch, or `pma pr` for a branch and a PR |
 | Attribution | Configurable, default the user only |
@@ -460,7 +460,7 @@ Adding `gh:N` changes an item's key from its text to the issue number. Dispatch,
 
 ## Implementation
 
-- CLI: `clap`. Config: `serde` and `toml`. Store: `rusqlite` (bundled).
+- CLI: `clap`. Config: `toml_edit`, which keeps comments on rewrite; JSON: `serde_json`. Store: `rusqlite` (bundled).
 
 - Git: run the `git` binary, not `git2` or `gix`, so the user's config, hooks and credentials apply.
 

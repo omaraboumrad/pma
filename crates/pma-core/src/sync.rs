@@ -192,26 +192,21 @@ fn body(description: &[String]) -> String {
     }
 }
 
-/// Runs `gh`, returning stdout or an error with its stderr.
+/// Runs `gh`, returning stdout or an error with its stderr. Bounded by
+/// `GH_TIMEOUT`, so a stalled call cannot hold the session lock.
 pub fn gh(args: &[&str]) -> Result<String, String> {
-    let out = Command::new("gh")
-        .args(args)
-        .output()
-        .map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => {
-                "`gh` is not on PATH; install and authenticate it".into()
-            }
-            _ => format!("gh: {e}"),
-        })?;
-    if !out.status.success() {
-        return Err(format!(
-            "gh {}: {}",
-            args.iter().take(2).copied().collect::<Vec<_>>().join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
+    let mut cmd = Command::new("gh");
+    cmd.args(args);
+    let what = args.iter().take(2).copied().collect::<Vec<_>>().join(" ");
+    let out = crate::scan::bounded(cmd, GH_TIMEOUT).map_err(|e| format!("gh {what}: {e}"))?;
+    if !out.success {
+        return Err(format!("gh {what}: {}", out.stderr.trim()));
     }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    Ok(out.stdout)
 }
+
+/// How long one `gh` call outside a scan may take.
+pub const GH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 pub fn login() -> Result<String, String> {
     Ok(gh(&["api", "user", "--jq", ".login"])?.trim().to_string())

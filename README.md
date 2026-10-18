@@ -85,13 +85,13 @@ pma pr 1                       # commit and open a pull request; or `pma push 1`
 
 - A campaign applies one task definition across many repositories, each verified on its own.
 
-- A workflow is a graph of agents over a project: review, then validate the review, then fix what it confirmed. Written as JSON or as a script, and costed before it runs.
+- A workflow is a graph of agents over a project: review, then validate the review, then fix what it confirmed. Written as JSON or as a script, and costed before it runs. `pma workflow library` prints nine ready-made ones: reviews, issue triage, specification, a `TODO.md` audit and a documentation check.
 
 - `pma workflow run` prints a plan: each agent node it would run, over which units, with the worker, the model and a ceiling. Nothing is spent until you approve that plan by its id, and an approval runs that plan and nothing else. Its target is `dispatch`'s: a project, a `TODO.md` line, a heading or a signal, whichever type the workflow reads.
 
 - One run of a workflow is an instance. It is frozen at the revision it started under, so activating a new one does not change work already under way, and `--instance <id>` resumes it where the last pass stopped. A node runs once every node before it has finished, so a join sees every branch. A node that edits a repository leaves a run in `pma review` like any other.
 
-- Each node can run on its own worker and model: a route that names the node, such as `{"match": {"node": "*/review"}, "model": "haiku"}`, picks them.
+- Each node can run on its own worker and model: a route that names the node, such as `{"match": {"node": "*/review"}, "model": "haiku", "approval": "each"}`, picks them.
 
 ## Install
 
@@ -240,6 +240,8 @@ pma campaign run ci-workflow    # one worktree per repository, verified apart
 pma route propose routing.json  # worker, model and autonomy per kind of task
 pma route activate 2            # --shadow records the decision without applying it
 pma route replay routing.json   # what a candidate would have done differently
+pma workflow library | pma workflow propose -   # the shipped library, as a draft
+pma workflow run todo-audit myproject           # open items the code already does, as notes
 pma workflow check lib.rhai     # read a document and print its worst case
 pma workflow propose lib.rhai   # store it as a draft revision
 pma workflow activate 1         # refused if its worst case is over budget

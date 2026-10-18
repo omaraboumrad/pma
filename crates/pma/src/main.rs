@@ -710,6 +710,9 @@ enum WorkflowAction {
         /// The instance, as `pma workflow` lists it.
         instance: i64,
     },
+    /// Print the runnable library as one document: `pma workflow library |
+    /// pma workflow propose -`. Edit or merge it first to keep your own.
+    Library,
     /// Read a document and print the worst case each workflow can cost.
     /// Nothing is stored and nothing runs.
     Check {
@@ -1476,7 +1479,7 @@ fn configure(key: Option<&str>, value: Option<&str>, reset: bool) -> Result<()> 
             println!(
                 "{}",
                 cfg.get(key)
-                    .ok_or_else(|| format!("unknown setting `{key}`"))?
+                    .ok_or_else(|| pma_core::config::not_a_setting(key))?
             );
         }
         (Some(key), Some(value)) => {
@@ -2452,6 +2455,10 @@ fn workflow_command(action: Option<WorkflowAction>) -> Result<()> {
         return show(Query::Workflows);
     };
     match action {
+        WorkflowAction::Library => {
+            print!("{}", workflow::LIBRARY);
+            Ok(())
+        }
         WorkflowAction::Check {
             file,
             units,

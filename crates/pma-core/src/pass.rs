@@ -1758,8 +1758,64 @@ fn emit(
             todo::save(&file, &updated).map_err(|e| format!("{}: {e}", file.display()))?;
             Ok(Ok(()))
         }
-        Sink::Doc => Ok(Err("the `doc` sink is not built".into())),
+        Sink::Doc => {
+            let Some(project) = &unit.project else {
+                return Ok(Err("a doc sink needs a unit that names a project".into()));
+            };
+            let Some(row) = store.project(project)? else {
+                return Ok(Err(format!("no project `{project}`")));
+            };
+            let file = match doc_path(&row.path, &mapped("path").unwrap_or_default()) {
+                Ok(f) => f,
+                Err(why) => return Ok(Err(why)),
+            };
+            let block = mapped("text").unwrap_or_default();
+            let block = block.trim_end();
+            if block.trim().is_empty() {
+                return Ok(Err("the doc's text is empty".into()));
+            }
+            let old = match std::fs::read_to_string(&file) {
+                Ok(t) => t,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+                Err(e) => return Ok(Err(format!("{}: {e}", file.display()))),
+            };
+            // Already there: a resumed pass finds its own write.
+            if old.contains(block) {
+                return Ok(Ok(()));
+            }
+            let new = match old.trim_end() {
+                "" => format!("{block}\n"),
+                kept => format!("{kept}\n\n{block}\n"),
+            };
+            todo::save(&file, &new).map_err(|e| format!("{}: {e}", file.display()))?;
+            Ok(Ok(()))
+        }
     }
+}
+
+/// Where a `doc` sink writes: a file inside the repository, reached through no
+/// symlink. `.git` and `TODO.md`, which the `todo` sink owns, are refused.
+fn doc_path(repo: &Path, path: &str) -> std::result::Result<std::path::PathBuf, String> {
+    use std::path::Component;
+    let rel = Path::new(path);
+    let plain = !path.is_empty() && rel.components().all(|c| matches!(c, Component::Normal(_)));
+    if !plain || rel.components().any(|c| c.as_os_str() == ".git") {
+        return Err(format!("`{path}` is not a path inside the repository"));
+    }
+    if rel.as_os_str().eq_ignore_ascii_case("TODO.md") {
+        return Err("TODO.md is written by the `todo` sink".into());
+    }
+    let file = repo.join(rel);
+    let parent = file.parent().unwrap_or(repo);
+    let inside = match (parent.canonicalize(), repo.canonicalize()) {
+        (Ok(p), Ok(r)) => p.starts_with(r),
+        _ => return Err(format!("`{path}`: its directory does not exist")),
+    };
+    let linked = std::fs::symlink_metadata(&file).is_ok_and(|m| m.file_type().is_symlink());
+    if !inside || linked {
+        return Err(format!("`{path}` leads outside the repository"));
+    }
+    Ok(file)
 }
 
 fn capitalised(s: &str) -> String {
@@ -2878,6 +2934,36 @@ fn summary(task: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_doc_stays_inside_the_repository() {
+        let dir = std::env::temp_dir().join(format!("pma-doc-path-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(repo.join("docs")).unwrap();
+        std::os::unix::fs::symlink(&dir, repo.join("out")).unwrap();
+        std::os::unix::fs::symlink(dir.join("x.md"), repo.join("link.md")).unwrap();
+        assert_eq!(
+            doc_path(&repo, "REVIEW.md").unwrap(),
+            repo.join("REVIEW.md")
+        );
+        assert!(doc_path(&repo, "docs/AUDIT.md").is_ok());
+        for (path, why) in [
+            ("", "not a path inside"),
+            ("../x.md", "not a path inside"),
+            ("/etc/x.md", "not a path inside"),
+            ("./x.md", "not a path inside"),
+            (".git/config", "not a path inside"),
+            ("todo.md", "`todo` sink"),
+            ("missing/x.md", "does not exist"),
+            ("out/x.md", "leads outside"),
+            ("link.md", "leads outside"),
+        ] {
+            let err = doc_path(&repo, path).unwrap_err();
+            assert!(err.contains(why), "{path}: {err}");
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     const DOC: &str = r#"{
       "types": {"finding": {"fields": {

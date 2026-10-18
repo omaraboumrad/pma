@@ -167,25 +167,25 @@ const CI_LOG_LINES: usize = 200;
 
 /// Runs `git -C dir args`, returning trimmed stdout or an error naming the
 /// command and its stderr. With no filesystem monitor: one names a program,
-/// and these calls carry the user's credentials.
+/// and these calls carry the user's credentials. Bounded by `GIT_TIMEOUT`, so
+/// a stalled fetch or push cannot hold the session lock.
 pub fn git(dir: &Path, args: &[&str]) -> Result<String> {
-    let out = Command::new("git")
-        .arg("-C")
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
         .arg(dir)
         .args(["-c", "core.fsmonitor=false"])
-        .args(args)
-        .output()
-        .map_err(|e| format!("git: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "git {}: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
-        )
-        .into());
+        .args(args);
+    let what = args.join(" ");
+    let out = crate::scan::bounded(cmd, GIT_TIMEOUT).map_err(|e| format!("git {what}: {e}"))?;
+    if !out.success {
+        return Err(format!("git {what}: {}", out.stderr.trim()).into());
     }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    Ok(out.stdout.trim().to_string())
 }
+
+/// How long one `git` call outside a scan may take. Longer than a scan's
+/// bound: a push, a fetch or a worktree checkout of a large repository is slow.
+pub const GIT_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// `git` in the run's worktree, once its `.git` is still the one `git
 /// worktree add` wrote and its hooks and settings are the ones taken at

@@ -268,6 +268,14 @@ A document may also be built by a Rhai script, which is a second way to write th
         "severity": {"type": "enum", "values": ["critical", "high", "medium", "low"]},
         "reason":   {"type": "line", "max": 200}
       }
+    },
+    "audit": {
+      "fields": {
+        "text":     {"type": "line",  "required": true, "max": 256},
+        "verdict":  {"type": "enum",  "required": true, "values": ["done", "partial"]},
+        "evidence": {"type": "line",  "required": true, "max": 500},
+        "reason":   {"type": "lines", "max": 30}
+      }
     }
   },
   "workflow": [
@@ -430,7 +438,7 @@ One combinator per primitive, plus the plumbing a graph needs:
 | `.reduce_with(name, group_by, task)` | `reduce` by agent |
 | `.edit(name, check, task)` | `edit` |
 | `.check(name, rule)` | `check` |
-| `.emit_todo(name, action, fields)`, `.emit_note(name, fields)` | `emit` |
+| `.emit_todo(name, action, fields)`, `.emit_note(name, fields)`, `.emit_doc(name, fields)` | `emit` |
 | `.invoke(name, workflow, args, emits)` | `call`, named `invoke` because Rhai's own `call` applies a function pointer |
 | `.retrying(max, predicate)`, `.retrying(max, predicate, model)` | a `retry` on the stage before it |
 | `.when(guard)` | a guard on the next edges |
@@ -546,10 +554,10 @@ Each writes `passed`, `failed` or `unknown`.
 | `todo` | `tick` | marks matching items `[x]`, through `todo::mark_done` |
 | `todo` | `remove` | removes finished items, through `todo::prune`. Refused for an open item |
 | `note` | `add` | one portfolio note per unit, through `Store::add_note` |
-| `doc` | `add` | a rendered file under the instance's artifact directory |
+| `doc` | `add` | one block per unit, `text`, appended to `path` in the user's clone, uncommitted. `path` is relative to the repository and reaches no symlink; `.git` and `TODO.md` are refused. A block already in the file is not written again |
 | `issue` | -- | refused. `pma sync` owns issue creation for `Critical` items (design.md, Sync); a second creator needs reconciling with it first |
 
-`todo` writes are the `pma sync` precedent, not a published batch: the edit is uncommitted and `scripts/commit_todo.py` commits it.
+`todo` and `doc` writes are the `pma sync` precedent, not a published batch: the edit is uncommitted. `scripts/commit_todo.py` commits a `TODO.md`; you commit a `doc`. A `doc` lands in the clone, not under the artifacts, because a report such as `REVIEW.md` is read and committed with the code, and artifacts are never collected (section 18).
 
 A new `todo::insert(text, priority, item, description) -> Option<String>`:
 
@@ -764,9 +772,9 @@ Notes on shape:
 
 ## 15. A library, and three compositions
 
-Nine small workflows and three that call them. `->` is an edge, `[...]` a guard, `=>` a sink. Types are the ones section 6 declares: `finding`, `task` and `issue`.
+Nine small workflows, three that call them, and two added after the pilots (15.14, 15.15). `->` is an edge, `[...]` a guard, `=>` a sink. Types are the ones section 6 declares: `finding`, `task`, `issue` and `audit`.
 
-Runnable today: 15.1, 15.2, 15.4, 15.5, 15.8, 15.9 and 15.12. The rest use `retry`, a lap edge or recursion, which `propose` refuses until section 7 is built; `pma workflow check` still prices them and names the construct. A step that is an agent `map` runs once per unit, so its `{in}` holds one unit.
+Runnable today: 15.1, 15.2, 15.4, 15.5, 15.8, 15.9, 15.12, 15.14 and 15.15. `pma workflow library` prints these as one document, with the types, for `pma workflow propose -`. The rest use `retry`, a lap edge or recursion, which `propose` refuses until section 7 is built; `pma workflow check` still prices them and names the construct. A step that is an agent `map` runs once per unit, so its `{in}` holds one unit.
 
 ### 15.1 `find-issues(in: [Project], review_doc = "REVIEW.md", breadth = 20) -> [Finding] !pure`
 
@@ -1211,9 +1219,79 @@ No `edit`, so `effects` is `writes` alone and this runs before phase 4b's gate. 
 
 | Workflow | Human | Gate it needs |
 |-|-|-|
-| 15.1, 15.2, 15.4, 15.5, 15.6 | reads the documents if they want | none. `!pure` |
-| 15.8, 15.9, 15.12 | reads uncommitted `TODO.md` edits and notes; commits them | none |
+| 15.1, 15.2, 15.4, 15.5, 15.6, 15.15 | reads the documents if they want | none. `!pure` |
+| 15.8, 15.9, 15.12, 15.14 | reads uncommitted `TODO.md` edits and notes; commits them | none |
 | 15.3, 15.7, 15.10, 15.11 | `pma review`, then `pma review --approve <ids>`, then `pma pr` or `pma push` | phase 4b |
+
+### 15.14 `todo-audit(in: [Project], breadth = 20) -> [Audit] !writes`
+
+Open `TODO.md` items the code already does. `docs/dev/pilot.md` excluded five `pkgdb` items that were built but still open. The pattern is 15.1's: one reviewer claims, a confirm per claim checks. Each confirmed claim becomes a note; the human ticks the item, since a wrong "done" would close open work.
+
+```
+@input -> claim -> confirm => note -> @output
+```
+
+```json
+{
+  "name": "todo-audit",
+  "in": "project", "out": "audit", "effects": ["writes"],
+  "params": {"breadth": {"type": "int", "default": 20, "max": 40}},
+  "caps": {"max_units": 60, "max_edits": 0},
+  "nodes": [
+    {"name": "claim", "op": "map", "out": "0..n", "in": "project", "emits": "audit",
+     "max_units": "{$breadth}",
+     "task": "Read the open items in `{name}`'s TODO.md. For each that the code already does, in full or in part, write a unit to {out}: the item's exact `text`, `verdict` `done` or `partial`, and `evidence` citing file:line. At most {$breadth}. Change no file."},
+    {"name": "confirm", "op": "map", "out": "0..1", "in": "audit", "emits": "audit",
+     "writes": ["reason"],
+     "task": "The unit in {in} claims the TODO.md item `{text}` is {verdict} in the code. Check its evidence against the code. If it holds, write it to {out} with a short `reason`; otherwise write an empty list. Change nothing else."},
+    {"name": "note", "op": "emit", "in": "audit", "sink": "note", "action": "add",
+     "map": {"text": "TODO.md item looks {verdict}: {text}. {evidence}"}}
+  ],
+  "edges": [
+    {"from": "@input", "to": "claim"},
+    {"from": "claim", "to": "confirm"},
+    {"from": "confirm", "to": "note"},
+    {"from": "note", "to": "@output"}
+  ]
+}
+```
+
+`reason` is `lines`, not `line`: in the workflow pilot a one-line limit refused two true findings. `evidence` is one line, so each note stays one line.
+
+Worst case: 1 claim, 40 confirms.
+
+### 15.15 `doc-drift(in: [Project], breadth = 20) -> [Finding] !pure`
+
+Documentation that no longer matches the code: a README example the parser refuses, a design note naming a crate that is gone. Both were found by hand on 2026-10-18. 15.1's shape with a reviewer aimed at the documents; feed its output to 15.8 to record it.
+
+```
+@input -> review -> confirm -> dedupe -> @output
+```
+
+```json
+{
+  "name": "doc-drift",
+  "in": "project", "out": "finding", "effects": [],
+  "params": {"breadth": {"type": "int", "default": 20, "max": 40}},
+  "caps": {"max_units": 60, "max_edits": 0},
+  "nodes": [
+    {"name": "review", "op": "map", "out": "0..n", "in": "project", "emits": "finding",
+     "max_units": "{$breadth}",
+     "task": "Compare `{name}`'s README and docs with its code. Report each statement, example or command the code contradicts: a flag that does not exist, an example the parser refuses, a named file, crate or function that is gone. Cite the document line and the code. At most {$breadth} findings to {out}. Change no file."},
+    {"name": "confirm", "op": "map", "out": "0..1", "in": "finding", "emits": "finding",
+     "writes": ["reason"],
+     "task": "The unit in {in} claims a document disagrees with the code. Check both. If the claim holds, write it to {out} with a one-line `reason`; otherwise write an empty list. Change nothing else."},
+    {"name": "dedupe", "op": "reduce", "via": "rule", "rule": "dedupe",
+     "group_by": ["title"], "in": "finding", "emits": "finding"}
+  ],
+  "edges": [
+    {"from": "@input", "to": "review"},
+    {"from": "review", "to": "confirm"},
+    {"from": "confirm", "to": "dedupe"},
+    {"from": "dedupe", "to": "@output"}
+  ]
+}
+```
 
 ## 16. Acceptance
 
@@ -1303,6 +1381,7 @@ End to end, on fixture repositories: 15.10 with two findings, one fixed and push
 
 ```sh
 pma workflow                          # revisions, and instances with their frontier
+pma workflow library                  # the runnable library and its types, as one document
 pma workflow propose <file>           # store a draft; print the worst case; activate nothing
 pma workflow activate <rev>           # put it into effect, recording who
 pma workflow show <rev|instance>      # the flattened graph, or an instance's units and moves

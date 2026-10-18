@@ -575,6 +575,24 @@ fn register_graph(engine: &mut Engine) {
         },
     );
 
+    engine.register_fn(
+        "emit_doc",
+        |g: Graph, name: ImmutableString, fields: Map| -> Built<Graph> {
+            let node = node_map(
+                "emit",
+                &g.ty,
+                &[
+                    ("sink", "doc".into()),
+                    ("action", "add".into()),
+                    ("map", fields.into()),
+                ],
+            );
+            let mut g = g.stage(&name, node)?;
+            g.writes = true;
+            Ok(g)
+        },
+    );
+
     // A call to another workflow. Named `invoke` because Rhai's own `call`
     // applies a function pointer, and a method that shadowed it would report
     // the wrong error. The callee's return type is stated here and checked

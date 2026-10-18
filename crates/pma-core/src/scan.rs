@@ -282,7 +282,24 @@ impl std::fmt::Display for CallError {
 
 /// Runs `cmd` with no input and returns its stdout when it succeeds. At
 /// `timeout` its process group is killed, so a helper it started goes too.
-pub fn call(mut cmd: Command, timeout: Duration) -> Result<String, CallError> {
+pub fn call(cmd: Command, timeout: Duration) -> Result<String, CallError> {
+    let ran = bounded(cmd, timeout)?;
+    match ran.success {
+        true => Ok(ran.stdout),
+        false => Err(CallError::Failed(gh_error(&ran.stderr))),
+    }
+}
+
+/// What a bounded command printed, and whether it succeeded.
+pub struct Ran {
+    pub success: bool,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// `call`, keeping the whole of stderr and leaving a failure to the caller.
+/// An error only when the command could not start or timed out.
+pub fn bounded(mut cmd: Command, timeout: Duration) -> Result<Ran, CallError> {
     use std::io::Read;
     use std::os::unix::process::CommandExt;
     let mut child = cmd
@@ -291,7 +308,13 @@ pub fn call(mut cmd: Command, timeout: Duration) -> Result<String, CallError> {
         .stderr(Stdio::piped())
         .process_group(0)
         .spawn()
-        .map_err(|e| CallError::Failed(format!("{}: {e}", cmd.get_program().display())))?;
+        .map_err(|e| {
+            let program = cmd.get_program().display();
+            CallError::Failed(match e.kind() {
+                std::io::ErrorKind::NotFound => format!("`{program}` is not on PATH"),
+                _ => format!("{program}: {e}"),
+            })
+        })?;
     // Read on threads, so a child that fills a pipe is not stalled by it.
     let drain = |pipe: Option<Box<dyn Read + Send>>| {
         std::thread::spawn(move || {
@@ -335,13 +358,12 @@ pub fn call(mut cmd: Command, timeout: Duration) -> Result<String, CallError> {
     };
     let stdout = out.join().unwrap_or_default();
     let stderr = err.join().unwrap_or_default();
-    match status {
-        None => Err(CallError::TimedOut(timeout)),
-        Some(s) if s.success() => Ok(String::from_utf8_lossy(&stdout).into_owned()),
-        Some(_) => Err(CallError::Failed(gh_error(&String::from_utf8_lossy(
-            &stderr,
-        )))),
-    }
+    let status = status.ok_or(CallError::TimedOut(timeout))?;
+    Ok(Ran {
+        success: status.success(),
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+    })
 }
 
 /// `git -C dir` for one project's scan. A call that fails reads as absent, as
@@ -918,10 +940,15 @@ mod tests {
             call(sh("echo why >&2; exit 3"), limit),
             Err(CallError::Failed("why".into()))
         );
-        assert!(matches!(
+        assert_eq!(
             call(Command::new("/no/such/program"), limit),
-            Err(CallError::Failed(_))
-        ));
+            Err(CallError::Failed(
+                "`/no/such/program` is not on PATH".into()
+            ))
+        );
+        let ran = bounded(sh("echo one >&2; echo two >&2; exit 1"), limit).unwrap();
+        assert!(!ran.success);
+        assert_eq!(ran.stderr, "one\ntwo\n", "the whole of stderr is kept");
     }
 
     #[test]

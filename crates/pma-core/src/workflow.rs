@@ -19,6 +19,10 @@ use serde_json::Value;
 /// its own fields projects with the `as:` rule.
 pub const BUILTIN_TYPES: [&str; 4] = ["project", "item", "signal", "run"];
 
+/// The runnable workflows of `docs/dev/workflows.md` section 15, with their
+/// types, as one document. A test holds it to the text.
+pub const LIBRARY: &str = include_str!("../workflows/library.json");
+
 /// Fields on every unit, whatever its type. Reserved, so a declaration may
 /// not shadow one, and addressed in a guard or a prompt with a leading `@`.
 pub const SYSTEM_FIELDS: [&str; 10] = [
@@ -1582,11 +1586,12 @@ impl Document {
                     (Sink::Todo, _) => (&["text"], &["text"]),
                     (Sink::Note, Action::Add) => (&["text"], &["text"]),
                     (Sink::Note, _) => return Err(at("a note is only added".into())),
-                    (Sink::Doc, _) => (&[], &[]),
+                    (Sink::Doc, Action::Add) => (&["path", "text"], &["path", "text"]),
+                    (Sink::Doc, _) => return Err(at("a doc is only added to".into())),
                 };
                 for (field, placeholder) in &e.map {
                     self.placeholders(w, &input, placeholder, &at)?;
-                    if e.sink != Sink::Doc && !fields.contains(&field.as_str()) {
+                    if !fields.contains(&field.as_str()) {
                         return Err(at(format!(
                             "the sink writes no field `{field}`; it takes {}",
                             fields.join(", ")
@@ -2411,9 +2416,6 @@ impl Document {
                 }
                 match &n.op {
                     Op::Map(m) if m.publish => out.push(at("`publish` is not built yet")),
-                    Op::Emit(e) if e.sink == Sink::Doc => {
-                        out.push(at("the `doc` sink is not built yet"))
-                    }
                     Op::Check { rule } if rule == "nonempty" => out.push(at(
                         "`nonempty` is not built: a check writes a verdict per unit, and an empty bag has none",
                     )),

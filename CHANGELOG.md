@@ -8,6 +8,23 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 **`docs/dev/pma-minos-integration.md`, the state of running a worker under minos's `minosb`.** No code depends on minos yet. Measured on Claude Code 2.1.299 with several turns in one session: `total_cost_usd` is cumulative for the session, so `parse_claude`'s last `result` record gives the right cost. The same choice makes the summary the last turn's reply, not the task's outcome, and makes a run whose last turn was interrupted read as failed (`error_during_execution`). Both matter only for a worker that takes corrections mid-run; see issues 2-4 there. `using-containers.md` and `implementation-plan.md` 2b.6-2b.8 now follow minos's broker design.
 
+**A workflow library, two new workflows, and the `doc` sink.** `pma workflow library` prints the nine workflows `propose` takes, with their types, as one document. It comes from `docs/dev/workflows.md` section 15, and a test holds the two to each other. A revision is a whole document, so the library is printed for you to edit or merge, then proposed, rather than installed beside your own.
+
+```sh
+pma workflow library | pma workflow propose -
+pma workflow run todo-audit myproject
+```
+
+- `todo-audit`: a reviewer claims which open `TODO.md` items the code already does, citing `file:line`; a confirm checks each claim; each confirmed one becomes a note. It ticks nothing: a wrong "done" would close open work.
+- `doc-drift`: find-issues aimed at the README and docs, for statements the code contradicts.
+- The `doc` sink appends one block per unit to a file in the project's clone, uncommitted: `{"sink": "doc", "map": {"path": "REVIEW.md", "text": "..."}}`, or `.emit_doc` in a script. Section 9 put it under the instance's artifacts; a report is read and committed with the code, and artifacts are never collected. A path that leaves the repository, `.git`, `TODO.md` or a symlink is refused.
+
+The library's worst case is $63 per unit of input at the default `agent_budget` (from `ensemble-review`), over the default `workflow_budget` of $25, so activating it needs a higher budget.
+
+### Changed
+
+**Docs.** The README's route example states its `approval`, without which the parser refuses it. `docs/dev/design.md` names the agents that are seeded and the crates in use (`toml_edit`, `serde_json`).
+
 ### Fixed
 
 **A map node is held to the width the instance was given, not the parameter's maximum.** `review-fix` declares `breadth` with a maximum of 15. `--set breadth=2` was recorded, but the review was told "at most 15" and accepted 4 findings, so the fix plan was twice the size asked for. The prompt and the check now read the given value, capped at the maximum; pricing still uses the maximum, which bounds any value given.
@@ -27,6 +44,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Publishing refuses a `TODO.md` that the agent replaced with a symlink. The tick followed the link and wrote outside the worktree.
 
 **`pma project forget` removes all of the project's settings.** It kept `verify` and `sandbox`, and settings are matched by project name. A later, unrelated repository with the same name ran the old `verify` command, and with `sandbox = false` its agent ran without a sandbox no one chose for it. The dry run lists the settings it will remove.
+
+**A stalled `git` or `gh` call outside a scan is killed.** Dispatch, publish and `pma sync` had no bound, so a hung fetch, push or API call held the session lock until someone killed it, and every later unattended run waited behind it. `git` calls stop after 10 minutes and `gh` calls after 2, with the process group killed as a scan already does. The scan's own 60-second bound was the alternative; it is too short for a push or a large checkout. `pma project clone` stays unbounded, since a clone's length depends on the repository and someone is watching it.
+
+**`pma config <retired key>` says what replaced the key**, as setting one already did, instead of "unknown setting".
 
 **Malformed input is read, or refused with its cause.**
 

@@ -1,0 +1,704 @@
+{
+  "types": {
+    "finding": {
+      "fields": {
+        "severity": {
+          "type": "enum",
+          "required": true,
+          "values": [
+            "critical",
+            "high",
+            "medium",
+            "low"
+          ]
+        },
+        "title": {
+          "type": "line",
+          "required": true,
+          "max": 200,
+          "unique": "normalised"
+        },
+        "detail": {
+          "type": "lines",
+          "max": 40
+        },
+        "paths": {
+          "type": "list"
+        },
+        "class": {
+          "type": "enum",
+          "values": [
+            "A",
+            "A-",
+            "B",
+            "C",
+            "D"
+          ]
+        },
+        "reason": {
+          "type": "line",
+          "max": 200
+        },
+        "verdict": {
+          "type": "enum",
+          "values": [
+            "accept",
+            "reject"
+          ]
+        }
+      }
+    },
+    "task": {
+      "fields": {
+        "text": {
+          "type": "line",
+          "required": true,
+          "max": 200
+        },
+        "spec": {
+          "type": "line",
+          "max": 200
+        }
+      }
+    },
+    "issue": {
+      "fields": {
+        "gh": {
+          "type": "line",
+          "required": true,
+          "max": 20
+        },
+        "text": {
+          "type": "line",
+          "required": true,
+          "max": 256
+        },
+        "tags": {
+          "type": "line",
+          "max": 200
+        },
+        "severity": {
+          "type": "enum",
+          "values": [
+            "critical",
+            "high",
+            "medium",
+            "low"
+          ]
+        },
+        "reason": {
+          "type": "line",
+          "max": 200
+        }
+      }
+    },
+    "audit": {
+      "fields": {
+        "text": {
+          "type": "line",
+          "required": true,
+          "max": 256
+        },
+        "verdict": {
+          "type": "enum",
+          "required": true,
+          "values": [
+            "done",
+            "partial"
+          ]
+        },
+        "evidence": {
+          "type": "line",
+          "required": true,
+          "max": 500
+        },
+        "reason": {
+          "type": "lines",
+          "max": 30
+        }
+      }
+    }
+  },
+  "workflow": [
+    {
+      "name": "find-issues",
+      "in": "project",
+      "out": "finding",
+      "effects": [],
+      "params": {
+        "review_doc": {
+          "type": "name",
+          "default": "REVIEW.md"
+        },
+        "breadth": {
+          "type": "int",
+          "default": 20,
+          "max": 40
+        }
+      },
+      "caps": {
+        "max_units": 60,
+        "max_edits": 0
+      },
+      "nodes": [
+        {
+          "name": "review",
+          "op": "map",
+          "out": "0..n",
+          "in": "project",
+          "emits": "finding",
+          "max_units": "{$breadth}",
+          "doc": "{$review_doc}",
+          "task": "Review `{name}`. Write your prose to {doc} and at most {$breadth} findings to {out}."
+        },
+        {
+          "name": "confirm",
+          "op": "map",
+          "out": "0..1",
+          "in": "finding",
+          "emits": "finding",
+          "writes": [
+            "reason"
+          ],
+          "task": "The unit in {in} is a claim. Confirm it against the code. If you can prove it, write it to {out} with a one-line `reason`; otherwise write an empty list. Change nothing else."
+        },
+        {
+          "name": "dedupe",
+          "op": "reduce",
+          "via": "rule",
+          "rule": "dedupe",
+          "group_by": [
+            "title"
+          ],
+          "in": "finding",
+          "emits": "finding"
+        }
+      ],
+      "edges": [
+        {
+          "from": "@input",
+          "to": "review"
+        },
+        {
+          "from": "review",
+          "to": "confirm"
+        },
+        {
+          "from": "confirm",
+          "to": "dedupe"
+        },
+        {
+          "from": "dedupe",
+          "to": "@output"
+        }
+      ]
+    },
+    {
+      "name": "ensemble-review",
+      "in": "project",
+      "out": "finding",
+      "effects": [],
+      "params": {
+        "breadth": {
+          "type": "int",
+          "default": 10,
+          "max": 20
+        }
+      },
+      "caps": {
+        "max_units": 80,
+        "max_edits": 0
+      },
+      "nodes": [
+        {
+          "name": "bugs",
+          "op": "map",
+          "out": "0..n",
+          "in": "project",
+          "emits": "finding",
+          "max_units": "{$breadth}",
+          "task": "Review `{name}` for correctness bugs. Write findings to {out}."
+        },
+        {
+          "name": "tests",
+          "op": "map",
+          "out": "0..n",
+          "in": "project",
+          "emits": "finding",
+          "max_units": "{$breadth}",
+          "task": "Review `{name}` for missing tests. Write findings to {out}."
+        },
+        {
+          "name": "api",
+          "op": "map",
+          "out": "0..n",
+          "in": "project",
+          "emits": "finding",
+          "max_units": "{$breadth}",
+          "task": "Review `{name}` for interfaces that are easy to use incorrectly. Write findings to {out}."
+        },
+        {
+          "name": "merge",
+          "op": "reduce",
+          "via": "rule",
+          "rule": "dedupe",
+          "group_by": [
+            "title"
+          ],
+          "in": "finding",
+          "emits": "finding"
+        },
+        {
+          "name": "confirm",
+          "op": "map",
+          "out": "0..1",
+          "in": "finding",
+          "emits": "finding",
+          "writes": [
+            "reason"
+          ],
+          "task": "Confirm the finding in {in} against the code. Write it to {out} with a `reason` if you can prove it, else an empty list."
+        }
+      ],
+      "edges": [
+        {
+          "from": "@input",
+          "to": "bugs"
+        },
+        {
+          "from": "@input",
+          "to": "tests"
+        },
+        {
+          "from": "@input",
+          "to": "api"
+        },
+        {
+          "from": "bugs",
+          "to": "merge"
+        },
+        {
+          "from": "tests",
+          "to": "merge"
+        },
+        {
+          "from": "api",
+          "to": "merge"
+        },
+        {
+          "from": "merge",
+          "to": "confirm"
+        },
+        {
+          "from": "confirm",
+          "to": "@output"
+        }
+      ]
+    },
+    {
+      "name": "triage-issues",
+      "in": "project",
+      "out": "issue",
+      "effects": [],
+      "params": {},
+      "caps": {
+        "max_units": 120,
+        "max_edits": 0
+      },
+      "nodes": [
+        {
+          "name": "issues",
+          "op": "map",
+          "out": "0..n",
+          "via": "rule",
+          "rule": "open-issues",
+          "in": "project",
+          "emits": "issue",
+          "max_units": 50
+        },
+        {
+          "name": "classify",
+          "op": "map",
+          "out": "1",
+          "in": "issue",
+          "emits": "issue",
+          "writes": [
+            "severity",
+            "reason"
+          ],
+          "task": "The issue in {in} is #{gh}, `{text}`. Judge it against the code; the agent has no GitHub access. Write it back to {out} with `severity` set and a one-line `reason`; `low` for anything that is not actionable."
+        }
+      ],
+      "edges": [
+        {
+          "from": "@input",
+          "to": "issues"
+        },
+        {
+          "from": "issues",
+          "to": "classify"
+        },
+        {
+          "from": "classify",
+          "to": "@output",
+          "when": {
+            "severity": [
+              "critical",
+              "high",
+              "medium"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "specify",
+      "in": "item",
+      "out": "task",
+      "effects": [],
+      "params": {
+        "spec_doc": {
+          "type": "name",
+          "default": "SPEC.md"
+        }
+      },
+      "caps": {
+        "max_units": 8,
+        "max_edits": 0
+      },
+      "nodes": [
+        {
+          "name": "seed",
+          "op": "map",
+          "out": "1",
+          "via": "rule",
+          "rule": "as:task",
+          "in": "item",
+          "emits": "task"
+        },
+        {
+          "name": "write",
+          "op": "map",
+          "out": "1",
+          "in": "task",
+          "emits": "task",
+          "writes": [
+            "spec"
+          ],
+          "doc": "{$spec_doc}",
+          "task": "The task is `{text}`. Write to {doc} what changes, which files, how it is checked, and what is out of scope. Put a one-line summary in `spec`."
+        }
+      ],
+      "edges": [
+        {
+          "from": "@input",
+          "to": "seed"
+        },
+        {
+          "from": "seed",
+          "to": "write"
+        },
+        {
+          "from": "write",
+          "to": "@output"
+        }
+      ]
+    },
+    {
+      "name": "record",
+      "in": "finding",
+      "out": "finding",
+      "effects": [
+        "writes"
+      ],
+      "params": {
+        "section": {
+          "type": "enum",
+          "default": "critical",
+          "values": [
+            "critical",
+            "high",
+            "medium",
+            "low"
+          ]
+        }
+      },
+      "caps": {
+        "max_units": 100,
+        "max_edits": 0
+      },
+      "nodes": [
+        {
+          "name": "file",
+          "op": "emit",
+          "in": "finding",
+          "sink": "todo",
+          "action": "add",
+          "map": {
+            "priority": "{severity}",
+            "text": "{title}",
+            "description": "{detail}"
+          }
+        }
+      ],
+      "edges": [
+        {
+          "from": "@input",
+          "to": "file"
+        },
+        {
+          "from": "file",
+          "to": "@output"
+        }
+      ]
+    },
+    {
+      "name": "settle",
+      "in": "project",
+      "out": "run",
+      "effects": [
+        "writes"
+      ],
+      "params": {},
+      "caps": {
+        "max_units": 40,
+        "max_edits": 0
+      },
+      "nodes": [
+        {
+          "name": "open-runs",
+          "op": "map",
+          "out": "0..n",
+          "via": "rule",
+          "rule": "open-runs",
+          "in": "project",
+          "emits": "run",
+          "max_units": 20
+        },
+        {
+          "name": "merged",
+          "op": "check",
+          "rule": "pr-merged",
+          "in": "run"
+        },
+        {
+          "name": "close",
+          "op": "emit",
+          "in": "run",
+          "sink": "note",
+          "action": "add",
+          "map": {
+            "text": "merged: {task}"
+          }
+        }
+      ],
+      "edges": [
+        {
+          "from": "@input",
+          "to": "open-runs"
+        },
+        {
+          "from": "open-runs",
+          "to": "merged"
+        },
+        {
+          "from": "merged",
+          "to": "close",
+          "when": {
+            "@pr-merged": [
+              "passed"
+            ]
+          }
+        },
+        {
+          "from": "close",
+          "to": "@output"
+        }
+      ]
+    },
+    {
+      "name": "portfolio-sweep",
+      "in": "project",
+      "out": "finding",
+      "effects": [
+        "writes"
+      ],
+      "params": {},
+      "caps": {
+        "max_units": 400,
+        "max_edits": 0
+      },
+      "nodes": [
+        {
+          "name": "look",
+          "op": "call",
+          "workflow": "ensemble-review",
+          "in": "project",
+          "with": {
+            "breadth": 8
+          }
+        },
+        {
+          "name": "keep",
+          "op": "call",
+          "workflow": "record",
+          "in": "finding",
+          "with": {
+            "section": "medium"
+          }
+        }
+      ],
+      "edges": [
+        {
+          "from": "@input",
+          "to": "look"
+        },
+        {
+          "from": "look",
+          "to": "keep"
+        },
+        {
+          "from": "keep",
+          "to": "@output"
+        }
+      ]
+    },
+    {
+      "name": "todo-audit",
+      "in": "project",
+      "out": "audit",
+      "effects": [
+        "writes"
+      ],
+      "params": {
+        "breadth": {
+          "type": "int",
+          "default": 20,
+          "max": 40
+        }
+      },
+      "caps": {
+        "max_units": 60,
+        "max_edits": 0
+      },
+      "nodes": [
+        {
+          "name": "claim",
+          "op": "map",
+          "out": "0..n",
+          "in": "project",
+          "emits": "audit",
+          "max_units": "{$breadth}",
+          "task": "Read the open items in `{name}`'s TODO.md. For each that the code already does, in full or in part, write a unit to {out}: the item's exact `text`, `verdict` `done` or `partial`, and `evidence` citing file:line. At most {$breadth}. Change no file."
+        },
+        {
+          "name": "confirm",
+          "op": "map",
+          "out": "0..1",
+          "in": "audit",
+          "emits": "audit",
+          "writes": [
+            "reason"
+          ],
+          "task": "The unit in {in} claims the TODO.md item `{text}` is {verdict} in the code. Check its evidence against the code. If it holds, write it to {out} with a short `reason`; otherwise write an empty list. Change nothing else."
+        },
+        {
+          "name": "note",
+          "op": "emit",
+          "in": "audit",
+          "sink": "note",
+          "action": "add",
+          "map": {
+            "text": "TODO.md item looks {verdict}: {text}. {evidence}"
+          }
+        }
+      ],
+      "edges": [
+        {
+          "from": "@input",
+          "to": "claim"
+        },
+        {
+          "from": "claim",
+          "to": "confirm"
+        },
+        {
+          "from": "confirm",
+          "to": "note"
+        },
+        {
+          "from": "note",
+          "to": "@output"
+        }
+      ]
+    },
+    {
+      "name": "doc-drift",
+      "in": "project",
+      "out": "finding",
+      "effects": [],
+      "params": {
+        "breadth": {
+          "type": "int",
+          "default": 20,
+          "max": 40
+        }
+      },
+      "caps": {
+        "max_units": 60,
+        "max_edits": 0
+      },
+      "nodes": [
+        {
+          "name": "review",
+          "op": "map",
+          "out": "0..n",
+          "in": "project",
+          "emits": "finding",
+          "max_units": "{$breadth}",
+          "task": "Compare `{name}`'s README and docs with its code. Report each statement, example or command the code contradicts: a flag that does not exist, an example the parser refuses, a named file, crate or function that is gone. Cite the document line and the code. At most {$breadth} findings to {out}. Change no file."
+        },
+        {
+          "name": "confirm",
+          "op": "map",
+          "out": "0..1",
+          "in": "finding",
+          "emits": "finding",
+          "writes": [
+            "reason"
+          ],
+          "task": "The unit in {in} claims a document disagrees with the code. Check both. If the claim holds, write it to {out} with a one-line `reason`; otherwise write an empty list. Change nothing else."
+        },
+        {
+          "name": "dedupe",
+          "op": "reduce",
+          "via": "rule",
+          "rule": "dedupe",
+          "group_by": [
+            "title"
+          ],
+          "in": "finding",
+          "emits": "finding"
+        }
+      ],
+      "edges": [
+        {
+          "from": "@input",
+          "to": "review"
+        },
+        {
+          "from": "review",
+          "to": "confirm"
+        },
+        {
+          "from": "confirm",
+          "to": "dedupe"
+        },
+        {
+          "from": "dedupe",
+          "to": "@output"
+        }
+      ]
+    }
+  ]
+}
