@@ -23,7 +23,7 @@ use crate::worker::{Parser, Worker};
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
-const VERSION: i64 = 35;
+const VERSION: i64 = 37;
 
 const SCHEMA: &str = "
 CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -307,6 +307,49 @@ CREATE TABLE campaign_members (
 );
 ";
 
+/// Version 37. Each failing workflow's latest failed run, so a view can link
+/// to it. A table rather than a column on `projects`: `ci_detail` keeps the
+/// names alone, which every reader of a failing state splits by line, and
+/// tests replay migrations, which `ADD COLUMN` cannot survive.
+const CI_RUNS: &str = "
+CREATE TABLE IF NOT EXISTS ci_runs (
+    project TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,
+    workflow TEXT NOT NULL,
+    url TEXT NOT NULL,
+    PRIMARY KEY (project, workflow)
+);
+";
+
+/// Version 36. Each scan, each project's state at it, and what changed since
+/// the scan before. The project and task rows hold only the last scan, so
+/// "what changed" and "failing since when" had nothing to read.
+const SCAN_HISTORY: &str = "
+CREATE TABLE IF NOT EXISTS scans (
+    id INTEGER PRIMARY KEY,
+    at INTEGER NOT NULL,
+    full INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS scan_projects (
+    scan INTEGER NOT NULL REFERENCES scans(id) ON DELETE CASCADE,
+    project TEXT NOT NULL,
+    ci TEXT NOT NULL,
+    ci_detail TEXT NOT NULL,
+    lint_errors INTEGER NOT NULL,
+    scan_error TEXT,
+    open INTEGER NOT NULL,
+    PRIMARY KEY (scan, project)
+);
+CREATE INDEX IF NOT EXISTS idx_scan_projects_project ON scan_projects(project, scan);
+CREATE TABLE IF NOT EXISTS scan_changes (
+    scan INTEGER NOT NULL REFERENCES scans(id) ON DELETE CASCADE,
+    project TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    priority TEXT,
+    detail TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_scan_changes_scan ON scan_changes(scan);
+";
+
 /// Version 35. The `settings.toml` text the configuration tables were last
 /// filled from, so an unchanged file is not applied again. `IF NOT EXISTS`
 /// because tests replay migrations over a store that has it.
@@ -570,6 +613,46 @@ const SLUG: &str = "
 ALTER TABLE projects ADD COLUMN slug TEXT;
 ";
 
+/// A project's state as the history compares it.
+struct ScanState {
+    ci: Ci,
+    lint_errors: i64,
+    scan_error: Option<String>,
+}
+
+/// Every scanned project's state, by name. A row a tier made before any
+/// scan read the project has no state to compare against.
+fn scan_state(conn: &Connection) -> Result<HashMap<String, ScanState>> {
+    let mut stmt = conn.prepare(
+        "SELECT name, ci, ci_detail, lint_errors, scan_error FROM projects
+         WHERE scanned_at IS NOT NULL",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            ScanState {
+                ci: Ci::from_columns(&r.get::<_, String>(1)?, r.get(2)?),
+                lint_errors: r.get(3)?,
+                scan_error: r.get(4)?,
+            },
+        ))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// The last CI state an earlier scan knew for a project.
+fn last_known_ci(conn: &Connection, project: &str, before: i64) -> Result<Option<Ci>> {
+    Ok(conn
+        .query_row(
+            "SELECT ci, ci_detail FROM scan_projects
+             WHERE project = ?1 AND scan < ?2 AND ci != 'unknown'
+             ORDER BY scan DESC LIMIT 1",
+            params![project, before],
+            |r| Ok(Ci::from_columns(&r.get::<_, String>(0)?, r.get(1)?)),
+        )
+        .optional()?)
+}
+
 pub struct Store {
     conn: Connection,
     /// `settings.toml`, beside the database. The configuration tables mirror
@@ -597,6 +680,8 @@ pub struct ProjectRow {
     pub ahead: Option<i64>,
     pub last_activity: Option<i64>,
     pub ci: Ci,
+    /// Each failing workflow's latest failed run, as `(workflow, url)`.
+    pub ci_runs: Vec<(String, String)>,
     pub scan_error: Option<String>,
     /// Outdated dependencies at the last measurement; `None` if never measured.
     pub deps: Option<i64>,
@@ -789,6 +874,8 @@ impl Store {
                     JOB_APPROVAL_AND_STREAM,
                     READ_RUNS_DONE,
                     SETTINGS_SYNC,
+                    SCAN_HISTORY,
+                    CI_RUNS,
                 ];
                 let tx = conn.unchecked_transaction()?;
                 for step in &steps[version as usize..] {
@@ -1026,9 +1113,23 @@ impl Store {
                 leftover: r.get(15)?,
                 slug: r.get(16)?,
                 absent_since: r.get(17)?,
+                ci_runs: Vec::new(),
             })
         })?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+        let mut rows: Vec<ProjectRow> = rows.collect::<rusqlite::Result<_>>()?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT project, workflow, url FROM ci_runs ORDER BY project, workflow")?;
+        let runs = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get(2)?))
+        })?;
+        for run in runs {
+            let (project, workflow, url) = run?;
+            if let Some(row) = rows.iter_mut().find(|r| r.name == project) {
+                row.ci_runs.push((workflow, url));
+            }
+        }
+        Ok(rows)
     }
 
     pub fn tasks(&self) -> Result<Vec<TaskRow>> {
@@ -1056,20 +1157,39 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Records scan results. Each task keeps the `first_seen` it had in the
-    /// previous scan. With `full`, projects not in `facts` are deleted and
-    /// returned with the tier they had.
-    /// Records the scan. A full scan marks every project it did not find as
-    /// absent and returns their names; the rows stay, since a project that
+    /// Records the scan, with each project's state and what changed since the
+    /// scan before (`crate::history`). Each task keeps the `first_seen` it had
+    /// in the previous scan. A full scan marks every project it did not find
+    /// as absent and returns their names; the rows stay, since a project that
     /// leaves a root is usually a move, not a deletion.
     pub fn save_scan(&mut self, facts: &[Facts], full: bool, now: i64) -> Result<Vec<String>> {
+        use crate::history::{self, Change};
         let open_runs: Vec<Run> = self
             .runs()?
             .into_iter()
             .filter(|r| !r.state.is_final())
             .collect();
         let tx = self.conn.transaction()?;
+        let before = scan_state(&tx)?;
+        let returned: std::collections::HashSet<String> = {
+            let mut stmt =
+                tx.prepare("SELECT name FROM projects WHERE absent_since IS NOT NULL")?;
+            stmt.query_map([], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        tx.execute(
+            "INSERT INTO scans (at, full) VALUES (?1, ?2)",
+            params![now, full],
+        )?;
+        let scan = tx.last_insert_rowid();
+        let mut changes: Vec<(String, Change)> = Vec::new();
         for f in facts {
+            match (before.get(&f.name), returned.contains(&f.name)) {
+                // A first scan finds every project; none of them is news.
+                (None, _) if !before.is_empty() => changes.push((f.name.clone(), Change::New)),
+                (Some(_), true) => changes.push((f.name.clone(), Change::Returned)),
+                _ => {}
+            }
             if f.held {
                 tx.execute(
                     "UPDATE projects SET scan_error = ?2, absent_since = NULL WHERE name = ?1",
@@ -1118,6 +1238,13 @@ impl Store {
                     f.todo_unread,
                 ],
             )?;
+            tx.execute("DELETE FROM ci_runs WHERE project = ?1", [&f.name])?;
+            for (workflow, url) in &f.ci_runs {
+                tx.execute(
+                    "INSERT OR REPLACE INTO ci_runs (project, workflow, url) VALUES (?1, ?2, ?3)",
+                    params![f.name, workflow, url],
+                )?;
+            }
 
             if let Some(d) = &f.deps {
                 tx.execute(
@@ -1136,34 +1263,51 @@ impl Store {
             // is reworded. Either way the item keeps its age: when it was first
             // seen, and when its text first appeared in git, which a reworded
             // text no longer finds in the history.
-            type Seen = (i64, Option<i64>);
-            let (by_key, by_text): (HashMap<String, Seen>, HashMap<String, Seen>) = {
+            // An item matched neither way is opened; a row no item matched
+            // is closed.
+            let rows: Vec<(String, String, String, i64, Option<i64>)> = {
                 let mut stmt = tx.prepare(
-                    "SELECT key, text, first_seen, added_at FROM tasks WHERE project = ?1",
+                    "SELECT key, text, priority, first_seen, added_at FROM tasks WHERE project = ?1",
                 )?;
-                let rows: Vec<(String, String, i64, Option<i64>)> = stmt
-                    .query_map([&f.name], |r| {
-                        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-                    })?
-                    .collect::<rusqlite::Result<_>>()?;
-                let by_text = rows
-                    .iter()
-                    .map(|(_, text, seen, added)| (crate::todo::normal_text(text), (*seen, *added)))
-                    .collect();
-                (
-                    rows.into_iter()
-                        .map(|(k, _, seen, added)| (k, (seen, added)))
-                        .collect(),
-                    by_text,
-                )
+                stmt.query_map([&f.name], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                })?
+                .collect::<rusqlite::Result<_>>()?
             };
+            let by_key: HashMap<&str, usize> = rows
+                .iter()
+                .enumerate()
+                .map(|(i, r)| (r.0.as_str(), i))
+                .collect();
+            let by_text: HashMap<String, usize> = rows
+                .iter()
+                .enumerate()
+                .map(|(i, r)| (crate::todo::normal_text(&r.1), i))
+                .collect();
+            let mut matched = std::collections::HashSet::new();
+            let known = before.contains_key(&f.name);
             tx.execute("DELETE FROM tasks WHERE project = ?1", [&f.name])?;
             for item in f.todo.iter().flat_map(|t| &t.items) {
-                let before = by_key
-                    .get(&item.key)
-                    .or_else(|| by_text.get(&crate::todo::normal_text(&item.text)));
-                let first_seen = before.map_or(now, |(seen, _)| *seen);
-                let added_at = match (item.added_at, before.and_then(|(_, added)| *added)) {
+                let found = by_key
+                    .get(item.key.as_str())
+                    .or_else(|| by_text.get(&crate::todo::normal_text(&item.text)))
+                    .copied();
+                match found {
+                    Some(i) => {
+                        matched.insert(i);
+                    }
+                    None if known => changes.push((
+                        f.name.clone(),
+                        Change::Opened {
+                            priority: item.priority.name().into(),
+                            text: item.text.clone(),
+                        },
+                    )),
+                    None => {}
+                }
+                let before = found.map(|i| (rows[i].3, rows[i].4));
+                let first_seen = before.map_or(now, |(seen, _)| seen);
+                let added_at = match (item.added_at, before.and_then(|(_, added)| added)) {
                     (Some(a), Some(b)) => Some(a.min(b)),
                     (a, b) => a.or(b),
                 };
@@ -1184,6 +1328,49 @@ impl Store {
                         item.group,
                     ],
                 )?;
+            }
+            for (i, (_, text, priority, ..)) in rows.iter().enumerate() {
+                if !matched.contains(&i) {
+                    changes.push((
+                        f.name.clone(),
+                        Change::Closed {
+                            priority: priority.clone(),
+                            text: text.clone(),
+                        },
+                    ));
+                }
+            }
+        }
+
+        // Each project as the scan left it, against the state before.
+        let after = scan_state(&tx)?;
+        for f in facts {
+            let Some(state) = after.get(&f.name) else {
+                continue;
+            };
+            let (ci, detail) = state.ci.to_columns();
+            tx.execute(
+                "INSERT INTO scan_projects (scan, project, ci, ci_detail, lint_errors, scan_error, open)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6,
+                         (SELECT count(*) FROM tasks WHERE project = ?2))",
+                params![scan, f.name, ci, detail, state.lint_errors, state.scan_error],
+            )?;
+            let Some(was) = before.get(&f.name) else {
+                continue;
+            };
+            let known_ci = match &was.ci {
+                Ci::Unknown(_) => last_known_ci(&tx, &f.name, scan)?,
+                ci => Some(ci.clone()),
+            };
+            let broke = history::broken_change(
+                history::broken(was.lint_errors, was.scan_error.as_deref()).as_deref(),
+                history::broken(state.lint_errors, state.scan_error.as_deref()).as_deref(),
+            );
+            for c in [history::ci_change(known_ci.as_ref(), &state.ci), broke]
+                .into_iter()
+                .flatten()
+            {
+                changes.push((f.name.clone(), c));
             }
         }
 
@@ -1206,10 +1393,104 @@ impl Store {
                 }
             }
         }
+        for name in &absent {
+            changes.push((name.clone(), Change::Absent));
+        }
+        for (project, change) in &changes {
+            let (kind, priority, detail) = change.to_columns();
+            tx.execute(
+                "INSERT INTO scan_changes (scan, project, kind, priority, detail)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![scan, project, kind, priority, detail],
+            )?;
+        }
+        tx.execute("DELETE FROM scans WHERE id <= ?1", [scan - history::KEPT])?;
         tx.commit()?;
         // A project this scan added may have a tier or tags in the file.
         self.reapply_settings()?;
         Ok(absent)
+    }
+
+    /// The latest `limit` scans, newest first, with their totals.
+    pub fn scans(&self, limit: usize) -> Result<Vec<crate::history::Scan>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.id, s.at, s.full,
+                    (SELECT count(*) FROM scan_projects p WHERE p.scan = s.id),
+                    (SELECT count(*) FROM scan_projects p WHERE p.scan = s.id AND p.ci = 'failing'),
+                    (SELECT count(*) FROM scan_projects p WHERE p.scan = s.id
+                        AND (p.lint_errors > 0 OR p.scan_error IS NOT NULL)),
+                    (SELECT coalesce(sum(p.open), 0) FROM scan_projects p WHERE p.scan = s.id),
+                    (SELECT count(*) FROM scan_changes c WHERE c.scan = s.id AND c.kind = 'opened'),
+                    (SELECT count(*) FROM scan_changes c WHERE c.scan = s.id AND c.kind = 'closed'),
+                    (SELECT count(*) FROM scan_changes c WHERE c.scan = s.id
+                        AND c.kind NOT IN ('opened', 'closed'))
+             FROM scans s ORDER BY s.id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit as i64], |r| {
+            Ok(crate::history::Scan {
+                id: r.get(0)?,
+                at: r.get(1)?,
+                full: r.get(2)?,
+                projects: r.get(3)?,
+                failing: r.get(4)?,
+                broken: r.get(5)?,
+                open: r.get(6)?,
+                opened: r.get(7)?,
+                closed: r.get(8)?,
+                other: r.get(9)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// What a scan recorded as changed, by project, in the order recorded.
+    pub fn scan_changes(&self, scan: i64) -> Result<Vec<crate::history::ProjectChange>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT project, kind, priority, detail FROM scan_changes
+             WHERE scan = ?1 ORDER BY project, rowid",
+        )?;
+        let rows = stmt.query_map([scan], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (project, kind, priority, detail) = row?;
+            if let Some(change) = crate::history::Change::from_columns(&kind, priority, detail) {
+                out.push(crate::history::ProjectChange { project, change });
+            }
+        }
+        Ok(out)
+    }
+
+    /// For each project whose CI fails at its latest recorded scan, when that
+    /// run of failing scans began.
+    pub fn failing_since(&self) -> Result<HashMap<String, crate::history::Since>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT p.project, s.at, p.ci, p.ci_detail FROM scan_projects p
+             JOIN scans s ON s.id = p.scan ORDER BY p.project, p.scan DESC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                Ci::from_columns(&r.get::<_, String>(2)?, r.get(3)?),
+            ))
+        })?;
+        let mut by_project: HashMap<String, Vec<(i64, Ci)>> = HashMap::new();
+        for row in rows {
+            let (project, at, ci) = row?;
+            by_project.entry(project).or_default().push((at, ci));
+        }
+        Ok(by_project
+            .into_iter()
+            .filter(|(_, states)| matches!(states.first(), Some((_, Ci::Failing(_)))))
+            .filter_map(|(p, states)| crate::history::failing_since(&states).map(|s| (p, s)))
+            .collect())
     }
 
     /// What forgetting a project would delete, and what would hold it back.
@@ -1250,6 +1531,8 @@ impl Store {
             "DELETE FROM campaign_members WHERE project = ?1",
             "DELETE FROM exhaustion WHERE project = ?1",
             "DELETE FROM verify_base WHERE project = ?1",
+            "DELETE FROM scan_projects WHERE project = ?1",
+            "DELETE FROM scan_changes WHERE project = ?1",
             // `tasks` follows by ON DELETE CASCADE.
             "DELETE FROM projects WHERE name = ?1",
         ] {
@@ -2965,6 +3248,10 @@ mod tests {
             ahead: None,
             last_activity: Some(42),
             ci: Ci::Failing(vec!["test".into(), "wheels".into()]),
+            ci_runs: vec![(
+                "test".into(),
+                "https://github.com/shakfu/x/actions/runs/7".into(),
+            )],
             deps: None,
             error: None,
             todo_unread: false,
@@ -4053,6 +4340,7 @@ mod tests {
         let p = store.project("one").unwrap().unwrap();
         assert_eq!((p.dirty, p.absent_since), (3, None));
         assert!(matches!(p.ci, Ci::Failing(_)), "{:?}", p.ci);
+        assert_eq!(p.ci_runs[0].1, "https://github.com/shakfu/x/actions/runs/7");
         assert_eq!(p.scan_error.as_deref(), Some("settings changed"));
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -4165,6 +4453,121 @@ mod tests {
             .unwrap();
         assert_eq!(store.project("a").unwrap().unwrap().absent_since, None);
         assert_eq!(store.tasks().unwrap()[0].first_seen, 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Each scan records what changed against the state before it: items
+    /// opened and closed, CI against the last state a scan knew, a project
+    /// broken, mended, new or gone.
+    #[test]
+    fn a_scan_records_what_changed() {
+        use crate::history::Change;
+        let dir = scratch("history");
+        let mut store = Store::open(&dir.join("p.db")).unwrap();
+        let mut one = facts("one", vec![item("x", 5), item("y", 6)]);
+        store.save_scan(&[one.clone()], true, 1000).unwrap();
+        let first = store.scans(10).unwrap();
+        assert_eq!(first.len(), 1);
+        assert!(
+            store.scan_changes(first[0].id).unwrap().is_empty(),
+            "a first scan has no news"
+        );
+
+        // Offline: CI unknown is not news, and the failing state is kept.
+        one.todo.as_mut().unwrap().items = vec![item("y", 6), item("z", 7)];
+        one.todo.as_mut().unwrap().lint_errors = 0;
+        one.ci = Ci::Unknown("offline".into());
+        store
+            .save_scan(&[one.clone(), facts("two", vec![])], true, 2000)
+            .unwrap();
+        let scan = store.scans(1).unwrap().remove(0);
+        let changes: Vec<(String, Change)> = store
+            .scan_changes(scan.id)
+            .unwrap()
+            .into_iter()
+            .map(|c| (c.project, c.change))
+            .collect();
+        let high = |t: &str| (t.to_string(), "high".to_string());
+        assert_eq!(
+            changes,
+            [
+                (
+                    "one".into(),
+                    Change::Opened {
+                        priority: high("z").1,
+                        text: high("z").0
+                    }
+                ),
+                (
+                    "one".into(),
+                    Change::Closed {
+                        priority: high("x").1,
+                        text: high("x").0
+                    }
+                ),
+                ("one".into(), Change::Mended),
+                ("two".into(), Change::New),
+            ]
+        );
+        assert_eq!(
+            (
+                scan.projects,
+                scan.open,
+                scan.opened,
+                scan.closed,
+                scan.other,
+                scan.broken
+            ),
+            (2, 2, 1, 1, 2, 1)
+        );
+
+        // Online again: passing against the failing state before the offline scan.
+        one.ci = Ci::Passing;
+        store.save_scan(&[one.clone()], true, 3000).unwrap();
+        let scan = store.scans(1).unwrap().remove(0);
+        let changes: Vec<_> = store
+            .scan_changes(scan.id)
+            .unwrap()
+            .into_iter()
+            .map(|c| (c.project, c.change))
+            .collect();
+        assert_eq!(
+            changes,
+            [
+                ("one".to_string(), Change::CiPassing),
+                ("two".to_string(), Change::Absent),
+            ]
+        );
+        assert_eq!(store.failing_since().unwrap().get("one"), None);
+
+        one.ci = Ci::Failing(vec!["test".into()]);
+        store.save_scan(&[one.clone()], false, 4000).unwrap();
+        store.save_scan(&[one], false, 5000).unwrap();
+        assert_eq!(
+            store.failing_since().unwrap().get("one"),
+            Some(&crate::history::Since {
+                at: 4000,
+                known: true
+            })
+        );
+        assert_eq!(store.scans(10).unwrap().len(), 5);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn old_scans_are_deleted_with_their_rows() {
+        let dir = scratch("history-kept");
+        let mut store = Store::open(&dir.join("p.db")).unwrap();
+        for at in 0..crate::history::KEPT + 3 {
+            store.save_scan(&[facts("one", vec![])], true, at).unwrap();
+        }
+        let scans = store.scans(1000).unwrap();
+        assert_eq!(scans.len() as i64, crate::history::KEPT);
+        let rows: i64 = store
+            .conn
+            .query_row("SELECT count(*) FROM scan_projects", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, crate::history::KEPT);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

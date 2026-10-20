@@ -3,6 +3,7 @@
 use crate::accept;
 use crate::class::Class;
 use crate::config::Config;
+use crate::history;
 use crate::rank::{self, Placed, Project, Quadrant, State, Urgency};
 use crate::scan::Ci;
 use crate::store::{Attempt, Run, RunState};
@@ -532,6 +533,83 @@ pub fn run_detail(run: &Run, attempts: &[Attempt], changelog: Option<&str>, diff
         out.push('\n');
     }
     out
+}
+
+/// Recorded scans as a table, in the order given.
+pub fn scans(scans: &[history::Scan], now: i64) -> String {
+    let mut rows = vec![
+        [
+            "scan", "when", "kind", "projects", "failing", "broken", "open", "opened", "closed",
+            "other",
+        ]
+        .map(String::from)
+        .to_vec(),
+    ];
+    for s in scans {
+        rows.push(vec![
+            s.id.to_string(),
+            ago(now - s.at),
+            if s.full { "full" } else { "partial" }.into(),
+            s.projects.to_string(),
+            s.failing.to_string(),
+            s.broken.to_string(),
+            s.open.to_string(),
+            s.opened.to_string(),
+            s.closed.to_string(),
+            s.other.to_string(),
+        ]);
+    }
+    table(&rows, "")
+}
+
+/// One line per change.
+pub fn changes(changes: &[history::ProjectChange]) -> String {
+    let rows: Vec<Vec<String>> = changes
+        .iter()
+        .map(|c| {
+            vec![
+                c.project.clone(),
+                c.change.name().into(),
+                truncate(&c.change.detail(), TEXT_WIDTH),
+            ]
+        })
+        .collect();
+    table(&rows, "  ")
+}
+
+/// One line per change, with a project's items opened and closed counted
+/// on one line rather than listed.
+pub fn changes_brief(changes: &[history::ProjectChange]) -> String {
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    let mut items: Vec<(&str, usize, usize)> = Vec::new();
+    for c in changes {
+        match &c.change {
+            history::Change::Opened { .. } | history::Change::Closed { .. } => {
+                let opened = matches!(c.change, history::Change::Opened { .. }) as usize;
+                match items.iter_mut().find(|(p, ..)| *p == c.project) {
+                    Some(e) => {
+                        e.1 += opened;
+                        e.2 += 1 - opened;
+                    }
+                    None => items.push((&c.project, opened, 1 - opened)),
+                }
+            }
+            other => rows.push(vec![
+                c.project.clone(),
+                other.name().into(),
+                truncate(&other.detail(), TEXT_WIDTH),
+            ]),
+        }
+    }
+    for (project, opened, closed) in items {
+        rows.push(vec![
+            project.into(),
+            "items".into(),
+            format!("{opened} opened, {closed} closed"),
+        ]);
+    }
+    rows.sort_by(|a, b| a[0].cmp(&b[0]));
+    table(&rows, "  ")
 }
 
 pub fn ago(seconds: i64) -> String {

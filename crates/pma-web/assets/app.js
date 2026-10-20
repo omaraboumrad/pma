@@ -292,6 +292,13 @@ function draw() {
 }
 
 function cellNode(c, col) {
+  const node = shownNode(c, col);
+  // A link opens GitHub in a new tab; the click does not also select the row.
+  if (!c.link) return node;
+  return el("a", { class: "out", href: c.link, target: "_blank", rel: "noopener noreferrer", onclick: (e) => e.stopPropagation() }, node);
+}
+
+function shownNode(c, col) {
   if (col.kind === "badge" && c.text) return el("span", { class: `pill tone-${c.tone}` }, c.text);
   const span = el("span", { class: `tone-${c.tone}` }, ...inline(c.text));
   if (col.kind === "wide") {

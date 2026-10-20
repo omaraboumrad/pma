@@ -32,6 +32,8 @@ pub struct Facts {
     /// Unix time of the newest commit touching a path outside `activity.ignore`.
     pub last_activity: Option<i64>,
     pub ci: Ci,
+    /// Each failing workflow's latest failed run, as `(workflow, url)`.
+    pub ci_runs: Vec<(String, String)>,
     /// `None` when this scan did not measure dependencies.
     pub deps: Option<DepsFacts>,
     pub error: Option<String>,
@@ -62,6 +64,7 @@ impl Facts {
             ahead: None,
             last_activity: None,
             ci: Ci::Unknown("offline".into()),
+            ci_runs: Vec::new(),
             deps: None,
             error: None,
             held: false,
@@ -249,7 +252,7 @@ pub fn scan_project(
         .and_then(|s| s.trim().parse().ok());
     facts.last_activity = last_activity(&git, ignore);
     if !offline {
-        facts.ci = ci_state(path);
+        (facts.ci, facts.ci_runs) = ci_state(path);
         if deps {
             facts.deps = Some(crate::deps::measure(path));
         }
@@ -620,15 +623,16 @@ pub fn default_branch(dir: &Path) -> Option<String> {
 /// Judged over the workflows that still exist and are enabled. `gh run list`
 /// keeps a deleted workflow's runs, whose last failure would otherwise read as
 /// failing CI until newer runs pushed it out of the window.
-fn ci_state(dir: &Path) -> Ci {
+/// The CI state, and each failing workflow's latest failed run.
+fn ci_state(dir: &Path) -> (Ci, Vec<(String, String)>) {
     let Some(url) = git(dir, &["remote", "get-url", "origin"]) else {
-        return Ci::Unknown("no origin remote".into());
+        return (Ci::Unknown("no origin remote".into()), Vec::new());
     };
     let Some(slug) = github_slug(url.trim()) else {
-        return Ci::Unknown("origin is not on GitHub".into());
+        return (Ci::Unknown("origin is not on GitHub".into()), Vec::new());
     };
     let Some(branch) = default_branch(dir) else {
-        return Ci::Unknown(DEFAULT_BRANCH_UNKNOWN.into());
+        return (Ci::Unknown(DEFAULT_BRANCH_UNKNOWN.into()), Vec::new());
     };
     let gh = |args: &[&str]| {
         let mut cmd = Command::new("gh");
@@ -640,11 +644,11 @@ fn ci_state(dir: &Path) -> Ci {
         args.extend_from_slice(extra);
         args.extend([
             "--json",
-            "workflowName,status,conclusion",
+            "workflowName,status,conclusion,url",
             "--jq",
-            ".[] | [.workflowName, .status, .conclusion] | @tsv",
+            ".[] | [.workflowName, .status, .conclusion, .url] | @tsv",
         ]);
-        gh(&args).map(|tsv| latest_verdicts(&tsv))
+        gh(&args).map(|tsv| (latest_verdicts(&tsv), decisive_urls(&tsv)))
     };
     let judged = (|| {
         let listed = gh(&[
@@ -658,20 +662,30 @@ fn ci_state(dir: &Path) -> Ci {
             "id,name,state",
         ])?;
         let active = active_workflows(&listed).map_err(Ci::Unknown)?;
-        let mut verdicts = runs(&["--limit", "100"])?;
+        let (mut verdicts, mut urls) = runs(&["--limit", "100"])?;
         // A workflow that runs rarely can fall outside that window, so it is
         // asked about alone rather than read as having no runs.
         for (id, name) in &active {
             if !verdicts.contains_key(name) {
                 let id = id.to_string();
-                if let Some(&failed) = runs(&["--workflow", &id, "--limit", "20"])?.get(name) {
+                let (alone, alone_urls) = runs(&["--workflow", &id, "--limit", "20"])?;
+                if let Some(&failed) = alone.get(name) {
                     verdicts.insert(name.clone(), failed);
                 }
+                urls.extend(alone_urls);
             }
         }
-        Ok(ci_of(&active, &verdicts))
+        let ci = ci_of(&active, &verdicts);
+        let failed_runs = match &ci {
+            Ci::Failing(names) => names
+                .iter()
+                .filter_map(|n| urls.get(n).map(|u| (n.clone(), u.clone())))
+                .collect(),
+            _ => Vec::new(),
+        };
+        Ok((ci, failed_runs))
     })();
-    judged.unwrap_or_else(|unknown| unknown)
+    judged.unwrap_or_else(|unknown| (unknown, Vec::new()))
 }
 
 /// Enabled workflows as `(id, name)`, from `gh workflow list --json id,name,state`.
@@ -745,6 +759,22 @@ fn latest_verdicts(tsv: &str) -> HashMap<String, bool> {
     verdicts
 }
 
+/// The URL of each workflow's latest decisive run, from the rows
+/// `latest_verdicts` reads, with the URL as a fourth column.
+fn decisive_urls(tsv: &str) -> HashMap<String, String> {
+    let mut urls = HashMap::new();
+    for line in tsv.lines() {
+        let f: Vec<&str> = line.split('\t').collect();
+        if let [name, status, conclusion, url] = f[..]
+            && failed(status, conclusion).is_some()
+        {
+            urls.entry(name.to_string())
+                .or_insert_with(|| url.to_string());
+        }
+    }
+    urls
+}
+
 /// The project's CI state over its active workflows. A verdict for a workflow
 /// that is not active is ignored.
 fn ci_of(active: &[(u64, String)], verdicts: &HashMap<String, bool>) -> Ci {
@@ -763,6 +793,22 @@ fn ci_of(active: &[(u64, String)], verdicts: &HashMap<String, bool>) -> Ci {
         (false, _) => Ci::Failing(failing),
         (true, false) => Ci::Passing,
         (true, true) => Ci::NoRuns,
+    }
+}
+
+/// The repository's page on GitHub, for a slug of the characters GitHub
+/// allows in an owner or a name.
+pub fn github_url(slug: &str) -> Option<String> {
+    let ok = |p: &str| {
+        !p.is_empty()
+            && p.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    };
+    match slug.split_once('/') {
+        Some((owner, name)) if ok(owner) && ok(name) => {
+            Some(format!("https://github.com/{owner}/{name}"))
+        }
+        _ => None,
     }
 }
 
@@ -872,6 +918,17 @@ mod tests {
         assert_eq!(ci_of(&active(&["a"]), &latest_verdicts("")), Ci::NoRuns);
     }
 
+    #[test]
+    fn each_workflow_links_to_its_latest_decisive_run() {
+        let tsv = "test\tin_progress\t\thttps://x/3\n\
+                   test\tcompleted\tfailure\thttps://x/2\n\
+                   test\tcompleted\tsuccess\thttps://x/1\n\
+                   lint\tcompleted\tsuccess\n";
+        let urls = decisive_urls(tsv);
+        assert_eq!(urls.get("test").map(String::as_str), Some("https://x/2"));
+        assert_eq!(urls.get("lint"), None, "a row without a URL gives none");
+    }
+
     /// A deleted or disabled workflow keeps its runs in `gh run list`; its last
     /// failure is not the project's CI state.
     #[test]
@@ -973,6 +1030,17 @@ mod tests {
         ] {
             let (state, detail) = ci.to_columns();
             assert_eq!(Ci::from_columns(state, detail), ci);
+        }
+    }
+
+    #[test]
+    fn github_urls_take_only_a_plain_slug() {
+        assert_eq!(
+            github_url("shakfu/pma").as_deref(),
+            Some("https://github.com/shakfu/pma")
+        );
+        for bad in ["shakfu", "a/b/c", "a/\"x", "/b", "a/"] {
+            assert_eq!(github_url(bad), None, "{bad}");
         }
     }
 

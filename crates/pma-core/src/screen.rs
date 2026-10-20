@@ -8,7 +8,7 @@
 use crate::api::{Action, Selection, View, WorkerChoice};
 use crate::keys::{Act, Tab};
 use crate::store::{Run, RunState};
-use crate::{accept, dates, next, publish, rank, report, report_runs, watch};
+use crate::{accept, dates, history, next, publish, rank, report, report_runs, scan, watch};
 
 /// What a row is about.
 #[derive(Debug, Clone, PartialEq)]
@@ -106,6 +106,8 @@ pub struct Column {
 pub struct Cell {
     pub text: String,
     pub tone: Tone,
+    /// A page on GitHub the cell names, for a front end that can open one.
+    pub link: Option<String>,
 }
 
 /// Whether `act` can apply to a row about `pick`. An act that needs no row
@@ -206,6 +208,18 @@ fn cell(text: impl Into<String>, tone: Tone) -> Cell {
     Cell {
         text: text.into(),
         tone,
+        link: None,
+    }
+}
+
+/// `c` linking to `url`, when the URL is a GitHub page. Run URLs come from
+/// `gh`'s output; a page must not receive any other scheme.
+fn linked(c: Cell, url: Option<&str>) -> Cell {
+    Cell {
+        link: url
+            .filter(|u| u.starts_with("https://github.com/"))
+            .map(String::from),
+        ..c
     }
 }
 
@@ -421,6 +435,96 @@ fn run_detail(
 
 /// A status row's cells, toned: `pma status`'s project, tier, state, open,
 /// idle, ci, deps, local and todo.
+/// A change's tone: bad news, good news, or work arriving.
+pub fn change_tone(c: &history::Change) -> Tone {
+    match c {
+        c if c.bad() => Tone::Bad,
+        c if c.good() => Tone::Good,
+        _ => Tone::Accent,
+    }
+}
+
+fn changes_pane(
+    changes: Vec<history::ProjectChange>,
+    projects: &[(rank::Project, crate::store::ProjectRow)],
+) -> Pane {
+    let repo = |name: &str| {
+        projects
+            .iter()
+            .find(|(_, r)| r.name == name)
+            .and_then(|(_, r)| r.slug.as_deref())
+            .and_then(scan::github_url)
+    };
+    Pane {
+        title: "Changed at the last scan".into(),
+        columns: vec![
+            col("project", Kind::Text),
+            col("change", Kind::Badge),
+            col("detail", Kind::Wide),
+        ],
+        items: changes
+            .into_iter()
+            .map(|c| {
+                let url = repo(&c.project);
+                let detail = match &c.change {
+                    history::Change::CiFailing(_) => url.as_ref().map(|u| format!("{u}/actions")),
+                    _ => None,
+                };
+                Item {
+                    cells: vec![
+                        linked(plain(c.project.clone()), url.as_deref()),
+                        cell(c.change.name(), change_tone(&c.change)),
+                        linked(plain(c.change.detail()), detail.as_deref()),
+                    ],
+                    pick: Pick::Manual { project: c.project },
+                }
+            })
+            .collect(),
+        empty: "The last scan changed nothing since the one before.",
+    }
+}
+
+fn scans_pane(scans: Vec<history::Scan>, now: i64) -> Pane {
+    let count = |n: i64, tone: Tone| match n {
+        0 => muted("0"),
+        n => cell(n.to_string(), tone),
+    };
+    Pane {
+        title: "Recent scans".into(),
+        columns: vec![
+            col("scan", Kind::Text),
+            col("when", Kind::Text),
+            col("kind", Kind::Text),
+            col("projects", Kind::Number),
+            col("failing", Kind::Number),
+            col("broken", Kind::Number),
+            col("open", Kind::Number),
+            col("opened", Kind::Number),
+            col("closed", Kind::Number),
+            col("other", Kind::Number),
+        ],
+        items: scans
+            .into_iter()
+            .map(|s| Item {
+                cells: vec![
+                    muted(format!("#{}", s.id)),
+                    plain(report::ago(now - s.at)),
+                    muted(if s.full { "full" } else { "partial" }),
+                    plain(s.projects.to_string()),
+                    count(s.failing, Tone::Bad),
+                    count(s.broken, Tone::Warn),
+                    plain(s.open.to_string()),
+                    count(s.opened, Tone::Accent),
+                    count(s.closed, Tone::Good),
+                    count(s.other, Tone::Plain),
+                ],
+                pick: Pick::Nothing,
+            })
+            .collect(),
+        empty: "No scan recorded yet.",
+    }
+}
+
 fn status_cells(c: &[String]) -> Vec<Cell> {
     let get = |i: usize| c.get(i).cloned().unwrap_or_default();
     let ci = get(5);
@@ -574,6 +678,9 @@ pub fn screen(view: View) -> Screen {
         View::Status {
             header,
             portfolio: p,
+            scans,
+            changes,
+            since,
             ..
         } => {
             let rows: Vec<report::StatusRow> = p
@@ -587,34 +694,96 @@ pub fn screen(view: View) -> Screen {
                     scan_error: row.scan_error.as_deref(),
                 })
                 .collect();
-            let items = report::status_rows(&p.cfg, &rows)
+            let row_of = |name: &str| p.projects.iter().map(|(_, r)| r).find(|r| r.name == name);
+            let repo = |name: &str| {
+                row_of(name)
+                    .and_then(|r| r.slug.as_deref())
+                    .and_then(scan::github_url)
+            };
+            let items: Vec<Item> = report::status_rows(&p.cfg, &rows)
                 .into_iter()
-                .map(|(_, c)| Item {
-                    pick: Pick::Manual {
-                        project: c.first().cloned().unwrap_or_default(),
-                    },
-                    cells: status_cells(&c),
+                .map(|(_, c)| {
+                    let name = c.first().cloned().unwrap_or_default();
+                    let url = repo(&name);
+                    let mut cells = status_cells(&c);
+                    cells[0] = linked(cells[0].clone(), url.as_deref());
+                    cells[5] = linked(
+                        cells[5].clone(),
+                        url.map(|u| format!("{u}/actions")).as_deref(),
+                    );
+                    Item {
+                        pick: Pick::Manual { project: name },
+                        cells,
+                    }
                 })
                 .collect();
+            let latest = scans.first().map(|s| s.at);
+            let mut failing = Vec::new();
+            for item in &items {
+                let Pick::Manual { project } = &item.pick else {
+                    continue;
+                };
+                let Some(row) = row_of(project) else {
+                    continue;
+                };
+                let scan::Ci::Failing(workflows) = &row.ci else {
+                    continue;
+                };
+                let actions = repo(project).map(|u| format!("{u}/actions"));
+                for w in workflows {
+                    let run = row
+                        .ci_runs
+                        .iter()
+                        .find(|(name, _)| name == w)
+                        .map(|(_, u)| u.clone())
+                        .or_else(|| actions.clone());
+                    failing.push(Item {
+                        cells: vec![
+                            linked(plain(project.clone()), repo(project).as_deref()),
+                            linked(cell(w.clone(), Tone::Bad), run.as_deref()),
+                            plain(history::since_text(since.get(project), latest, now)),
+                            linked(muted(run.clone().unwrap_or_default()), run.as_deref()),
+                        ],
+                        pick: Pick::Manual {
+                            project: project.clone(),
+                        },
+                    });
+                }
+            }
             panes(
                 Tab::Status,
                 Some(header),
-                vec![Pane {
-                    title: "Projects, worst first".into(),
-                    columns: vec![
-                        col("project", Kind::Text),
-                        col("tier", Kind::Text),
-                        col("state", Kind::Badge),
-                        col("open", Kind::Number),
-                        col("idle", Kind::Number),
-                        col("ci", Kind::Badge),
-                        col("deps", Kind::Number),
-                        col("local", Kind::Text),
-                        col("todo", Kind::Text),
-                    ],
-                    items,
-                    empty: "No tiered project. `pma project tier <1-5> <project>` ranks one.",
-                }],
+                vec![
+                    Pane {
+                        title: "Projects, worst first".into(),
+                        columns: vec![
+                            col("project", Kind::Text),
+                            col("tier", Kind::Text),
+                            col("state", Kind::Badge),
+                            col("open", Kind::Number),
+                            col("idle", Kind::Number),
+                            col("ci", Kind::Badge),
+                            col("deps", Kind::Number),
+                            col("local", Kind::Text),
+                            col("todo", Kind::Text),
+                        ],
+                        items,
+                        empty: "No tiered project. `pma project tier <1-5> <project>` ranks one.",
+                    },
+                    Pane {
+                        title: "Failing CI".into(),
+                        columns: vec![
+                            col("project", Kind::Text),
+                            col("workflow", Kind::Badge),
+                            col("failing", Kind::Text),
+                            col("run", Kind::Wide),
+                        ],
+                        items: failing,
+                        empty: "No workflow fails on a default branch.",
+                    },
+                    changes_pane(changes, &p.projects),
+                    scans_pane(scans, now),
+                ],
             )
         }
         View::Stale {

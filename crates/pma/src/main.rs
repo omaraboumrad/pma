@@ -3,8 +3,8 @@
 //! Design: `docs/dev/design.md`.
 
 use pma_core::{
-    api, class, config, dates, dispatch, jobs, next, pass, progress, projects, publish, rank,
-    report, report_runs, route, scan, script, store, sync, todo, watch, worker, workflow,
+    api, class, config, dates, dispatch, history, jobs, next, pass, progress, projects, publish,
+    rank, report, report_runs, route, scan, script, store, sync, todo, watch, worker, workflow,
 };
 use pma_tui::{choose, tui};
 
@@ -28,7 +28,10 @@ const GROUPS: [(&str, &[&str]); 6] = [
         &["next", "scan", "matrix", "dispatch", "review", "pr", "push"],
     ),
     ("Tasks", &["lint", "prune", "stale", "sync", "note"]),
-    ("Reading", &["status", "report", "tui", "web", "watch"]),
+    (
+        "Reading",
+        &["status", "history", "report", "tui", "web", "watch"],
+    ),
     ("Setup", &["root", "project", "config", "verify"]),
     ("Agents", &["agent", "preset", "route"]),
     ("Many at once", &["campaign", "workflow", "job"]),
@@ -202,6 +205,22 @@ enum Command {
         /// Include untiered projects, ranked as tier 5.
         #[arg(long)]
         all: bool,
+        /// Write the view, with the latest scan's changes and the recent
+        /// scans, to FILE as a self-contained HTML page.
+        #[arg(long, value_name = "FILE", conflicts_with = "explain")]
+        html: Option<PathBuf>,
+    },
+    /// Past scans, or what one scan changed.
+    ///
+    /// Each scan records every project's state and what changed since the
+    /// scan before: items opened and closed, CI failing or passing again, a
+    /// project broken, mended, new or absent.
+    History {
+        /// A scan's number, to list what it changed; the latest with `last`.
+        scan: Option<String>,
+        /// How many scans to list.
+        #[arg(short = 'n', long, default_value_t = 20)]
+        count: usize,
     },
     /// Run an agent on tasks, each in its own worktree.
     ///
@@ -791,9 +810,18 @@ fn main() -> ExitCode {
         Command::Status {
             projects,
             tags,
+            explain: _,
+            all,
+            html: Some(file),
+        } => write_status_html(&projects, &tags, all, &file),
+        Command::Status {
+            projects,
+            tags,
             explain,
             all,
+            html: None,
         } => show_status(&projects, &tags, explain, all),
+        Command::History { scan, count } => show_history(scan.as_deref(), count),
         Command::Dispatch { detach: true, .. } => {
             Store::open_default().and_then(|store| jobs::enqueue(&store))
         }
@@ -1579,7 +1607,73 @@ fn run_scan(names: &[String], tags: &[String], offline: bool, deps: bool) -> Res
         summary.push_str(&format!(", outdated dependencies in {outdated}"));
     }
     println!("{summary}");
+    print!("{}", scan_review(&store, &facts)?);
     Ok(())
+}
+
+/// After a scan: what changed since the scan before, and the projects with
+/// failing CI or broken, with how long CI has failed.
+fn scan_review(store: &Store, facts: &[scan::Facts]) -> Result<String> {
+    let now = dates::now();
+    let scans = store.scans(2)?;
+    let mut out = String::new();
+    // The first recorded scan also compares against the rows it replaced.
+    let changes = match scans.first() {
+        Some(latest) => store.scan_changes(latest.id)?,
+        None => Vec::new(),
+    };
+    if !changes.is_empty() {
+        out.push_str(&format!(
+            "\nsince the scan before:\n{}",
+            report::changes_brief(&changes)
+        ));
+    }
+    let since = store.failing_since()?;
+    let rows = store.projects()?;
+    let mut attention: Vec<Vec<String>> = Vec::new();
+    for f in facts {
+        let Some(row) = rows.iter().find(|r| r.name == f.name) else {
+            continue;
+        };
+        if let scan::Ci::Failing(names) = &row.ci {
+            let when = history::since_text(since.get(&row.name), scans.first().map(|s| s.at), now);
+            // One line per workflow, with its failed run to open.
+            for w in names {
+                let run = row
+                    .ci_runs
+                    .iter()
+                    .find(|(n, _)| n == w)
+                    .map(|(_, u)| u.clone())
+                    .or_else(|| {
+                        row.slug
+                            .as_deref()
+                            .and_then(scan::github_url)
+                            .map(|u| format!("{u}/actions"))
+                    })
+                    .unwrap_or_default();
+                attention.push(vec![
+                    row.name.clone(),
+                    "failing CI".into(),
+                    format!("{w}; {when}"),
+                    run,
+                ]);
+            }
+        }
+        if let Some(why) = history::broken(row.lint_errors, row.scan_error.as_deref()) {
+            attention.push(vec![row.name.clone(), "broken".into(), why]);
+        }
+    }
+    if !attention.is_empty() {
+        out.push_str(&format!(
+            "\nneeds attention:\n{}",
+            report::table(&attention, "  ")
+        ));
+    }
+    out.push_str(
+        "\nevery project: `pma status --all`; earlier scans: `pma history`; \
+         a page: `pma status --all --html <file>`\n",
+    );
+    Ok(out)
 }
 
 fn show_matrix(
@@ -1600,6 +1694,82 @@ fn show_next(names: &[String], tags: &[String], all: bool) -> Result<()> {
         of: selection(names, tags),
         all,
     })
+}
+
+#[cfg(feature = "web")]
+fn write_status_html(names: &[String], tags: &[String], all: bool, file: &Path) -> Result<()> {
+    let store = Store::open_default()?;
+    let view = api::query(
+        &store,
+        Query::Status {
+            of: selection(names, tags),
+            explain: false,
+            all,
+        },
+    )?;
+    let mut screen = pma_core::screen::screen(view);
+    // A report is read top down: the changes and the scans before the long
+    // project list. The TUI and web keep the projects first.
+    if let pma_core::screen::Body::Panes(panes) = &mut screen.body {
+        panes.rotate_left(1);
+    }
+    let now = dates::now();
+    let html = pma_web::page(&screen, "pma status", &dates::format(dates::day(now)));
+    std::fs::write(file, html).map_err(|e| format!("write {}: {e}", file.display()))?;
+    println!("wrote {}", file.display());
+    Ok(())
+}
+
+#[cfg(not(feature = "web"))]
+fn write_status_html(_: &[String], _: &[String], _: bool, _: &Path) -> Result<()> {
+    Err("this pma was built without the `web` feature, which writes HTML".into())
+}
+
+/// The recorded scans, or what one of them changed.
+fn show_history(scan: Option<&str>, count: usize) -> Result<()> {
+    let store = Store::open_default()?;
+    let now = dates::now();
+    let scans = store.scans(count)?;
+    let Some(scan) = scan else {
+        if scans.is_empty() {
+            println!("no scan recorded yet; run `pma scan`");
+        } else {
+            print!("{}", report::scans(&scans, now));
+        }
+        return Ok(());
+    };
+    let id = match scan {
+        "last" => store
+            .scans(1)?
+            .first()
+            .map(|s| s.id)
+            .ok_or("no scan recorded yet")?,
+        n => n
+            .parse()
+            .map_err(|_| format!("`{n}` is not a scan number; `pma history` lists them"))?,
+    };
+    let Some(s) = store
+        .scans(history::KEPT as usize)?
+        .into_iter()
+        .find(|s| s.id == id)
+    else {
+        return Err(format!("no scan {id}; `pma history` lists them").into());
+    };
+    println!(
+        "scan {id}, {}, {}: {} projects, CI failing in {}, {} broken, {} open items",
+        report::ago(now - s.at),
+        if s.full { "full" } else { "partial" },
+        s.projects,
+        s.failing,
+        s.broken,
+        s.open
+    );
+    let changes = store.scan_changes(id)?;
+    match changes.is_empty() {
+        true => println!("no change since the scan before"),
+        false => print!("\n{}", report::changes(&changes)),
+    }
+    Ok(())
 }
 
 fn show_status(names: &[String], tags: &[String], explain: bool, all: bool) -> Result<()> {
@@ -3519,6 +3689,7 @@ fn render(view: View) -> String {
             header,
             portfolio: p,
             explain,
+            ..
         } => {
             let rows: Vec<report::StatusRow> = p
                 .projects

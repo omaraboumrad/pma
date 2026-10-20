@@ -11,6 +11,7 @@ pub mod config;
 pub mod dates;
 pub mod deps;
 pub mod dispatch;
+pub mod history;
 pub mod jobs;
 pub mod keys;
 pub mod next;

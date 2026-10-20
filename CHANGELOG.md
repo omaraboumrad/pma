@@ -6,6 +6,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+**Scan history: what changed, `pma history`, and `pma status --html`.** A scan reported only counts, such as "CI failing in 6", without naming the projects, and kept no record of earlier scans. It now prints what changed since the scan before and lists the projects with failing CI or broken. Each scan records every project's state and its changes: items opened and closed, CI failing or passing again, a project broken, mended, new, returned or absent. The last 100 scans are kept. The status view in the TUI, the web and the HTML page gains three panes: failing CI, one row per failing workflow with its latest failed run; the last scan's changes; and the recent scans. In the web and the HTML page, a project links to its GitHub repository, its CI to its Actions page, and a failing workflow to its run. The scan records each failing run's URL from `gh run list`. Schemas 36 and 37.
+
+```sh
+pma history                          # the recorded scans, newest first
+pma history last                     # what the latest one changed; or a scan's number
+pma status --all --html status.html  # one self-contained page, no server
+```
+
+A CI change is judged against the last state a scan knew, so an offline scan's `unknown` reports neither a failure nor a fix. Failing CI shows when it began; with no earlier passing record, that time is a lower bound. An item is matched across scans as the store already matches it: by key, then by text. Rewording an item without an id still reads as one item closed and one opened. Rendering HTML from `pma_core::screen` keeps the page's tones and columns in step with the web view; an export of the web app's JavaScript was the alternative, and needs a server to load its data.
+
 **`docs/dev/pma-minos-integration.md`, the state of running a worker under minos's `minosb`.** No code depends on minos yet. Measured on Claude Code 2.1.299 with several turns in one session: `total_cost_usd` is cumulative for the session, so `parse_claude`'s last `result` record gives the right cost. The same choice makes the summary the last turn's reply, not the task's outcome, and makes a run whose last turn was interrupted read as failed (`error_during_execution`). Both matter only for a worker that takes corrections mid-run; see issues 2-4 there. `using-containers.md` and `implementation-plan.md` 2b.6-2b.8 now follow minos's broker design.
 
 **A workflow library, two new workflows, and the `doc` sink.** `pma workflow library` prints the nine workflows `propose` takes, with their types, as one document. It comes from `docs/dev/workflows.md` section 15, and a test holds the two to each other. A revision is a whole document, so the library is printed for you to edit or merge, then proposed, rather than installed beside your own.

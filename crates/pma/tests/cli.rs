@@ -272,6 +272,76 @@ fn plan_id(out: &str) -> String {
         .collect()
 }
 
+/// A scan names what changed since the one before and what needs attention;
+/// `history` lists the scans and what each changed; `status --html` writes
+/// them as a page.
+#[test]
+fn a_scan_reports_what_changed_and_history_keeps_it() {
+    let s = Scratch::new("history");
+    let home = s.0.join("home");
+    let root = s.0.join("root");
+    let alpha = root.join("alpha");
+    fs::create_dir_all(&alpha).unwrap();
+    git(&alpha, &["init", "-q"], None);
+    fs::write(
+        alpha.join("TODO.md"),
+        "# TODO\n\n## High\n\n- [ ] keep\n- [ ] finish\n",
+    )
+    .unwrap();
+    ok(&home, &["root", "add", root.to_str().unwrap()]);
+    assert!(ok(&home, &["history"]).contains("no scan recorded yet"));
+    let first = ok(&home, &["scan", "--offline"]);
+    assert!(!first.contains("since the scan before"), "{first}");
+    assert!(first.contains("`pma history`"), "{first}");
+
+    // One item done, one added, a second `#` heading, and a new project.
+    fs::write(
+        alpha.join("TODO.md"),
+        "# TODO\n\n## High\n\n- [ ] keep\n- [ ] new one\n\n# Other\n",
+    )
+    .unwrap();
+    let beta = root.join("beta");
+    fs::create_dir_all(&beta).unwrap();
+    git(&beta, &["init", "-q"], None);
+    let second = ok(&home, &["scan", "--offline"]);
+    assert!(second.contains("since the scan before:"), "{second}");
+    assert!(second.contains("alpha  broken"), "{second}");
+    assert!(
+        second.contains("alpha  items   1 opened, 1 closed"),
+        "{second}"
+    );
+    assert!(second.contains("beta   new"), "{second}");
+    assert!(second.contains("needs attention:"), "{second}");
+
+    let listed = ok(&home, &["history"]);
+    let lines: Vec<&str> = listed.lines().collect();
+    assert_eq!(lines.len(), 3, "{listed}");
+    assert!(lines[1].starts_with("2 "), "newest first: {listed}");
+    let changed = ok(&home, &["history", "last"]);
+    assert!(changed.starts_with("scan 2, "), "{changed}");
+    assert!(changed.contains("opened  high: new one"), "{changed}");
+    assert!(changed.contains("closed  high: finish"), "{changed}");
+    assert!(ok(&home, &["history", "1"]).contains("no change since the scan before"));
+    let (_, err, success) = pma_in(&home, &["history", "9"]);
+    assert!(!success && err.contains("no scan 9"), "{err}");
+
+    let page = s.0.join("status.html");
+    ok(
+        &home,
+        &["status", "--all", "--html", page.to_str().unwrap()],
+    );
+    let html = fs::read_to_string(&page).unwrap();
+    assert!(html.starts_with("<!doctype html>"), "{html}");
+    for text in [
+        "Changed at the last scan",
+        "Recent scans",
+        "new one",
+        "alpha",
+    ] {
+        assert!(html.contains(text), "{text} missing");
+    }
+}
+
 #[test]
 fn scan_rank_and_explain_a_real_repo() {
     let s = Scratch::new("stage2");
@@ -327,9 +397,14 @@ fn scan_rank_and_explain_a_real_repo() {
         "{scanned}"
     );
     assert!(
-        scanned.ends_with(": 1 with TODO.md, 3 open items\n"),
+        scanned
+            .lines()
+            .next()
+            .unwrap()
+            .ends_with(": 1 with TODO.md, 3 open items"),
         "{scanned}"
     );
+    assert!(!scanned.contains("since the scan before"), "{scanned}");
 
     let matrix = ok(&home, &["matrix", "--all"]);
     let expected = "\
@@ -2161,7 +2236,11 @@ fn notes_and_measured_dependencies() {
 
     let scanned = ok(&["scan", "--deps"]);
     assert!(
-        scanned.ends_with(", outdated dependencies in 1\n"),
+        scanned
+            .lines()
+            .next()
+            .unwrap()
+            .ends_with(", outdated dependencies in 1"),
         "{scanned}"
     );
     ok(&["scan", "--offline"]);

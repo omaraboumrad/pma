@@ -89,6 +89,12 @@ pub enum View {
         header: String,
         portfolio: Box<Portfolio>,
         explain: bool,
+        /// The latest scans, newest first.
+        scans: Vec<crate::history::Scan>,
+        /// What the latest scan changed, in the selected projects.
+        changes: Vec<crate::history::ProjectChange>,
+        /// When each failing project's CI began failing.
+        since: std::collections::HashMap<String, crate::history::Since>,
     },
     Stale {
         header: String,
@@ -270,6 +276,9 @@ impl Outcome {
         }
     }
 }
+
+/// Scans the status view lists.
+pub const SCANS_SHOWN: usize = 10;
 
 /// What the last scan recorded, for tiered projects.
 pub struct Portfolio {
@@ -509,10 +518,23 @@ pub fn query(store: &Store, q: Query) -> Result<View> {
         }
         Query::Status { of, explain, all } => {
             let p = portfolio(store, &of, all)?;
+            let scans = store.scans(SCANS_SHOWN)?;
+            let names = select(store, &of.projects, &of.tags)?;
+            let changes = match scans.first() {
+                Some(latest) => store
+                    .scan_changes(latest.id)?
+                    .into_iter()
+                    .filter(|c| names.is_empty() || names.contains(&c.project))
+                    .collect(),
+                None => Vec::new(),
+            };
             View::Status {
                 header: p.header(),
                 portfolio: Box::new(p),
                 explain,
+                scans,
+                changes,
+                since: store.failing_since()?,
             }
         }
         Query::Stale { of, count } => {

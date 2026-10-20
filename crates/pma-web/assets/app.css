@@ -250,6 +250,10 @@ tfoot td { font-weight: 650; background: var(--surface-2); }
 .pill.tone-bad { background: var(--bad-soft); color: var(--bad); }
 .pill.tone-muted { color: var(--text-3); }
 .pill.tone-plain::before, .pill.tone-strong::before { display: none; }
+a.out { color: inherit; text-decoration: none; }
+a.out > span:not(.pill) { color: var(--accent-text); }
+a.out:hover > span:not(.pill), a.out:focus-visible > span:not(.pill) { text-decoration: underline; }
+a.out:hover > .pill { filter: brightness(0.95); text-decoration: underline; }
 
 /* Drawer */
 .drawer {

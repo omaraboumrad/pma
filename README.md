@@ -35,6 +35,8 @@ pma pr 1                       # commit and open a pull request; or `pma push 1`
 
 - Projects worst first by what needs attention (`pma status`), and an oldest-first list to prune (`pma stale`).
 
+- Each scan says what changed since the one before: items opened and closed, CI failing or fixed, projects broken or new. `pma history` keeps the last 100 scans, and `pma status --html` writes the view as one page.
+
 - Portfolio notes that belong to no single project.
 
 **Tasks in plain Markdown**
@@ -179,6 +181,8 @@ pma next                        # for agents and for you; --all for every row
 pma matrix                      # the ranked 2x2; -q q1 for one quadrant
 pma status --explain            # projects worst first, with what placed each
 pma status --all                # untiered projects too, e.g. to find failing CI
+pma status --all --html s.html  # the same, with the last scan's changes, as one HTML page
+pma history                     # past scans; `pma history last` for what the latest changed
 pma stale                       # open items by age, oldest first
 pma tui                         # every view and action; 0-9 switch tabs, ? lists keys, q quits
 pma web                         # the same in a browser, on 127.0.0.1 behind a one-time token
@@ -188,7 +192,7 @@ pma web --no-open --port 9000   # for `ssh -L 9000:127.0.0.1:9000 host` from ano
 pma note add "move CI to a reusable workflow"
 ```
 
-`next`, `matrix`, `status` and `tui` read the last scan. They do not rescan.
+`next`, `matrix`, `status`, `history` and `tui` read the last scan. They do not rescan.
 
 Agents, models and presets:
 

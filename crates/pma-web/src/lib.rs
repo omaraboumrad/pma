@@ -11,6 +11,9 @@
 //! as the TUI's do. Design: `docs/dev/frontends.md`.
 
 mod http;
+mod page;
+
+pub use page::page;
 
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
@@ -358,7 +361,7 @@ fn keys_json() -> Value {
 }
 
 fn cell_json(c: &screen::Cell) -> Value {
-    json!({ "text": c.text, "tone": c.tone.name() })
+    json!({ "text": c.text, "tone": c.tone.name(), "link": c.link })
 }
 
 fn screen_json(s: &Screen) -> Value {
