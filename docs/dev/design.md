@@ -45,7 +45,7 @@ Goal 5 is not built. The manager is deterministic today, in scoring formulas and
 | Portfolio store | SQLite at `~/.config/pma/projects.db`; one user, one machine, one session |
 | Agents | `claude`, `opencode`, `omp`, `sanduk` and `refresh` seeded; `codex`, `cursor-agent` by an `agent` record |
 | Agent output | Uncommitted changes, reviewed, then committed and pushed by `pma` |
-| Publish | Per run, by command: `pma push` to the default branch, or `pma pr` for a branch and a PR |
+| Publish | Per run, by command: `pma stage`, `pma commit`, `pma push` in the clone, or `pma pr` for a branch and a PR |
 | Attribution | Configurable, default the user only |
 | Issues sync | Hybrid, `Critical` items only |
 | Language | Rust |
@@ -242,7 +242,7 @@ It replaces a health score, `tier * sum(w_i * s_i) / sum(w_i)` over five signals
 
 SQLite at `~/.config/pma/projects.db`, via `rusqlite`. It holds projects, tiers, settings, notes, the scanned task index, the dispatch queue, and agent run history. Worktrees, logs and artifacts live apart from it, under `~/.local/state/pma`, so the database directory holds only the database and the session lock.
 
-This assumes one user. Commands that run agents or change worktrees (`dispatch`, `pr`, `push`, `review --reject`, `review --rework`) hold an exclusive `flock` on `session.lock` for their whole run. A second one refuses to start and names the holder's pid. The kernel releases the lock when the process exits, so a crash leaves no stale lock, unlike a pid file. Other commands run alongside, and SQLite waits up to 5s for a write lock. `pma review` holds the lock for milliseconds to fail runs of an ended session, so a command that needs the lock waits up to 2s before refusing.
+This assumes one user. Commands that run agents or change worktrees (`dispatch`, `stage`, `commit`, `push`, `pr`, `review --reject`, `review --rework`) hold an exclusive `flock` on `session.lock` for their whole run. A second one refuses to start and names the holder's pid. The kernel releases the lock when the process exits, so a crash leaves no stale lock, unlike a pid file. Other commands run alongside, and SQLite waits up to 5s for a write lock. `pma review` holds the lock for milliseconds to fail runs of an ended session, so a command that needs the lock waits up to 2s before refusing.
 
 - `journal_mode=DELETE`, not WAL. The file on disk is complete whenever no transaction is open, so it can be copied as a backup. WAL lets readers run during a write; here writes are single rows, and the busy timeout covers them.
 
@@ -401,7 +401,7 @@ Limits: `max_parallel` agents, and `batch_budget`. A run starts only while the b
 
 ## Review
 
-States: `queued -> running -> ready | failed`, then `approved`, or `rejected`. `pma push` takes `approved -> pushed`. `pma pr` takes `approved -> pr-open`, then `merged` when the pull request is merged, or `closed` when it is closed unmerged. Final states: `rejected`, `pushed`, `merged`, `closed`. Rework returns a ready, failed or approved run to `running`.
+States: `queued -> running -> ready | failed`, then `approved`, or `rejected`. `pma stage` takes `ready | approved -> staged`, `pma commit` `staged -> committed`, `pma push` `committed -> pushed`; each runs the earlier steps first, and from `ready` only `stage` does. `pma pr` takes `approved -> pr-open`, then `merged` when the pull request is merged, or `closed` when it is closed unmerged. Final states: `rejected`, `pushed`, `merged`, `closed`; `staged` and `committed` hold their task until pushed or rejected. Rework returns a ready, failed or approved run to `running`.
 
 `pr-open` is not final, so the task is not dispatched again while its pull request is open. The item is still open on the default branch until the merge, which alone would admit it. `pma review` and `pma dispatch` read each open pull request's state with `gh pr view`. A run whose state cannot be read stays `pr-open`. An open pull request with a review decision, comments or reviews shows them in `pma review`.
 
@@ -417,27 +417,19 @@ States: `queued -> running -> ready | failed`, then `approved`, or `rejected`. `
 
 **Superseded by implementation plan 4.7 and 4.8.** Publishing runs no verification after approval, so an edited worktree, or a clean but semantically incompatible rebase, can publish content no verify run ever saw. Approval will carry evidence (verified tree, base SHA, verify command, scope revision, approver) that the integrated tree is rechecked against after the rebase. A `pma pr` run will also gain a merge lifecycle gated on positive green CI for the current head, rather than only observing whether a person merged it.
 
-`pma pr <id>...` and `pma push <id>...` publish the named runs, each of which must be approved; `--all-approved` names every approved run. Per project:
+`pma stage`, `pma commit` and `pma push` work in the user's clone; `docs/dev/stage-commit-push.md` has the rules. The item is ticked in the staged change. No check runs at publishing: the clone must be at the run's base, and git refuses a push that does not fast-forward.
 
-1. `git add -A`, then commit with the task text as the subject. Add `Closes #N` when `gh:N` is set. Author is the user. With `attribution = "co-author"`, a trailer names the agent.
+`pma pr <id>...` publishes approved runs from their worktrees. Per run:
 
-2. With `push`, rebase onto the remote default branch.
+1. Commit the approved tree on the base, with the task text as the subject. Add `Closes #N` when `gh:N` is set. Author is the user. With `attribution = "co-author"`, a trailer names the agent.
 
-3. Mark the item `[x]` in place and amend the commit. This follows the rebase. Git treats changes to adjacent lines as a conflict, so two tasks ticked before the rebase could conflict. A fix-CI run has no item and skips this step.
+2. Mark the item `[x]` in place and amend the commit. A fix-CI run has no item and skips this step.
 
-4. Publish:
+3. Push `pma/<slug>` and `gh pr create`. `gh` is required up front. The run becomes `pr-open`.
 
-   - `push`: push to the default branch. The run becomes `pushed`.
+4. Remove the worktree and branch.
 
-   - `pr`: push `pma/<slug>` and `gh pr create`. `gh` is required up front. The run becomes `pr-open`.
-
-5. Remove the worktree and branch.
-
-A failure in one project, such as a rebase conflict, stops that project and does not stop the batch. Its runs stay approved, so the command can be run again. The report lists each outcome.
-
-Publishing resumes where it stopped. The outcome is saved as soon as the publish step succeeds, and a failure to remove the worktree afterwards is a warning; the leftover branch then shows in the hygiene signal. With `push`, a worktree whose commits are already in the fetched default branch was pushed by an earlier, interrupted push, and is recorded as pushed. With `pr`, an open pull request for the branch is reused instead of creating another.
-
-The user's clone is not updated. After a push it is behind its remote, and an uncommitted `TODO.md` edit there can conflict on pull.
+A failure in one project stops that project and does not stop the batch. Each run stays in the last state it reached, so the command can be run again. With `pr`, an open pull request for the branch is reused instead of creating another, and a failure to remove the worktree afterwards is a warning.
 
 ## Sync (hybrid)
 
@@ -457,7 +449,7 @@ Sync keys on the `Critical` heading, not on Q1. A quadrant shifts as due dates a
 
 Each `gh:N` is written to the file right after its issue is created. A sync that stops between the two leaves an open, labelled issue with the item's title and no link. The next sync links that issue instead of opening another.
 
-Write-backs are uncommitted edits to `TODO.md` in the user's clone, not a published batch: `pma pr` and `pma push` commit worktrees, and the clone is the file the matrix reads. `scripts/commit_todo.py` commits them.
+Write-backs are uncommitted edits to `TODO.md` in the user's clone, not a published batch: `pma pr` commits worktrees, and the clone is the file the matrix reads. `scripts/commit_todo.py` commits them.
 
 Adding `gh:N` changes an item's key from its text to the issue number. Dispatch, publishing, and the one-run-per-task check therefore match a task by key or by text.
 

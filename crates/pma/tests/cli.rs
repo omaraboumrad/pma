@@ -739,26 +739,46 @@ fn dispatch_review_rework_and_push() {
     assert!(!env.home.join("state/worktrees/alpha/third-task").exists());
     assert_eq!(git_out(&alpha, &["branch", "--list", "pma/third-task"]), "");
 
-    let out = env.ok(&["push", "1", "2"]);
-    assert!(out.contains("#1 alpha: pushed "), "{out}");
-    assert!(out.contains("#2 alpha: pushed "), "{out}");
-    let log = git_out(&origin, &["log", "--format=%B|", "main"]);
+    // `git apply --index` refuses a file with unstaged edits, and the run
+    // stays approved.
+    let (out, _, success) = env.run(&["push", "1"]);
     assert!(
-        log.starts_with("second task\n\nCloses #7\n|\nadd greeting\n|"),
-        "{log:?}"
+        !success && out.contains("TODO.md: does not match index"),
+        "{out}"
+    );
+    git(&alpha, &["checkout", "-q", "--", "TODO.md"], None);
+    let (out, _, success) = env.run(&["push", "1", "2"]);
+    assert!(!success, "{out}");
+    assert!(out.contains("#1 alpha: staged in "), "{out}");
+    assert!(out.contains("; committed "), "{out}");
+    assert!(out.contains("; pushed "), "{out}");
+    // #2 shares #1's base, which the clone has moved past. Nothing checked
+    // it against #1, so it is refused rather than rebased.
+    assert!(out.contains("not run #2's base"), "{out}");
+    assert!(out.contains("Publish it with `pma pr 2`"), "{out}");
+    let log = git_out(&origin, &["log", "--format=%B|", "main"]);
+    assert_eq!(log, "add greeting\n|\ninit\n|\n");
+    // The clone holds what was pushed.
+    assert_eq!(
+        git_out(&alpha, &["rev-parse", "HEAD"]),
+        git_out(&origin, &["rev-parse", "main"])
     );
     assert_eq!(
         git_out(&origin, &["show", "main:TODO.md"]),
-        "# TODO\n\n## High\n\n- [x] add greeting #agent\n  say hello in hello.txt\n- [x] second task #agent gh:7\n- [ ] third task #agent\n\n## Low\n\n- [ ] guarded task #manual\n"
+        "# TODO\n\n## High\n\n- [x] add greeting #agent\n  say hello in hello.txt\n- [ ] second task #agent gh:7\n- [ ] third task #agent\n\n## Low\n\n- [ ] guarded task #manual\n"
     );
-    assert_eq!(git_out(&origin, &["show", "main:second.txt"]), "two\n");
     assert_eq!(git_out(&origin, &["branch", "--list", "agent"]), "");
     assert!(!env.home.join("state/worktrees/alpha/add-greeting").exists());
-    assert_eq!(git_out(&alpha, &["branch", "--list", "pma/*"]), "");
-    assert_eq!(env.ok(&["review"]), "no runs to review\n");
+    assert_eq!(
+        git_out(&alpha, &["branch", "--list", "pma/add-greeting"]),
+        ""
+    );
     let (_, err, success) = env.run(&["push", "1"]);
     assert!(
-        !success && err.contains("run #1 is pushed; only an approved run is published"),
+        !success
+            && err.contains(
+                "run #1 is pushed; `pma push` takes an approved, staged or committed run"
+            ),
         "{err}"
     );
 
@@ -782,7 +802,7 @@ fn dispatch_review_rework_and_push() {
         out.ends_with("0 ready, 1 failed, $0.00 spent; see `pma review`\n"),
         "{out}"
     );
-    // Four runs: two pushed, `third task` rejected, and one refused at the
+    // Four runs: one pushed, one approved, `third task` rejected, and one refused at the
     // batch budget, which is not decided because no one judged it. One passed
     // on its first attempt and one after a rework, so four attempts in all,
     // and the refused run reported no cost.
@@ -799,7 +819,7 @@ fn dispatch_review_rework_and_push() {
         .collect();
     assert_eq!(
         &b[..8],
-        ["B", "4", "1", "2", "2", "0", "4", "$0.40+1?"],
+        ["B", "4", "1", "2", "1", "0", "4", "$0.40+1?"],
         "{report}"
     );
     assert!(report.contains("10m00s"), "review time: {report}");
@@ -997,7 +1017,7 @@ fn publishing_resumes_after_a_partial_failure() {
     );
     let out = env.ok(&["push", "1"]);
     assert!(
-        out.starts_with("#1 alpha: pushed ") && out.contains("; warning: worktree not removed: "),
+        out.contains("; warning: worktree not removed: ") && out.contains("; pushed "),
         "{out}"
     );
     assert_eq!(
@@ -1006,10 +1026,11 @@ fn publishing_resumes_after_a_partial_failure() {
         "published all the same"
     );
 
-    // As if pma had stopped between the push and recording it.
+    // As if pma had stopped between the push and recording it. Pushing the
+    // same commit again changes nothing, and the worktree goes this time.
     rusqlite::Connection::open(env.home.join("projects.db"))
         .unwrap()
-        .execute("UPDATE runs SET state = 'approved' WHERE id = 1", [])
+        .execute("UPDATE runs SET state = 'committed' WHERE id = 1", [])
         .unwrap();
     git(
         &alpha,
@@ -1017,7 +1038,7 @@ fn publishing_resumes_after_a_partial_failure() {
         None,
     );
     let out = env.ok(&["push", "1"]);
-    assert!(out.starts_with("#1 alpha: already pushed "), "{out}");
+    assert!(out.starts_with("#1 alpha: pushed "), "{out}");
     assert!(!worktree.exists());
     assert_eq!(
         git_out(&origin, &["log", "--format=%s", "main"]),
@@ -1048,48 +1069,48 @@ fn publishing_resumes_after_a_partial_failure() {
     assert_eq!(env.ok(&["push", "--all-approved"]), "no approved runs\n");
 }
 
-/// A publish that fails after it committed leaves its commits in the
-/// worktree, and verify may have written there too. A retry publishes the
-/// approved tree and the tick, and nothing written since.
+/// A stage refused after it ticked the item leaves the worktree as it was
+/// approved, so a retry stages the approved tree and the tick, and an edit
+/// since approval is still refused.
 #[test]
 fn a_retried_publish_publishes_only_what_was_approved() {
     let s = Scratch::new("retry-approved");
-    let (env, origin, _) = dispatch_env(&s, &[("claude", FAKE_CLAUDE), ("gh", FAKE_GH_PR)]);
-    // While `fail` exists, the check fails and leaves output, as a test run
-    // that rewrites a lock file or writes coverage does.
-    let fail = s.0.join("fail");
-    let verify = format!(
-        "if [ -e {0} ]; then echo out > output.txt; echo out >> Makefile; exit 1; fi; test -f hello.txt",
-        fail.display()
-    );
-    env.ok(&["config", "projects.alpha.verify", &verify]);
+    let (env, origin, alpha) = dispatch_env(&s, &[("claude", FAKE_CLAUDE), ("gh", FAKE_GH_PR)]);
 
     env.ok(&["dispatch", "alpha:5"]);
     env.ok(&["review", "1", "--approve"]);
-    fs::write(&fail, "").unwrap();
+    // Something the user staged would go into the run's commit.
+    fs::write(alpha.join("mine.txt"), "mine\n").unwrap();
+    git(&alpha, &["add", "mine.txt"], None);
+    let (out, _, success) = env.run(&["push", "1"]);
+    assert!(!success && out.contains("holds staged changes"), "{out}");
+    assert!(env.ok(&["review"]).contains("#1  approved"));
+    git(&alpha, &["rm", "-q", "--cached", "mine.txt"], None);
+
+    let worktree = env.home.join("state/worktrees/alpha/add-greeting");
+    fs::write(worktree.join("extra.txt"), "extra\n").unwrap();
     let (out, _, success) = env.run(&["push", "1"]);
     assert!(
-        !success && out.contains("failed on the integrated tree"),
+        !success && out.contains("the worktree changed after it was approved"),
         "{out}"
     );
-    let worktree = env.home.join("state/worktrees/alpha/add-greeting");
-    assert!(worktree.join("output.txt").exists(), "verify wrote output");
-    // An edit after the failed publish, by a lingering agent or anyone.
-    fs::write(worktree.join("hello.txt"), "edited\n").unwrap();
-    fs::write(worktree.join("extra.txt"), "extra\n").unwrap();
-    fs::remove_file(&fail).unwrap();
+    fs::remove_file(worktree.join("extra.txt")).unwrap();
 
-    assert!(env.ok(&["push", "1"]).contains("#1 alpha: pushed "));
+    assert!(env.ok(&["push", "1"]).contains("; pushed "));
     assert_eq!(git_out(&origin, &["show", "main:hello.txt"]), "hi\n");
     assert_eq!(
         git_out(&origin, &["ls-tree", "--name-only", "main"]),
         "Makefile\nTODO.md\nhello.txt\n"
     );
-    assert!(!git_out(&origin, &["show", "main:Makefile"]).contains("out"));
     assert!(git_out(&origin, &["show", "main:TODO.md"]).contains("- [x] add greeting"));
     assert_eq!(
         git_out(&origin, &["log", "--format=%s", "main"]),
         "add greeting\ninit\n"
+    );
+    // The user's untracked file is left alone.
+    assert_eq!(
+        fs::read_to_string(alpha.join("mine.txt")).unwrap(),
+        "mine\n"
     );
 
     // `pma pr` fails after its push; the retry rebuilds its commit with
@@ -1113,6 +1134,70 @@ fn a_retried_publish_publishes_only_what_was_approved() {
     );
 }
 
+/// Each command runs the steps before it that the run has not done. Staging
+/// is the review, so a ready run stages without approval, and commits only
+/// what was staged.
+#[test]
+fn stage_commit_and_push_follow_git() {
+    let s = Scratch::new("stage-commit-push");
+    let (env, origin, alpha) = dispatch_env(&s, &[("claude", FAKE_CLAUDE)]);
+    env.ok(&["dispatch", "alpha:5"]);
+
+    let (_, err, success) = env.run(&["commit", "1"]);
+    assert!(
+        !success && err.contains("run #1 is ready; `pma commit` takes an approved or staged run"),
+        "{err}"
+    );
+    let out = env.ok(&["stage", "1"]);
+    assert!(out.starts_with("#1 alpha: staged in "), "{out}");
+    assert!(!env.home.join("state/worktrees/alpha/add-greeting").exists());
+    assert_eq!(
+        git_out(&alpha, &["diff", "--cached", "--name-only"]),
+        "TODO.md\nhello.txt\n"
+    );
+    assert!(
+        fs::read_to_string(alpha.join("TODO.md"))
+            .unwrap()
+            .contains("- [x] add greeting")
+    );
+    // A staged run holds its task.
+    let (_, err, success) = env.run(&["dispatch", "alpha:5"]);
+    assert!(!success && err.contains("already has a run"), "{err}");
+
+    // An index that is no longer what was staged is the user's to commit.
+    fs::write(alpha.join("hello.txt"), "edited\n").unwrap();
+    git(&alpha, &["add", "hello.txt"], None);
+    let (out, _, success) = env.run(&["commit", "1"]);
+    assert!(
+        !success && out.contains("differs from what run #1 staged"),
+        "{out}"
+    );
+    fs::write(alpha.join("hello.txt"), "hi\n").unwrap();
+    git(&alpha, &["add", "hello.txt"], None);
+
+    let out = env.ok(&["commit", "1"]);
+    assert!(out.starts_with("#1 alpha: committed "), "{out}");
+    assert_eq!(
+        git_out(&alpha, &["log", "-1", "--format=%s"]),
+        "add greeting\n"
+    );
+    assert_eq!(git_out(&origin, &["log", "--format=%s", "main"]), "init\n");
+
+    // The user's own commit after it is not pushed.
+    fs::write(alpha.join("mine.txt"), "mine\n").unwrap();
+    git(&alpha, &["add", "mine.txt"], None);
+    git(&alpha, &["commit", "-qm", "mine"], None);
+    let (out, _, success) = env.run(&["push", "1"]);
+    assert!(!success && out.contains("is not run #1's commit"), "{out}");
+    git(&alpha, &["reset", "-q", "--hard", "HEAD^"], None);
+    let out = env.ok(&["push", "1"]);
+    assert!(out.starts_with("#1 alpha: pushed "), "{out}");
+    assert_eq!(
+        git_out(&origin, &["log", "--format=%s", "main"]),
+        "add greeting\ninit\n"
+    );
+}
+
 /// Commits a secret, then deletes it: the net diff is clean.
 const COMMITTING_CLAUDE: &str = r#"#!/bin/sh
 echo key > secret.txt
@@ -1131,7 +1216,7 @@ fn the_agents_own_commits_are_not_published() {
     let (env, origin, _) = dispatch_env(&s, &[("claude", COMMITTING_CLAUDE), ("gh", FAKE_GH_PR)]);
     env.ok(&["dispatch", "alpha:5"]);
     env.ok(&["review", "1", "--approve"]);
-    assert!(env.ok(&["push", "1"]).contains("#1 alpha: pushed "));
+    assert!(env.ok(&["push", "1"]).contains("; pushed "));
     assert_eq!(
         git_out(&origin, &["log", "--format=%s", "main"]),
         "add greeting\ninit\n"
@@ -1174,7 +1259,7 @@ fn an_approval_requires_the_tree_last_shown() {
     // Shown, it is approved and published.
     assert!(env.ok(&["review", "1"]).contains("late.txt"));
     env.ok(&["review", "1", "--approve"]);
-    assert!(env.ok(&["push", "1"]).contains("#1 alpha: pushed "));
+    assert!(env.ok(&["push", "1"]).contains("; pushed "));
     assert_eq!(git_out(&origin, &["show", "main:late.txt"]), "late\n");
 
     // Shown, then written to: refused again.
@@ -1205,7 +1290,7 @@ fn a_run_with_no_changes_is_not_published() {
     env.ok(&["review", "1", "--approve"]);
     let (out, _, success) = env.run(&["push", "1"]);
     assert!(
-        !success && out.contains("nothing to publish: no changes"),
+        !success && out.contains("nothing to stage: no changes"),
         "{out}"
     );
     assert_eq!(git_out(&origin, &["log", "--format=%s", "main"]), "init\n");
@@ -1369,10 +1454,7 @@ fn a_worker_without_json_output_or_an_allowlist_runs_the_same_path() {
     );
 
     env.ok(&["review", "1", "--approve"]);
-    assert!(
-        env.ok(&["push", "1"]).contains("#1 alpha: pushed "),
-        "pushed"
-    );
+    assert!(env.ok(&["push", "1"]).contains("; pushed "), "pushed");
     assert_eq!(git_out(&origin, &["show", "main:hello.txt"]), "hi\n");
     // No cost to sum, and `--by agent` names the worker that did the work.
     let report = env.ok(&["report", "--by", "agent"]);
@@ -1522,8 +1604,8 @@ fn a_campaign_applies_one_definition_across_repositories() {
     );
 }
 
-/// Approval names a tree. A publish sends that tree or nothing, and rechecks
-/// what the rebase produced rather than what was approved in isolation.
+/// Approval names a tree. A publish sends that tree or nothing, and only onto
+/// the base its check passed against.
 #[test]
 fn an_approval_is_evidence_about_a_tree_not_a_state() {
     let s = Scratch::new("evidence");
@@ -1545,10 +1627,7 @@ fn an_approval_is_evidence_about_a_tree_not_a_state() {
     // Reviewing it again approves the tree that is actually there.
     fs::remove_file(worktree.join("sneaked.txt")).unwrap();
     env.ok(&["review", "1", "--approve"]);
-    assert!(
-        env.ok(&["push", "1"]).contains("#1 alpha: pushed "),
-        "pushed"
-    );
+    assert!(env.ok(&["push", "1"]).contains("; pushed "), "pushed");
 
     // A rework withdraws an approval: the approver read another tree.
     env.ok(&["dispatch", "alpha:7"]);
@@ -1557,8 +1636,9 @@ fn an_approval_is_evidence_about_a_tree_not_a_state() {
     let detail = env.ok(&["review", "2"]);
     assert!(!detail.contains("approved by"), "{detail}");
 
-    // The integrated tree is checked, not the approved one in isolation:
-    // another commit lands upstream that the approved change breaks.
+    // Nothing checks the change against a moved origin, so git's refusal of
+    // a push that does not fast-forward stands: another commit lands
+    // upstream that the approved change breaks.
     env.ok(&["review", "2", "--approve"]);
     let other = s.0.join("other");
     git(
@@ -1572,7 +1652,7 @@ fn an_approval_is_evidence_about_a_tree_not_a_state() {
     let (out, err, success) = env.run(&["push", "2"]);
     assert!(!success, "{out}{err}");
     assert!(
-        out.contains("`make test` failed on the integrated tree"),
+        out.contains("origin's main moved since the run's base"),
         "{out}"
     );
     assert_eq!(
@@ -1580,7 +1660,12 @@ fn an_approval_is_evidence_about_a_tree_not_a_state() {
         "stricter test\nadd greeting\ninit\n",
         "nothing of the run reached the branch"
     );
-    let _ = alpha;
+    // The commit stays in the clone, for the user to rebase or drop.
+    assert!(env.ok(&["review", "2"]).starts_with("#2 committed"));
+    assert_eq!(
+        git_out(&alpha, &["log", "-1", "--format=%s"]),
+        "second task\n"
+    );
 }
 
 /// A batch approval is all or nothing, and only for runs nothing objects to.
@@ -2262,7 +2347,7 @@ fn notes_and_measured_dependencies() {
     assert!(
         ["39", "40", "41"]
             .iter()
-            .any(|d| status.contains(&format!("2 outdated, lock {d} days old, measured today"))),
+            .any(|d| status.contains(&format!("2 to move, lock {d}d old, measured today"))),
         "kept, and the lock is past deps.days: {status}"
     );
     assert!(
@@ -4920,8 +5005,8 @@ fn a_replaced_git_dir_is_refused_before_pma_runs_git_in_it() {
 
 /// The user's own hooks run at publishing. One added since dispatch does not:
 /// nothing in the diff shows it, and `pma push` commits and pushes with the
-/// user's credentials. Here the project's check adds it while publishing, so
-/// the run was clean at review.
+/// user's credentials. Here it is added after the run is staged, as an agent
+/// that outlived its run would, so the run was clean at review.
 #[test]
 fn a_hook_added_during_a_run_stops_its_push() {
     use std::os::unix::fs::PermissionsExt;
@@ -4935,23 +5020,18 @@ fn a_hook_added_during_a_run_stops_its_push() {
     )
     .unwrap();
     fs::set_permissions(&own, fs::Permissions::from_mode(0o755)).unwrap();
-    let (mark, hooked) = (s.0.join("mark"), s.0.join("hooked"));
-    let verify = format!(
-        "if [ -e {mark} ]; then h=\"$(git rev-parse --git-common-dir)/hooks/pre-push\"; \
-         printf '#!/bin/sh\\ntouch {hooked}\\n' > \"$h\"; chmod +x \"$h\"; fi; test -f hello.txt",
-        mark = mark.display(),
-        hooked = hooked.display()
-    );
-    env.ok(&["config", "projects.alpha.verify", &verify]);
-
+    let hooked = s.0.join("hooked");
     env.ok(&["dispatch", "alpha:5"]);
     env.ok(&["review", "1", "--approve"]);
-    assert!(env.ok(&["push", "1"]).contains("#1 alpha: pushed "));
+    assert!(env.ok(&["push", "1"]).contains("; pushed "));
     assert!(s.0.join("own.log").exists(), "the user's hook did not run");
 
     env.ok(&["dispatch", "alpha:7"]);
     env.ok(&["review", "2", "--approve"]);
-    fs::write(&mark, "").unwrap();
+    env.ok(&["stage", "2"]);
+    let hook = alpha.join(".git/hooks/pre-push");
+    fs::write(&hook, format!("#!/bin/sh\ntouch {}\n", hooked.display())).unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
     let (out, _, success) = env.run(&["push", "2"]);
     assert!(!success, "{out}");
     assert!(
@@ -4966,9 +5046,8 @@ fn a_hook_added_during_a_run_stops_its_push() {
     );
 
     // Restoring the hooks is enough.
-    fs::remove_file(&mark).unwrap();
-    fs::remove_file(alpha.join(".git/hooks/pre-push")).unwrap();
-    assert!(env.ok(&["push", "2"]).contains("#2 alpha: pushed "));
+    fs::remove_file(&hook).unwrap();
+    assert!(env.ok(&["push", "2"]).contains("; pushed "));
 }
 
 /// An agent that writes a clean filter and a filesystem monitor into the

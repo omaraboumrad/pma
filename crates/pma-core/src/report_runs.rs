@@ -68,7 +68,7 @@ impl Tally {
             self.first_pass += 1;
         }
         match run.state {
-            RunState::Approved | RunState::Pushed | RunState::Merged => {
+            RunState::Approved | RunState::Committed | RunState::Pushed | RunState::Merged => {
                 self.decided += 1;
                 self.accepted += 1;
             }

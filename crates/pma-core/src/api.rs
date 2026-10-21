@@ -894,10 +894,7 @@ pub fn command_line(a: &Action) -> Option<Vec<String>> {
             all_approved,
             target,
         } => {
-            push(match target {
-                publish::Target::Pr => "pr",
-                publish::Target::Push => "push",
-            });
+            push(target.name());
             v.extend(ids.iter().map(i64::to_string));
             flag(&mut v, *all_approved, "--all-approved");
         }

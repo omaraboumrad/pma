@@ -246,11 +246,31 @@ pub fn status_rows(cfg: &Config, rows: &[StatusRow]) -> Vec<StatusLine> {
         .collect()
 }
 
+/// The terminal's narrower cells for `local` and `todo`, so a row fits 80
+/// columns for a name of up to 15 characters. Unpushed commits and leftover
+/// branches already place a project in `unpublished`, and `--explain` counts
+/// them, so `local` keeps changed files alone, as `dirty`.
+fn terse(cells: &mut [String], r: &StatusRow) {
+    cells[7] = match r.project.dirty {
+        0 => "-".into(),
+        n => n.to_string(),
+    };
+    cells[8] = match (r.has_todo, r.lint_errors, r.scan_error) {
+        (_, _, Some(_)) => "error".into(),
+        (true, n, None) if n > 0 => format!("{n} lint"),
+        _ => std::mem::take(&mut cells[8]),
+    };
+}
+
 pub fn status(cfg: &Config, rows: &[StatusRow], explain: bool) -> String {
     let placed = placed(cfg, rows);
-    let mut cells = vec![STATUS_HEADINGS.map(String::from).to_vec()];
+    let mut headings = STATUS_HEADINGS.map(String::from).to_vec();
+    headings[7] = "dirty".into();
+    let mut cells = vec![headings];
     for (states, r) in &placed {
-        cells.push(status_cells(states, r));
+        let mut row = status_cells(states, r);
+        terse(&mut row, r);
+        cells.push(row);
     }
     let mut out = table(&cells, "");
 
@@ -777,16 +797,16 @@ mod tests {
         assert_eq!(
             lines[..4],
             [
-                "project  tier  state           open  idle  ci       deps  local               todo",
-                "red      2     failing CI      0     1d    failing  3     clean               ok",
-                "busy     1     unpublished +2  1     1d    unknown  3     2 changed, 1 ahead  ok",
-                "quiet    1     clear           0     1d    passing  -     clean               ok",
+                "project  tier  state           open  idle  ci       deps  dirty  todo",
+                "red      2     failing CI      0     1d    failing  3     -      ok",
+                "busy     1     unpublished +2  1     1d    unknown  3     2      ok",
+                "quiet    1     clear           0     1d    passing  -     -      ok",
             ]
         );
         assert!(
             out.contains(
                 "\nbusy  tier 1\n  unpublished  1 unpushed commit\n  critical     1 open item\n  \
-                 stale deps   3 outdated, lock 31 days old, measured today\n  CI not measured: offline\n"
+                 stale deps   3 to move, lock 31d old, measured today\n  CI not measured: offline\n"
             ),
             "{out}"
         );
@@ -798,5 +818,38 @@ mod tests {
             out.contains("\nquiet  tier 1\n  clear\n  deps not measured; `pma scan --deps`\n"),
             "{out}"
         );
+    }
+
+    /// A 15-character name with the widest cells a state, a lint count and
+    /// three-digit counts produce still fits a terminal of 80 columns.
+    #[test]
+    fn a_status_row_fits_80_columns() {
+        let cfg = Config::default();
+        let wide = Project {
+            name: "buildpy-bundler".into(),
+            tier: 1,
+            open: vec![Priority::Low; 120],
+            idle_days: Some(999),
+            ci: Ci::Failing(vec!["test".into()]),
+            dirty: 120,
+            leftover: 2,
+            ahead: Some(3),
+            deps: Some(rank::Deps {
+                moves: 153,
+                measured: 0,
+                lock: Some(336),
+                held_back: Some(18),
+            }),
+        };
+        let row = StatusRow {
+            project: &wide,
+            tiered: true,
+            has_todo: true,
+            lint_errors: 146,
+            scan_error: None,
+        };
+        let out = status(&cfg, &[row], true);
+        let long: Vec<&str> = out.lines().filter(|l| l.chars().count() > 80).collect();
+        assert!(long.is_empty(), "{long:?}");
     }
 }

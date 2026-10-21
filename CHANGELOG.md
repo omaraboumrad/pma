@@ -6,6 +6,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+**`pma stage` and `pma commit`.** Each runs the steps before it that the run has not done, in your clone:
+
+```sh
+pma stage 4     # the change, item ticked, into your clone's index; no approval needed
+pma commit 4    # then a commit there, with pma's message
+pma push 4      # then that commit, and nothing else, to origin's default branch
+```
+
+Runs gain the states `staged` and `committed`, which hold their task. The TUI and web bind `s` and `m` on runs. `docs/dev/stage-commit-push.md`.
+
 **Scan history: what changed, `pma history`, and `pma status --html`.** A scan reported only counts, such as "CI failing in 6", without naming the projects, and kept no record of earlier scans. It now prints what changed since the scan before and lists the projects with failing CI or broken. Each scan records every project's state and its changes: items opened and closed, CI failing or passing again, a project broken, mended, new, returned or absent. The last 100 scans are kept. The status view in the TUI, the web and the HTML page gains three panes: failing CI, one row per failing workflow with its latest failed run; the last scan's changes; and the recent scans. In the web and the HTML page, a project links to its GitHub repository, its CI to its Actions page, and a failing workflow to its run. The scan records each failing run's URL from `gh run list`. Schemas 36 and 37.
 
 ```sh
@@ -40,11 +50,17 @@ pma dispatch a:deps -a claude    # after a refused refresh: carries its check ou
 
 ### Changed
 
+**`pma push` works in your clone, and publishing runs no check.** `push` committed, rebased, re-ran the check and pushed from the run's worktree, so the clone never showed the commit before it was public, and the name covered only the last step. It now commits in the clone if `pma commit` has not, and pushes that commit. The clone must be at the run's base, and `stage` refuses a non-empty index. The publish check is gone from `push` and `pr`: with no rebase, it re-tested the tree the run's check passed plus the tick, and git refuses a push onto a moved origin. A second run on the same base is refused once the first lands; publish it with `pma pr`.
+
+**`pma status` fits 80 columns.** The `local` column is now `dirty`, holding the count of changed files or `-`, and the todo column reads `N lint` and `error`.
+
 **Stale deps means a lock that can move and has not changed for 30 days.** Any count above zero placed a project in the state, so 60 of 60 measured projects were in it on 2026-10-21, and a measurement 36 days old was shown as current. A project is now in it when a measurement within `deps.days` (default 30) finds the lock can move, and the lock has not changed for `deps.days`; 25 of the 60 were. uv is measured with `uv lock --upgrade --dry-run` instead of `uv tree --outdated`: the old count included releases the constraints exclude, which no lock refresh can reach. The count now includes transitive packages, as cargo's does, and cargo's additions and removals count too. Every scan reads lock age from `git log`, with no network. Schema 38. The decision record is `docs/dev/deps-refresh.md`.
 
 **Docs.** The README's route example states its `approval`, without which the parser refuses it. `docs/dev/design.md` names the agents that are seeded and the crates in use (`toml_edit`, `serde_json`).
 
 ### Fixed
+
+**A repository with no workflows reads as CI `none`, not unknown.** `gh` prints nothing for it, which was parsed as JSON and failed with "EOF while parsing".
 
 **A map node is held to the width the instance was given, not the parameter's maximum.** `review-fix` declares `breadth` with a maximum of 15. `--set breadth=2` was recorded, but the review was told "at most 15" and accepted 4 findings, so the fix plan was twice the size asked for. The prompt and the check now read the given value, capped at the maximum; pricing still uses the maximum, which bounds any value given.
 

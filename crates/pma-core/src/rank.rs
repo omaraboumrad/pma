@@ -367,14 +367,17 @@ pub fn states(cfg: &Config, p: &Project, facts: Facts<'_>) -> Vec<(State, String
         out.push((State::Critical, count(critical, "open item", "open items")));
     }
     if let Some(d) = p.deps.filter(|d| d.stale(cfg.deps_days)) {
+        let measured = match d.measured {
+            0 => "today".to_string(),
+            n => format!("{n}d ago"),
+        };
         let mut why = format!(
-            "{} outdated, lock {} old, measured {}",
+            "{} to move, lock {}d old, measured {measured}",
             d.moves,
-            count(d.lock.unwrap_or_default(), "day", "days"),
-            days_ago(d.measured)
+            d.lock.unwrap_or_default()
         );
         if let Some(n) = d.held_back.filter(|n| *n > 0) {
-            why.push_str(&format!("; {n} held back by constraints"));
+            why.push_str(&format!("; {n} held back"));
         }
         out.push((State::StaleDeps, why));
     }
@@ -672,8 +675,7 @@ mod tests {
                 (State::Critical, "2 open items".to_string()),
                 (
                     State::StaleDeps,
-                    "3 outdated, lock 40 days old, measured 1 day ago; 6 held back by constraints"
-                        .to_string()
+                    "3 to move, lock 40d old, measured 1d ago; 6 held back".to_string()
                 ),
                 (
                     State::Idle,

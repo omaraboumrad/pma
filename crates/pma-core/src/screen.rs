@@ -120,6 +120,8 @@ pub fn fits(act: Act, pick: &Pick) -> bool {
         | Act::RejectRun
         | Act::ReworkRun
         | Act::AddReviewTime
+        | Act::Stage
+        | Act::Commit
         | Act::Pr
         | Act::Push => matches!(pick, Pick::Run { .. }),
         Act::ApproveJob => matches!(pick, Pick::Job { awaiting: true, .. }),
@@ -1351,6 +1353,8 @@ pub fn question(act: Act, pick: &Pick) -> String {
     let verb = match act {
         Act::Dispatch => "dispatch",
         Act::RejectRun => "reject",
+        Act::Stage => "stage in its clone",
+        Act::Commit => "commit in its clone",
         Act::Pr => "open a pull request for",
         Act::Push => "push",
         Act::StopJob | Act::StopWorkflow => "stop",
@@ -1496,10 +1500,12 @@ pub fn action_in(
                 .parse()
                 .map_err(|_| "type the minutes as a whole number".to_string())?,
         },
-        (Act::Pr | Act::Push, Pick::Run { id, .. }) => Action::Publish {
+        (Act::Stage | Act::Commit | Act::Pr | Act::Push, Pick::Run { id, .. }) => Action::Publish {
             ids: vec![*id],
             all_approved: false,
             target: match act {
+                Act::Stage => publish::Target::Stage,
+                Act::Commit => publish::Target::Commit,
                 Act::Pr => publish::Target::Pr,
                 _ => publish::Target::Push,
             },
@@ -1509,6 +1515,8 @@ pub fn action_in(
             | Act::RejectRun
             | Act::ReworkRun
             | Act::AddReviewTime
+            | Act::Stage
+            | Act::Commit
             | Act::Pr
             | Act::Push,
             _,

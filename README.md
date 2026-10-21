@@ -15,8 +15,8 @@ pma scan                       # TODO.md, git state, CI
 pma                            # next: tasks for agents, and what waits on you
 pma dispatch myproject:31      # hand line 31 to an agent
 pma review 1                   # the diff, the test result, the cost
-pma review 1 --approve
-pma pr 1                       # commit and open a pull request; or `pma push 1`
+pma stage 1                    # into your clone's index; `git diff --cached`
+pma push 1                     # commit and push it; or `pma pr 1` after --approve
 ```
 
 ## Features
@@ -222,9 +222,11 @@ pma review 4                    # task, test result, cost, summary, diff
 pma review 4 --approve          # or --reject, or --rework "feedback"
 pma review 4 --reject --infra   # the check or machine failed, not the agent
 pma review 4 5 6 --approve      # a batch; every run is checked before any is approved
-pma pr 4                        # commit, open a pull request, remove the worktree
-pma push 4                      # commit and push to the default branch instead
-pma pr --all-approved           # every approved run; also on push
+pma stage 4                     # into your clone's index, item ticked; no approval needed
+pma commit 4                    # stage if not yet staged, then commit in your clone
+pma push 4                      # commit if not yet committed, then push the commit
+pma pr 4                        # or commit in the worktree and open a pull request
+pma push --all-approved         # every approved run; also on stage, commit and pr
 pma report --by project         # also class or agent
 ```
 
@@ -234,16 +236,18 @@ Each run gets a worktree of the remote default branch under `~/.local/state/pma/
 
 In a project with a `CHANGELOG.md`, the agent leaves that file alone and drafts one entry per separable change. `pma review <id>` shows the entries, or says none was drafted.
 
-A run opened with `pma pr` is `pr-open` until the pull request is merged or closed; `pma review` settles it and shows review activity meanwhile. A run published with `pma push` is `pushed`.
+`stage`, `commit` and `push` work in your clone, and each runs the steps before it that the run has not done. The clone must be at the run's base, the commit its check ran on; one that has moved is refused, and `pma pr` remains. `stage` refuses a clone with staged changes. `commit` and `push` need `--approve` for a run not yet staged. `push` pushes the run's commit only. Design: `docs/dev/stage-commit-push.md`.
+
+A run opened with `pma pr` is `pr-open` until the pull request is merged or closed; `pma review` settles it and shows review activity meanwhile.
 
 Stale dependencies:
 
 ```sh
 pma scan --deps                          # measure every lock; at least once per deps.days
-pma status --explain                     # stale deps  153 outdated, lock 51 days old, ...
+pma status --explain                     # stale deps  153 to move, lock 51d old, ...
 pma dispatch a:deps b:deps -a refresh    # move each lock in a worktree; no agent
 pma review 4                             # the lock diff and the check's verdict
-pma push 4                               # or `pma pr 4`
+pma stage 4                              # then `pma push 4`, or `pma pr 4`
 pma review 5 --reject                    # a refresh the check refused
 pma dispatch b:deps -a claude            # the agent gets the check's output
 ```
@@ -311,7 +315,7 @@ Each `## Critical` item gets an issue labelled `pma:critical`, and `gh:N` is wri
 
 - Settings live in `~/.config/pma/settings.toml`, beside the database: `config` keys, roots, workers, presets, and each project's tier and tags. Edit it by hand, or with `pma config <key> <value>`, `pma root`, `pma project`, `pma agent` and `pma preset`, which keep its comments. `pma config` lists the settings and `--reset` clears one. An invalid file stops every command and names the key. Workflow and route revisions stay in the database, because activating one checks its cost and records who did.
 
-One command that runs agents or edits worktrees runs at a time. `dispatch`, `pr`, `push`, `workflow run` and `review --reject` take a lock and name the process holding it. Reading commands run alongside.
+One command that runs agents or edits worktrees runs at a time. `dispatch`, `stage`, `commit`, `push`, `pr`, `workflow run` and `review --reject` take a lock and name the process holding it. Reading commands run alongside.
 
 ## Development
 

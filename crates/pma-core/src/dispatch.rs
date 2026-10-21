@@ -231,12 +231,21 @@ const GIT_CHANGED: &str = "the repository's hooks or git settings changed since 
 /// that runs a program or redirects a push, since dispatch. pma's git calls
 /// carry the user's credentials and environment, and none of that is in the
 /// diff the reviewer read. Also refuses a replaced `.git`, which is all a run
-/// from before the snapshot existed can be checked for.
+/// from before the snapshot existed can be checked for. A run whose
+/// worktree is gone, once staged, is checked in its clone.
 pub fn unchanged_git(run: &Run) -> Result<()> {
+    let gone = !run.worktree.exists();
     let Some(then) = &run.git_snapshot else {
-        return own_gitdir(run);
+        return match gone {
+            true => Ok(()),
+            false => own_gitdir(run),
+        };
     };
-    match changes(then, &git_snapshot(run)?) {
+    let now = match gone {
+        true => snapshot_in(&run.repo, &run.repo)?,
+        false => git_snapshot(run)?,
+    };
+    match changes(then, &now) {
         None => Ok(()),
         Some(changes) => Err(format!(
             "{GIT_CHANGED}{} was dispatched:\n{changes}\n\

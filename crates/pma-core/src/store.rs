@@ -2571,7 +2571,7 @@ impl Store {
         let mut accepted = 0;
         for run in self.runs()?.iter().filter(|r| r.project == project) {
             match run.state {
-                RunState::Approved | RunState::Pushed | RunState::Merged => {
+                RunState::Approved | RunState::Committed | RunState::Pushed | RunState::Merged => {
                     decided += 1;
                     accepted += 1;
                 }
@@ -2832,6 +2832,11 @@ pub enum RunState {
     PrOpen,
     /// Rejected in `pma review`: never published.
     Rejected,
+    /// `pma stage` wrote it into its clone's index. It holds its task until
+    /// it is committed and pushed, or rejected.
+    Staged,
+    /// `pma commit` committed it in its clone.
+    Committed,
     /// `pma push` pushed it to the default branch.
     Pushed,
     /// Its pull request was merged.
@@ -2847,7 +2852,7 @@ pub enum RunState {
 }
 
 impl RunState {
-    const ALL: [(&'static str, RunState); 12] = [
+    const ALL: [(&'static str, RunState); 14] = [
         ("queued", RunState::Queued),
         ("running", RunState::Running),
         ("ready", RunState::Ready),
@@ -2855,6 +2860,8 @@ impl RunState {
         ("approved", RunState::Approved),
         ("pr-open", RunState::PrOpen),
         ("rejected", RunState::Rejected),
+        ("staged", RunState::Staged),
+        ("committed", RunState::Committed),
         ("pushed", RunState::Pushed),
         ("merged", RunState::Merged),
         ("closed", RunState::Closed),
@@ -3086,7 +3093,7 @@ impl Run {
         let now = crate::dates::now();
         match state {
             RunState::Ready => self.ready_at = Some(now),
-            RunState::Approved | RunState::Rejected => {
+            RunState::Approved | RunState::Committed | RunState::Rejected => {
                 self.decided_at.get_or_insert(now);
             }
             RunState::Pushed | RunState::PrOpen => {

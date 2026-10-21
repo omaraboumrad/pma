@@ -68,7 +68,7 @@ The TUI and the web view have operating parity: anything one shows or does, the 
 | Kind | What |
 |-|-|
 | Read | `next`, `matrix`, `status`, `stale`, `report`; runs awaiting review and run detail (diff, summary, changelog draft, attempts, verify); live agents (`watch`); jobs and job logs; workflow revisions, instances and pending plans; campaigns; notes; lint results |
-| Act | `scan`; `dispatch`; `workflow run`, approve a plan, `workflow stop`; approve, reject or rework a run; `pr`; `push`; `job stop`, `job approve`; `campaign run`; `sync`; `prune`; `verify`; add, edit or remove a note |
+| Act | `scan`; `dispatch`; `workflow run`, approve a plan, `workflow stop`; approve, reject or rework a run; `stage`; `commit`; `pr`; `push`; `job stop`, `job approve`; `campaign run`; `sync`; `prune`; `verify`; add, edit or remove a note |
 
 **Configuring** (CLI and `settings.toml` only): `config`, `root`, `project tier/tag/export/import/forget/clone`, `agent`, `preset`, `route`, `workflow propose/activate`, `campaign add/rm`.
 

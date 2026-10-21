@@ -111,6 +111,8 @@ pub enum Act {
     /// Starts an instance from a typed `<workflow> <target> [flags]`.
     StartWorkflow,
     ReworkRun,
+    Stage,
+    Commit,
     Pr,
     Push,
     RunCampaign,
@@ -119,7 +121,7 @@ pub enum Act {
 }
 
 impl Act {
-    pub const ALL: [Act; 22] = [
+    pub const ALL: [Act; 24] = [
         Act::ApproveRun,
         Act::ApproveRuns,
         Act::RejectRun,
@@ -137,6 +139,8 @@ impl Act {
         Act::ResumeWorkflow,
         Act::StartWorkflow,
         Act::ReworkRun,
+        Act::Stage,
+        Act::Commit,
         Act::Pr,
         Act::Push,
         Act::RunCampaign,
@@ -194,7 +198,7 @@ impl Act {
             Action::Dispatch { .. } => &[Act::Dispatch],
             Action::WorkflowRun { .. } => &[Act::ResumeWorkflow, Act::StartWorkflow],
             Action::ReworkRun { .. } => &[Act::ReworkRun],
-            Action::Publish { .. } => &[Act::Pr, Act::Push],
+            Action::Publish { .. } => &[Act::Stage, Act::Commit, Act::Pr, Act::Push],
             Action::RunCampaign { .. } => &[Act::RunCampaign],
             Action::Sync { .. } => &[Act::Sync],
             Action::Verify { .. } => &[Act::Verify],
@@ -352,6 +356,8 @@ pub const BINDINGS: &[Binding] = &[
         Ask::Text("minutes"),
         "review time",
     ),
+    on("s", RUNS, Act::Stage, Ask::Confirm, "stage"),
+    on("m", RUNS, Act::Commit, Ask::Confirm, "commit"),
     on("p", RUNS, Act::Pr, Ask::Confirm, "pull request"),
     on("u", RUNS, Act::Push, Ask::Confirm, "push"),
     on("y", RUNS, Act::SettlePrs, Ask::Nothing, "check PRs"),

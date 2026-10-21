@@ -26,7 +26,9 @@ use todo::Priority;
 const GROUPS: [(&str, &[&str]); 6] = [
     (
         "The loop",
-        &["next", "scan", "matrix", "dispatch", "review", "pr", "push"],
+        &[
+            "next", "scan", "matrix", "dispatch", "review", "stage", "commit", "push", "pr",
+        ],
     ),
     ("Tasks", &["lint", "prune", "stale", "sync", "note", "deps"]),
     (
@@ -361,10 +363,36 @@ enum Command {
         #[arg(long, conflicts_with = "ids")]
         all_approved: bool,
     },
-    /// Push each approved run named to the default branch.
+    /// Write each run named into its clone's index, for review.
     ///
-    /// Commits the run, rebases it onto the remote default branch and pushes
-    /// it there, with no pull request. The run becomes `pushed`.
+    /// Takes a ready or approved run: staging is the review, so no approval
+    /// is needed. The clone must be at the run's base with nothing staged.
+    /// The item is marked done in `TODO.md`, the worktree is removed, and the
+    /// run becomes `staged`. `git diff --cached` shows the change.
+    Stage {
+        /// Run ids, as `pma review` lists them.
+        #[arg(required_unless_present = "all_approved")]
+        ids: Vec<i64>,
+        /// Every approved run instead of named ones.
+        #[arg(long, conflicts_with = "ids")]
+        all_approved: bool,
+    },
+    /// Commit each run named in its clone, staging it first.
+    ///
+    /// Takes a staged run, or an approved one. The run becomes `committed`.
+    Commit {
+        /// Run ids, as `pma review` lists them.
+        #[arg(required_unless_present = "all_approved")]
+        ids: Vec<i64>,
+        /// Every approved run instead of named ones.
+        #[arg(long, conflicts_with = "ids")]
+        all_approved: bool,
+    },
+    /// Push each run named to the default branch, committing first.
+    ///
+    /// Takes a committed, staged or approved run. Pushes the run's commit
+    /// only, never other local commits; git refuses it when origin has moved
+    /// past the run's base. The run becomes `pushed`.
     Push {
         /// Run ids, as `pma review` lists them.
         #[arg(required_unless_present = "all_approved")]
@@ -885,6 +913,12 @@ fn main() -> ExitCode {
         Command::Agent { action } => agent_command(action),
         Command::Report { by } => run_report(by.as_deref()),
         Command::Pr { ids, all_approved } => run_publish(&ids, all_approved, publish::Target::Pr),
+        Command::Stage { ids, all_approved } => {
+            run_publish(&ids, all_approved, publish::Target::Stage)
+        }
+        Command::Commit { ids, all_approved } => {
+            run_publish(&ids, all_approved, publish::Target::Commit)
+        }
         Command::Push { ids, all_approved } => {
             run_publish(&ids, all_approved, publish::Target::Push)
         }
@@ -3447,10 +3481,17 @@ fn run_publish(ids: &[i64], all: bool, target: publish::Target) -> Result<()> {
     }
     for id in ids {
         let run = store.run(*id)?;
-        if run.state != RunState::Approved {
+        if !target.takes(run.state) {
+            let wanted = match target {
+                publish::Target::Stage => "a ready or approved run",
+                publish::Target::Commit => "an approved or staged run",
+                publish::Target::Push => "an approved, staged or committed run",
+                publish::Target::Pr => "an approved run",
+            };
             return Err(format!(
-                "run #{id} is {}; only an approved run is published. `pma review {id}` shows it",
-                run.state.name()
+                "run #{id} is {}; `pma {}` takes {wanted}. `pma review {id}` shows it",
+                run.state.name(),
+                target.name()
             )
             .into());
         }
@@ -3475,7 +3516,9 @@ fn run_publish(ids: &[i64], all: bool, target: publish::Target) -> Result<()> {
         },
     )?;
     if failed > 0 {
-        return Err(format!("{failed} runs not published; they stay approved").into());
+        return Err(
+            format!("{failed} runs stopped; each stays in the last state it reached").into(),
+        );
     }
     Ok(())
 }
