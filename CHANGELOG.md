@@ -31,7 +31,16 @@ pma workflow run todo-audit myproject
 
 The library's worst case is $63 per unit of input at the default `agent_budget` (from `ensemble-review`), over the default `workflow_budget` of $25, so activating it needs a higher budget.
 
+**`pma deps refresh` and the `refresh` worker.** `pma deps refresh <dir>` moves each lock within its constraints: `cargo update`, `uv lock --upgrade`, or `go get -u ./...` with `go mod tidy`. The seeded `refresh` worker runs it in a dispatch's worktree, so the project's check decides what is kept, with no agent and no model. When the check refuses a refresh, the deps prompt carries its output, and the agent is asked to find the update that broke it. A refresh counts attempts under its own key; counted against the task, one refused refresh and its rejection left the agent none. It is not charged against `batch_budget`: a worker that reports no cost is charged its whole `agent_budget`, which held a default batch to 5 refreshes that cost nothing. No route is seeded, since a policy without a catch-all refuses every other dispatch. Schema 39 seeds the worker through `settings.toml`.
+
+```sh
+pma dispatch a:deps b:deps -a refresh
+pma dispatch a:deps -a claude    # after a refused refresh: carries its check output
+```
+
 ### Changed
+
+**Stale deps means a lock that can move and has not changed for 30 days.** Any count above zero placed a project in the state, so 60 of 60 measured projects were in it on 2026-10-21, and a measurement 36 days old was shown as current. A project is now in it when a measurement within `deps.days` (default 30) finds the lock can move, and the lock has not changed for `deps.days`; 25 of the 60 were. uv is measured with `uv lock --upgrade --dry-run` instead of `uv tree --outdated`: the old count included releases the constraints exclude, which no lock refresh can reach. The count now includes transitive packages, as cargo's does, and cargo's additions and removals count too. Every scan reads lock age from `git log`, with no network. Schema 38. The decision record is `docs/dev/deps-refresh.md`.
 
 **Docs.** The README's route example states its `approval`, without which the parser refuses it. `docs/dev/design.md` names the agents that are seeded and the crates in use (`toml_edit`, `serde_json`).
 

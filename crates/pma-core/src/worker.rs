@@ -180,6 +180,10 @@ fn truthy(value: &serde_json::Value) -> bool {
     }
 }
 
+/// The seeded worker that runs `pma deps refresh`. Its runs count their
+/// attempts apart from an agent's, and a refused one is handed to the next.
+pub const REFRESH: &str = "refresh";
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Worker {
     pub name: String,
@@ -483,6 +487,27 @@ impl Worker {
             enforces_budget: false,
             sandbox: false,
             resumes: true,
+            env: BTreeMap::new(),
+        }
+    }
+
+    /// Not an agent: `pma deps refresh` moves each lock within its
+    /// constraints, and the project's check decides whether that is kept.
+    /// No sandbox, since the tools need the network and their caches.
+    pub fn refresh() -> Worker {
+        Worker {
+            name: REFRESH.into(),
+            command: "pma".into(),
+            args: ["deps", "refresh", "{dir}"]
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+            allow: None,
+            parse: Parser::TextTail,
+            reports_cost: false,
+            enforces_budget: false,
+            sandbox: false,
+            resumes: false,
             env: BTreeMap::new(),
         }
     }

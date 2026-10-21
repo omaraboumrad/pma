@@ -20,6 +20,9 @@ pub struct Config {
     pub signals: SignalPriorities,
     /// Globs for paths whose commits do not count as activity.
     pub activity_ignore: Vec<String>,
+    /// Days a lock may go unchanged, and a `--deps` measurement stay current,
+    /// before a project is in stale deps.
+    pub deps_days: i64,
     /// Days without activity at which the activity signal reaches 1, per tier.
     pub activity_horizon: [i64; 5],
     /// The worker `pma dispatch` runs, by name in the `agents` table.
@@ -97,6 +100,7 @@ impl Default for Config {
             // added an empty one to many repos at once, is not maintenance.
             activity_ignore: vec![".github/**".into(), "*.lock".into(), "TODO.md".into()],
             activity_horizon: [30, 60, 120, 240, 365],
+            deps_days: 30,
             agent: "claude".into(),
             preset: None,
             default_tier: None,
@@ -218,6 +222,7 @@ impl Config {
         keys.extend(["ci", "deps", "activity", "hygiene"].map(|s| format!("signals.{s}")));
         keys.push("activity.ignore".into());
         keys.extend(per_tier("activity.horizon"));
+        keys.push("deps.days".into());
         keys.extend(
             [
                 "agent",
@@ -400,6 +405,7 @@ impl Config {
                 _ => return None,
             }),
             Some(("activity", "ignore")) => Slot::List(&mut self.activity_ignore),
+            Some(("deps", "days")) => Slot::Count(&mut self.deps_days, 0, i64::MAX),
             Some(("activity", rest)) => {
                 let t = rest.strip_prefix("horizon.")?;
                 Slot::Count(&mut self.activity_horizon[tier(t)?], 1, i64::MAX)
@@ -442,7 +448,7 @@ mod tests {
     #[test]
     fn every_key_reads_and_round_trips() {
         let keys = Config::keys();
-        assert_eq!(keys.len(), 32);
+        assert_eq!(keys.len(), 33);
         let defaults = Config::default();
         let mut copy = Config::default();
         for key in &keys {
@@ -464,12 +470,14 @@ mod tests {
         cfg.set("signals.ci", "critical").unwrap();
         cfg.set("activity.ignore", " docs/** , ,*.md").unwrap();
         cfg.set("activity.horizon.2", "14").unwrap();
+        cfg.set("deps.days", "14").unwrap();
         assert_eq!(cfg.tiers[2], 0.5);
         assert_eq!(cfg.priority(Priority::High), 0.7);
         assert_eq!(cfg.default_tier, Some(3));
         assert_eq!(cfg.signals.ci, Priority::Critical);
         assert_eq!(cfg.activity_ignore, ["docs/**", "*.md"]);
         assert_eq!(cfg.activity_horizon[1], 14);
+        assert_eq!(cfg.deps_days, 14);
 
         cfg.set("agent", "codex").unwrap();
         // `model` is retired: a model belongs to the worker record.

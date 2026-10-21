@@ -34,6 +34,8 @@ pub struct Facts {
     pub ci: Ci,
     /// Each failing workflow's latest failed run, as `(workflow, url)`.
     pub ci_runs: Vec<(String, String)>,
+    /// When the stalest lock last changed; see `lock_changed_at`.
+    pub lock_at: Option<i64>,
     /// `None` when this scan did not measure dependencies.
     pub deps: Option<DepsFacts>,
     pub error: Option<String>,
@@ -65,6 +67,7 @@ impl Facts {
             last_activity: None,
             ci: Ci::Unknown("offline".into()),
             ci_runs: Vec::new(),
+            lock_at: None,
             deps: None,
             error: None,
             held: false,
@@ -74,9 +77,11 @@ impl Facts {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DepsFacts {
-    /// Outdated dependencies; `None` when no ecosystem applies or every
-    /// tool failed.
+    /// Packages the locks would move; `None` when no ecosystem applies or
+    /// every tool failed.
     pub outdated: Option<i64>,
+    /// Crates cargo's constraints hold back from their latest release.
+    pub held_back: Option<i64>,
     /// One `ecosystem: name current -> latest`, or `ecosystem: error: ...`, per line.
     pub detail: String,
 }
@@ -232,13 +237,14 @@ pub fn scan_project(
         .run(&["remote", "get-url", "origin"])
         .and_then(|url| github_slug(url.trim()));
 
-    match call(git.command(&["status", "--porcelain"]), CALL_TIMEOUT) {
-        Ok(out) => facts.dirty = out.lines().count() as i64,
+    let status = match call(git.command(&["status", "--porcelain"]), CALL_TIMEOUT) {
+        Ok(out) => out,
         Err(e) => {
             facts.error = Some(git.noted(Some(format!("git status: {e}"))));
             return facts;
         }
-    }
+    };
+    facts.dirty = status.lines().count() as i64;
     facts.pma_branches = git
         .run(&[
             "for-each-ref",
@@ -251,6 +257,7 @@ pub fn scan_project(
         .run(&["rev-list", "--count", "@{u}..HEAD"])
         .and_then(|s| s.trim().parse().ok());
     facts.last_activity = last_activity(&git, ignore);
+    facts.lock_at = lock_changed_at(&git, path, &status);
     if !offline {
         (facts.ci, facts.ci_runs) = ci_state(path);
         if deps {
@@ -548,6 +555,36 @@ fn last_activity(git: &Git, ignore: &[String]) -> Option<i64> {
         "--name-only",
     ])?;
     newest_counted_commit(&log, ignore)
+}
+
+/// The oldest of each lock's newest commit on HEAD or its upstream, so a
+/// refresh published but not yet pulled counts. A lock with uncommitted
+/// changes is being refreshed and counts as changed now. `None` without a
+/// committed lock.
+fn lock_changed_at(git: &Git, dir: &Path, status: &str) -> Option<i64> {
+    crate::deps::ECOSYSTEMS
+        .iter()
+        .map(|(_, _, lock)| *lock)
+        .filter(|lock| dir.join(lock).is_file())
+        .filter_map(|lock| {
+            if modified(status, lock) {
+                return Some(crate::dates::now());
+            }
+            git.run(&["log", "-1", "--format=%ct", "HEAD", "@{u}", "--", lock])
+                .or_else(|| git.run(&["log", "-1", "--format=%ct", "HEAD", "--", lock]))?
+                .trim()
+                .parse()
+                .ok()
+        })
+        .min()
+}
+
+/// Whether `git status --porcelain` lists `path` as changed. Untracked is
+/// not changed: a lock never committed has no age to reset.
+fn modified(status: &str, path: &str) -> bool {
+    status
+        .lines()
+        .any(|l| !l.starts_with("??") && l.get(3..) == Some(path))
 }
 
 fn newest_counted_commit(log: &str, ignore: &[String]) -> Option<i64> {
@@ -870,6 +907,65 @@ mod tests {
         ] {
             assert_eq!(glob_match(pattern, path), want, "{pattern} vs {path}");
         }
+    }
+
+    #[test]
+    fn a_staged_or_edited_lock_is_modified_and_an_untracked_one_is_not() {
+        let status = " M Cargo.lock\nM  uv.lock\n?? go.sum\n M sub/Cargo.lock\n";
+        assert!(modified(status, "Cargo.lock"));
+        assert!(modified(status, "uv.lock"));
+        assert!(!modified(status, "go.sum"));
+        assert!(!modified("", "Cargo.lock"));
+    }
+
+    /// The oldest lock decides; an edited lock counts as now; a lock never
+    /// committed has no age.
+    #[test]
+    fn lock_age_is_the_stalest_committed_lock() {
+        let dir = std::env::temp_dir().join(format!("pma-lock-age-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sh = |args: &[&str], date: &str| {
+            let ok = Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_AUTHOR_DATE", date)
+                .env("GIT_COMMITTER_DATE", date)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        let at = |status: &str| lock_changed_at(&Git::new(&dir), &dir, status);
+        sh(&["init", "-q"], "@0");
+        std::fs::write(dir.join("uv.lock"), "").unwrap();
+        assert_eq!(at(""), None, "an uncommitted lock has no age");
+
+        sh(&["add", "uv.lock"], "@0");
+        sh(&["commit", "-qm", "uv"], "@1000 +0000");
+        std::fs::write(dir.join("Cargo.lock"), "").unwrap();
+        sh(&["add", "Cargo.lock"], "@0");
+        sh(&["commit", "-qm", "cargo"], "@2000 +0000");
+        assert_eq!(at(""), Some(1000));
+
+        let now = crate::dates::now();
+        assert!(
+            at(" M uv.lock\n").is_some_and(|t| t == 2000),
+            "the edited lock counts as now"
+        );
+        assert!(at(" M uv.lock\n M Cargo.lock\n").is_some_and(|t| t >= now));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

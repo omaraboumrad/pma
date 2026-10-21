@@ -43,7 +43,7 @@ Goal 5 is not built. The manager is deterministic today, in scoring formulas and
 | Agent quadrants | Q1 and Q2; Q3 optional once Q1 and Q2 are exhausted |
 | Signal tasks | In the matrix alongside written tasks |
 | Portfolio store | SQLite at `~/.config/pma/projects.db`; one user, one machine, one session |
-| Agents | `claude`, `opencode`, `omp` seeded; `codex`, `cursor-agent` by an `agent` record |
+| Agents | `claude`, `opencode`, `omp`, `sanduk` and `refresh` seeded; `codex`, `cursor-agent` by an `agent` record |
 | Agent output | Uncommitted changes, reviewed, then committed and pushed by `pma` |
 | Publish | Per run, by command: `pma push` to the default branch, or `pma pr` for a branch and a PR |
 | Attribution | Configurable, default the user only |
@@ -192,7 +192,7 @@ Project-level conditions become signal tasks in the matrix, so one view covers w
 | Signal | Source | Signal task | Urgent | Priority | Dispatchable |
 |-|-|-|-|-|-|
 | ci | `gh run list` on the default branch | fix CI | when failing | High | yes |
-| deps | per ecosystem: `cargo`, `go list -u -m all`, `uv` | update dependencies | no | Medium | yes |
+| deps | per ecosystem, dry runs: `cargo update`, `uv lock --upgrade`, `go list -u -m all`; lock age from `git log` | update dependencies | no | Medium | yes |
 | activity | `git log`, excluding commits whose paths all match `activity.ignore` | review project, once idle beyond the tier's horizon | no | Low | no |
 | hygiene | changed files (`git status`), unpushed commits, leftover `pma/` branches | resolve local changes | no | Medium | no |
 
@@ -208,17 +208,17 @@ Every `pma` worktree is made with a `pma/` branch, so counting branches finds wo
 
 A fix-CI dispatch includes, for each workflow failing at the last scan, the `gh run view --log-failed` output of that workflow's latest decisive run, the run scan judged. A workflow that passes by dispatch time refuses the task until the next scan. A startup failure has no job log; the prompt says so. `pma` fetches it, because the agent environment has no GitHub credentials. The local `verify` passing does not prove CI passes on other platforms. With `pma pr`, CI runs before merge.
 
-The deps signal counts outdated dependencies as each tool reports them. The tools write nothing to the project:
+The deps signal measures how far each lock can move within its declared constraints. Each measure is its fix run as a dry run, so a refresh clears it. The tools write nothing to the project:
 
 | Ecosystem | Applies with | Command | Counts |
 |-|-|-|-|
-| cargo | `Cargo.lock` | `cargo update --dry-run` | semver-compatible lock updates, transitive included |
-| uv | `uv.lock` | `uv tree --frozen --outdated --depth 1` | direct dependencies with a newer release |
+| cargo | `Cargo.lock` | `cargo update --dry-run` | lock updates, additions and removals, transitive included |
+| uv | `uv.lock` | `uv lock --upgrade --dry-run` | lock updates, additions and removals, transitive included |
 | go | `go.mod` | `go list -u -m all`, direct modules | modules with a newer version |
 
-The counts are not comparable across ecosystems: cargo's includes transitive crates. On 2026-09-15 across 52 repos, cargo projects reached 147 while uv projects stayed under 15. Any count above zero places a project in the stale-deps state, so the difference does not change its place.
+cargo also reports crates its constraints hold back, which `status --explain` shows and nothing ranks.
 
-Measuring takes 0.6s (uv) to 10s (go) per project, and 44s for the 52 repos. It runs only with `pma scan --deps`. Other scans keep the last measurement and its date, which `status --explain` shows. A project with none of the three files, or whose tools all fail, is unmeasured. A tool's failure is kept in the detail. A deps task is dispatched with that detail as the list to update.
+Measuring takes 0.6s (uv) to 10s (go) per project, and 44s for 80 repos on 2026-10-21. It runs only with `pma scan --deps`. Other scans keep the last measurement and its date. Every scan reads lock age: the oldest lock's newest commit on HEAD or its upstream, or now for a lock with uncommitted changes. A project with none of the three files, or whose tools all fail, is unmeasured. A tool's failure is kept in the detail. A deps task is dispatched with that detail as the list to update. The rule and the `refresh` worker are in [deps-refresh.md](deps-refresh.md).
 
 ### Project state
 
@@ -230,7 +230,7 @@ Measuring takes 0.6s (uv) to 10s (go) per project, and 44s for the 52 repos. It 
 | 2 | broken | `TODO.md` has lint errors, or the scan could not read the project |
 | 3 | unpublished | commits not pushed, or `pma/` branches no open run owns |
 | 4 | critical | open items under `## Critical` |
-| 5 | stale deps | outdated dependencies at the last `--deps` measurement |
+| 5 | stale deps | a measurement within `deps.days` finds the lock can move, and the lock has not changed for `deps.days` |
 | 6 | idle | no counted commit within the tier's horizon, or none at all |
 | 7 | clear | none of the above |
 
@@ -295,6 +295,9 @@ hygiene  = "medium"
 [activity]
 ignore  = [".github/**", "*.lock", "TODO.md"]
 horizon = { 1 = 30, 2 = 60, 3 = 120, 4 = 240, 5 = 365 }   # days
+
+[deps]
+days = 30   # a lock unchanged this long is stale; a measurement this old expires
 
 [projects.cyllama]
 tier    = 1

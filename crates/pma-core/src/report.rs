@@ -214,7 +214,7 @@ fn status_cells(states: &[(State, String)], r: &StatusRow) -> Vec<String> {
             Ci::NoRuns => "none".into(),
             Ci::Unknown(_) => "unknown".into(),
         },
-        p.deps.map_or("-".into(), |(n, _)| n.to_string()),
+        p.deps.map_or("-".into(), |d| d.moves.to_string()),
         if local.is_empty() {
             "clean".into()
         } else {
@@ -271,8 +271,13 @@ pub fn status(cfg: &Config, rows: &[StatusRow], explain: bool) -> String {
             if let Ci::Unknown(why) = &p.ci {
                 out.push_str(&format!("  CI not measured: {why}\n"));
             }
-            if p.deps.is_none() {
-                out.push_str("  deps not measured; `pma scan --deps`\n");
+            match p.deps {
+                None => out.push_str("  deps not measured; `pma scan --deps`\n"),
+                Some(d) if d.measured > cfg.deps_days => out.push_str(&format!(
+                    "  deps measured {}, over deps.days; `pma scan --deps`\n",
+                    rank::days_ago(d.measured)
+                )),
+                Some(_) => {}
             }
         }
     }
@@ -740,13 +745,24 @@ mod tests {
             ci: Ci::Unknown("offline".into()),
             dirty: 2,
             ahead: Some(1),
-            deps: Some((3, 0)),
+            deps: Some(rank::Deps {
+                moves: 3,
+                measured: 0,
+                lock: Some(31),
+                held_back: None,
+            }),
             ..quiet.clone()
         };
         let red = Project {
             name: "red".into(),
             tier: 2,
             ci: Ci::Failing(vec!["test".into()]),
+            deps: Some(rank::Deps {
+                moves: 3,
+                measured: 31,
+                lock: Some(90),
+                held_back: None,
+            }),
             ..quiet.clone()
         };
         let row = |project| StatusRow {
@@ -762,7 +778,7 @@ mod tests {
             lines[..4],
             [
                 "project  tier  state           open  idle  ci       deps  local               todo",
-                "red      2     failing CI      0     1d    failing  -     clean               ok",
+                "red      2     failing CI      0     1d    failing  3     clean               ok",
                 "busy     1     unpublished +2  1     1d    unknown  3     2 changed, 1 ahead  ok",
                 "quiet    1     clear           0     1d    passing  -     clean               ok",
             ]
@@ -770,9 +786,13 @@ mod tests {
         assert!(
             out.contains(
                 "\nbusy  tier 1\n  unpublished  1 unpushed commit\n  critical     1 open item\n  \
-                 stale deps   3 outdated, measured today\n  CI not measured: offline\n"
+                 stale deps   3 outdated, lock 31 days old, measured today\n  CI not measured: offline\n"
             ),
             "{out}"
+        );
+        assert!(
+            out.contains("\n  deps measured 31 days ago, over deps.days; `pma scan --deps`\n"),
+            "a measurement past the window places red in no deps state: {out}"
         );
         assert!(
             out.contains("\nquiet  tier 1\n  clear\n  deps not measured; `pma scan --deps`\n"),

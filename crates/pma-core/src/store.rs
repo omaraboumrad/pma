@@ -23,7 +23,7 @@ use crate::worker::{Parser, Worker};
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
-const VERSION: i64 = 37;
+const VERSION: i64 = 39;
 
 const SCHEMA: &str = "
 CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -317,6 +317,21 @@ CREATE TABLE IF NOT EXISTS ci_runs (
     workflow TEXT NOT NULL,
     url TEXT NOT NULL,
     PRIMARY KEY (project, workflow)
+);
+";
+
+/// Version 39. Seeds `refresh`, the worker that runs `pma deps refresh`.
+/// Seeded through `settings.toml`, which every later edit applies whole.
+const REFRESH_WORKER: &str = "-- no schema change; the seed is in Rust";
+
+/// Version 38. When the stalest lock last changed, read on every scan, and
+/// the crates cargo's constraints hold back, read with `--deps`. A table for
+/// the reason `ci_runs` is one.
+const PROJECT_DEPS: &str = "
+CREATE TABLE IF NOT EXISTS project_deps (
+    project TEXT PRIMARY KEY REFERENCES projects(name) ON DELETE CASCADE,
+    lock_at INTEGER,
+    held_back INTEGER
 );
 ";
 
@@ -688,6 +703,10 @@ pub struct ProjectRow {
     /// One `ecosystem: name current -> latest` per line.
     pub deps_detail: String,
     pub deps_at: Option<i64>,
+    /// Crates cargo's constraints held back at the last measurement.
+    pub held_back: Option<i64>,
+    /// When the stalest lock last changed, at the last scan.
+    pub lock_at: Option<i64>,
 }
 
 /// What a project's record consists of, for `pma project forget`.
@@ -876,6 +895,8 @@ impl Store {
                     SETTINGS_SYNC,
                     SCAN_HISTORY,
                     CI_RUNS,
+                    PROJECT_DEPS,
+                    REFRESH_WORKER,
                 ];
                 let tx = conn.unchecked_transaction()?;
                 for step in &steps[version as usize..] {
@@ -923,6 +944,14 @@ impl Store {
             settings: path.with_file_name(crate::settings::FILE),
         };
         store.load_settings()?;
+        // After the file is read, so the seed is written to it and survives
+        // the next edit. A worker already of that name is left alone.
+        let named = |w: &Worker| w.name == crate::worker::REFRESH;
+        if version < 39 && !store.agents()?.iter().any(named) {
+            store.change_settings(|doc| {
+                crate::settings::set_agent(doc, &crate::worker::Worker::refresh())
+            })?;
+        }
         Ok(store)
     }
 
@@ -1091,8 +1120,9 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT name, path, tier, scanned_at, has_todo, lint_errors, dirty, ahead,
                     last_activity, ci, ci_detail, scan_error, deps, deps_detail, deps_at,
-                    leftover, slug, absent_since
-             FROM projects ORDER BY name",
+                    leftover, slug, absent_since, d.held_back, d.lock_at
+             FROM projects LEFT JOIN project_deps d ON d.project = projects.name
+             ORDER BY name",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok(ProjectRow {
@@ -1113,6 +1143,8 @@ impl Store {
                 leftover: r.get(15)?,
                 slug: r.get(16)?,
                 absent_since: r.get(17)?,
+                held_back: r.get(18)?,
+                lock_at: r.get(19)?,
                 ci_runs: Vec::new(),
             })
         })?;
@@ -1246,10 +1278,19 @@ impl Store {
                 )?;
             }
 
+            tx.execute(
+                "INSERT INTO project_deps (project, lock_at) VALUES (?1, ?2)
+                 ON CONFLICT (project) DO UPDATE SET lock_at = excluded.lock_at",
+                params![f.name, f.lock_at],
+            )?;
             if let Some(d) = &f.deps {
                 tx.execute(
                     "UPDATE projects SET deps = ?2, deps_detail = ?3, deps_at = ?4 WHERE name = ?1",
                     params![f.name, d.outdated, d.detail, now],
+                )?;
+                tx.execute(
+                    "UPDATE project_deps SET held_back = ?2 WHERE project = ?1",
+                    params![f.name, d.held_back],
                 )?;
             }
 
@@ -3252,6 +3293,7 @@ mod tests {
                 "test".into(),
                 "https://github.com/shakfu/x/actions/runs/7".into(),
             )],
+            lock_at: None,
             deps: None,
             error: None,
             todo_unread: false,
@@ -3477,14 +3519,16 @@ mod tests {
     fn upgrading_seeds_the_worker_that_was_compiled_in() {
         let dir = scratch("agents");
         let store = Store::open(&dir.join("p.db")).unwrap();
-        // Four templates, alphabetically: the one that was compiled in, the
-        // two installed separately, and the same agent in a container.
+        // Five templates, alphabetically: the one that was compiled in, the
+        // two installed separately, the lock refresh, and the same agent in a
+        // container.
         assert_eq!(
             store.agents().unwrap(),
             [
                 Worker::claude(),
                 Worker::omp(),
                 Worker::opencode(),
+                Worker::refresh(),
                 Worker::sanduk()
             ]
         );
@@ -3510,6 +3554,7 @@ mod tests {
                 w.clone(),
                 Worker::omp(),
                 Worker::opencode(),
+                Worker::refresh(),
                 Worker::sanduk()
             ]
         );
@@ -3524,6 +3569,7 @@ mod tests {
                 Worker::claude(),
                 Worker::omp(),
                 Worker::opencode(),
+                Worker::refresh(),
                 Worker::sanduk()
             ]
         );
@@ -3539,6 +3585,15 @@ mod tests {
         drop(store);
         let store = Store::open(&dir.join("p.db")).unwrap();
         assert_eq!(store.agent("opencode").unwrap(), edited);
+
+        // Seeded through the file, so an edit of it keeps the worker, and
+        // removing it is not undone by reopening.
+        let text = std::fs::read_to_string(dir.join(crate::settings::FILE)).unwrap();
+        assert!(text.contains("[agents.refresh]"), "{text}");
+        assert!(store.remove_agent("refresh").unwrap());
+        drop(store);
+        let store = Store::open(&dir.join("p.db")).unwrap();
+        assert!(store.agent("refresh").is_err());
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -4281,22 +4336,21 @@ mod tests {
         let mut measured = facts("one", vec![item("y", 7), item("z", 8)]);
         measured.deps = Some(DepsFacts {
             outdated: Some(2),
+            held_back: Some(5),
             detail: "uv: ruff 0.14 -> 0.16".into(),
         });
+        measured.lock_at = Some(2500);
         store.save_scan(&[measured], true, 3000).unwrap();
-        store
-            .save_scan(
-                &[facts("one", vec![item("y", 7), item("z", 8)])],
-                true,
-                4000,
-            )
-            .unwrap();
+        let mut plain = facts("one", vec![item("y", 7), item("z", 8)]);
+        plain.lock_at = Some(3500);
+        store.save_scan(&[plain], true, 4000).unwrap();
         let p = store.project("one").unwrap().unwrap();
         assert_eq!(
-            (p.deps, p.deps_detail.as_str(), p.deps_at),
-            (Some(2), "uv: ruff 0.14 -> 0.16", Some(3000)),
+            (p.deps, p.deps_detail.as_str(), p.deps_at, p.held_back),
+            (Some(2), "uv: ruff 0.14 -> 0.16", Some(3000), Some(5)),
             "a scan that does not measure deps keeps the last measurement"
         );
+        assert_eq!(p.lock_at, Some(3500), "every scan reads the lock's age");
         assert_eq!(
             (p.scanned_at, p.has_todo, p.lint_errors, p.dirty),
             (Some(4000), true, 1, 3)

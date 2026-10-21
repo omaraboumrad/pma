@@ -3,8 +3,9 @@
 //! Design: `docs/dev/design.md`.
 
 use pma_core::{
-    api, class, config, dates, dispatch, history, jobs, next, pass, progress, projects, publish,
-    rank, report, report_runs, route, scan, script, store, sync, todo, watch, worker, workflow,
+    api, class, config, dates, deps, dispatch, history, jobs, next, pass, progress, projects,
+    publish, rank, report, report_runs, route, scan, script, store, sync, todo, watch, worker,
+    workflow,
 };
 use pma_tui::{choose, tui};
 
@@ -27,7 +28,7 @@ const GROUPS: [(&str, &[&str]); 6] = [
         "The loop",
         &["next", "scan", "matrix", "dispatch", "review", "pr", "push"],
     ),
-    ("Tasks", &["lint", "prune", "stale", "sync", "note"]),
+    ("Tasks", &["lint", "prune", "stale", "sync", "note", "deps"]),
     (
         "Reading",
         &["status", "history", "report", "tui", "web", "watch"],
@@ -372,6 +373,11 @@ enum Command {
         #[arg(long, conflicts_with = "ids")]
         all_approved: bool,
     },
+    /// Dependency locks.
+    Deps {
+        #[command(subcommand)]
+        action: DepsAction,
+    },
     /// Portfolio notes, which belong to no one project.
     Note {
         #[command(subcommand)]
@@ -534,6 +540,19 @@ enum TagAction {
     },
     /// List the projects carrying a tag.
     Show { tag: String },
+}
+
+#[derive(Subcommand)]
+enum DepsAction {
+    /// Move each lock in a directory within its declared constraints.
+    ///
+    /// Runs `cargo update`, `uv lock --upgrade`, or `go get -u ./...` with
+    /// `go mod tidy`, for each lock present. The `refresh` worker runs this in
+    /// a dispatch's worktree, where the project's check decides what is kept.
+    Refresh {
+        /// The project directory.
+        dir: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -875,6 +894,9 @@ fn main() -> ExitCode {
             tags,
             apply,
         } => run_sync(&projects, &tags, apply),
+        Command::Deps {
+            action: DepsAction::Refresh { dir },
+        } => deps::refresh(&dir).map_err(Into::into),
         Command::Note { action } => note(action),
 
         Command::Tui => run_tui(),

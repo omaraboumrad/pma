@@ -151,6 +151,9 @@ pub fn revision(text: &str) -> String {
 pub fn attempt_key(run: &Run) -> String {
     match run.task_key.starts_with("workflow:") {
         true => run.task_key.clone(),
+        // A refused refresh says an update broke the check, which is the
+        // agent's task, not that an agent cannot do it.
+        false if run.agent == crate::worker::REFRESH => format!("{} #refresh", revision(&run.text)),
         false => revision(&run.text),
     }
 }
@@ -160,6 +163,30 @@ pub fn attempt_key(run: &Run) -> String {
 /// says nothing about the task's suitability.
 fn consumes(run: &Run) -> bool {
     run.state == RunState::Ready && run.verify_ok == Some(false)
+}
+
+/// The tail of the check's output from the project's last `refresh` run,
+/// when that check failed. `None` when the last refresh passed, or there was
+/// none.
+fn failed_refresh(store: &Store, home: &Path, project: &str) -> Result<Option<String>> {
+    let last = store
+        .runs()?
+        .into_iter()
+        .filter(|r| {
+            r.project == project && r.task_key == "deps" && r.agent == crate::worker::REFRESH
+        })
+        .max_by_key(|r| r.id);
+    let Some(run) = last.filter(|r| r.verify_ok == Some(false)) else {
+        return Ok(None);
+    };
+    let logs = home.join("runs").join(run.id.to_string());
+    let newest = (1..)
+        .map(|n| logs.join(format!("verify-{n}.log")))
+        .take_while(|p| p.is_file())
+        .last();
+    Ok(newest
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|text| crate::agent::tail(&text, CI_LOG_LINES)))
 }
 
 /// Lines of failed CI log carried in a fix-CI prompt.
@@ -531,15 +558,21 @@ pub fn prepare(
                 .project(&pick.project)?
                 .map(|p| p.deps_detail)
                 .unwrap_or_default();
-            (
-                format!(
-                    "Outdated dependencies at the last `pma scan --deps`:\n\n```\n{detail}\n```\n\n\
-                     Update them within the project's version constraints first. Change a \
-                     constraint only where the tests still pass, and list any dependency you \
-                     left behind, with the reason.\n"
-                ),
-                Vec::new(),
-            )
+            let mut prompt = format!(
+                "Outdated dependencies at the last `pma scan --deps`:\n\n```\n{detail}\n```\n\n\
+                 Update them within the project's version constraints first. Change a \
+                 constraint only where the tests still pass, and list any dependency you \
+                 left behind, with the reason.\n"
+            );
+            if let Some(log) = failed_refresh(store, home, &pick.project)? {
+                prompt.push_str(&format!(
+                    "\n`pma deps refresh` took every update the constraints allow, and the \
+                     project's check then failed. Find the update that broke it. Fix the code, \
+                     or hold that package back with a constraint and say why. The check's \
+                     output:\n\n```\n{log}\n```\n"
+                ));
+            }
+            (prompt, Vec::new())
         }
         key if without_item(key) && !is_signal(key) => {
             (pick.details.clone().unwrap_or_default(), Vec::new())
@@ -1048,12 +1081,13 @@ pub fn execute(
     struct Queue {
         waiting: VecDeque<Run>,
         spent: f64,
-        running: usize,
+        /// What the runs under way may still spend.
+        reserved: f64,
     }
     let queue = Mutex::new(Queue {
         waiting: runs.into(),
         spent: 0.0,
-        running: 0,
+        reserved: 0.0,
     });
     let threads = (cfg.max_parallel as usize).max(1);
     // An attempt rides with the run it belongs to: only this thread has the
@@ -1080,9 +1114,8 @@ pub fn execute(
                         // so the second is not refused after the first spent
                         // the batch's room.
                         let tries = 1 + i64::from(escalation(policy, &run).is_some());
-                        let committed = q.spent
-                            + q.running as f64 * cfg.agent_budget
-                            + tries as f64 * cfg.agent_budget;
+                        let committed =
+                            q.spent + q.reserved + tries as f64 * attempt_price(cfg, &run);
                         if committed > cfg.batch_budget + 1e-9 {
                             run.state = RunState::Failed;
                             run.error =
@@ -1092,7 +1125,7 @@ pub fn execute(
                             let _ = tx.send((run, Vec::new()));
                             continue;
                         }
-                        q.running += 1;
+                        q.reserved += attempt_price(cfg, &run);
                         run
                     };
                     run.state = RunState::Running;
@@ -1108,11 +1141,10 @@ pub fn execute(
                     }
                     {
                         let mut q = queue.lock().unwrap();
-                        q.running -= 1;
-                        // A worker that reports no cost is charged its whole
-                        // budget per attempt, so it cannot run the batch past
-                        // its limit unseen.
-                        q.spent += run.cost_usd.unwrap_or(made.len() as f64 * cfg.agent_budget);
+                        q.reserved -= attempt_price(cfg, &run);
+                        q.spent += run
+                            .cost_usd
+                            .unwrap_or(made.len() as f64 * attempt_price(cfg, &run));
                     }
                     let _ = tx.send((run, made));
                 }
@@ -1152,6 +1184,16 @@ pub fn execute(
     match save_error {
         Some(e) => Err(e.into()),
         None => Ok(finished),
+    }
+}
+
+/// What one attempt of `run` is charged against the batch when its worker
+/// reports no cost: its whole budget, so it cannot run the batch past its
+/// limit unseen. `refresh` runs no model and costs nothing.
+fn attempt_price(cfg: &Config, run: &Run) -> f64 {
+    match run.agent == crate::worker::REFRESH {
+        true => 0.0,
+        false => cfg.agent_budget,
     }
 }
 
@@ -1951,6 +1993,11 @@ mod tests {
             ..Run::default()
         };
         assert_eq!(attempt_key(&task), "fix the parser");
+        let refresh = Run {
+            agent: crate::worker::REFRESH.into(),
+            ..task.clone()
+        };
+        assert_eq!(attempt_key(&refresh), "fix the parser #refresh");
     }
 
     /// An item named like a signal, a campaign or a workflow unit is still an

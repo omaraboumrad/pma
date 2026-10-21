@@ -176,7 +176,7 @@ pma project forget gone         # an absent project's record
 pma project clone --tag work    # check out absent projects again; --apply to do it
 pma scan                        # TODO.md, git state, CI via gh
 pma scan --offline myproject    # one project, without GitHub
-pma scan --deps                 # also count outdated cargo, uv and go deps
+pma scan --deps                 # also measure how far each cargo, uv and go lock can move
 pma next                        # for agents and for you; --all for every row
 pma matrix                      # the ranked 2x2; -q q1 for one quadrant
 pma status --explain            # projects worst first, with what placed each
@@ -235,6 +235,33 @@ Each run gets a worktree of the remote default branch under `~/.local/state/pma/
 In a project with a `CHANGELOG.md`, the agent leaves that file alone and drafts one entry per separable change. `pma review <id>` shows the entries, or says none was drafted.
 
 A run opened with `pma pr` is `pr-open` until the pull request is merged or closed; `pma review` settles it and shows review activity meanwhile. A run published with `pma push` is `pushed`.
+
+Stale dependencies:
+
+```sh
+pma scan --deps                          # measure every lock; at least once per deps.days
+pma status --explain                     # stale deps  153 outdated, lock 51 days old, ...
+pma dispatch a:deps b:deps -a refresh    # move each lock in a worktree; no agent
+pma review 4                             # the lock diff and the check's verdict
+pma push 4                               # or `pma pr 4`
+pma review 5 --reject                    # a refresh the check refused
+pma dispatch b:deps -a claude            # the agent gets the check's output
+```
+
+A project's deps are stale when a `--deps` measurement no older than `deps.days` (30) found that a lock can move within its declared constraints, and that lock has not changed for `deps.days`. An older measurement places the project in no deps state, so run `pma scan --deps` at least that often.
+
+The `refresh` worker runs `pma deps refresh`: `cargo update`, `uv lock --upgrade`, or `go get -u ./...` with `go mod tidy`. Under `>=` constraints, `uv lock --upgrade` takes new major versions; the project's check decides whether the result is kept. Reject a refused refresh before another worker takes the task. The next agent's prompt then carries the check's output. A refresh uses none of the agent's two attempts and none of `batch_budget`. The worker runs the `pma` on your `PATH`, so install the build that has `pma deps refresh`.
+
+For `pma dispatch --auto` to send deps to `refresh` and everything else to your default, propose and activate a policy:
+
+```json
+{"route": [
+  {"name": "locks", "match": {"class": "A"}, "agent": "refresh", "approval": "each"},
+  {"name": "rest", "approval": "each"}
+]}
+```
+
+Class `A` is mechanical work, which is the deps task alone. An applied policy refuses any workflow node that no route names, so add a `node` route for each workflow you run. `pma workflow run` warns of each node it would refuse, and `pma route replay <file>` shows what the policy changes over the runs already recorded. Design and rationale: [docs/dev/deps-refresh.md](docs/dev/deps-refresh.md).
 
 Repeating work:
 

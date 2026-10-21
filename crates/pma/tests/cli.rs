@@ -2174,7 +2174,7 @@ fn notes_and_measured_dependencies() {
     fs::create_dir_all(&bin).unwrap();
     fs::write(
         bin.join("uv"),
-        "#!/bin/sh\nprintf 'alpha v1\\n|-- ruff v0.14.10 (group: dev) (latest: v0.16.7)\\n`-- ty v0.0.8 (latest: v0.0.81)\\n'\n",
+        "#!/bin/sh\nprintf 'Resolved 3 packages in 1ms\\nUpdate ruff v0.14.10 -> v0.16.7\\nUpdate ty v0.0.8 -> v0.0.81\\n'\n",
     )
     .unwrap();
     fs::set_permissions(bin.join("uv"), fs::Permissions::from_mode(0o755)).unwrap();
@@ -2246,13 +2246,36 @@ fn notes_and_measured_dependencies() {
     ok(&["scan", "--offline"]);
     let status = ok(&["status", "--explain"]);
     assert!(
-        status.contains("2 outdated, measured today"),
-        "kept: {status}"
+        !status.contains("stale deps"),
+        "a lock never committed has no age: {status}"
+    );
+
+    git(&alpha, &["add", "uv.lock"], None);
+    git(
+        &alpha,
+        &["commit", "-qm", "lock"],
+        Some(now() - 40 * 86_400),
+    );
+    ok(&["scan", "--offline"]);
+    let status = ok(&["status", "--explain"]);
+    // 40 days of seconds is 39 to 41 calendar days across a DST change.
+    assert!(
+        ["39", "40", "41"]
+            .iter()
+            .any(|d| status.contains(&format!("2 outdated, lock {d} days old, measured today"))),
+        "kept, and the lock is past deps.days: {status}"
     );
     assert!(
         ok(&["matrix", "--all"])
             .contains("alpha  T1  medium  open 0d  update dependencies: 2 outdated"),
         "the deps signal task"
+    );
+
+    fs::write(alpha.join("uv.lock"), "refreshing").unwrap();
+    ok(&["scan", "--offline"]);
+    assert!(
+        !ok(&["status", "--explain"]).contains("stale deps"),
+        "an edited lock is being refreshed"
     );
 }
 
@@ -5861,5 +5884,65 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"done","tot
     assert!(
         !env.home.join("state/workflow-trees/1").exists(),
         "the scratch trees are gone"
+    );
+}
+
+/// Moves `uv.lock` the way `uv lock --upgrade` would, and measures it dry.
+const FAKE_UV: &str = "#!/bin/sh
+case \"$*\" in
+  'lock --upgrade --dry-run') echo 'Update ruff v1 -> v2' ;;
+  'lock --upgrade') echo 'ruff 2' > uv.lock ;;
+esac
+";
+
+/// The `refresh` worker moves the lock in a worktree and the project's check
+/// judges it. A refresh the check refused hands its output to the agent that
+/// takes the task next.
+#[test]
+fn a_refresh_the_check_refuses_reaches_the_next_agent() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let s = Scratch::new("refresh");
+    let prompt_log = s.0.join("prompt.txt");
+    let catcher = format!(
+        "#!/bin/sh\nprintf '%s' \"$1\" > '{}'\n",
+        prompt_log.display()
+    );
+    let (env, _, alpha) = dispatch_env(&s, &[("uv", FAKE_UV), ("catcher", &catcher)]);
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_pma"), env.bin.join("pma")).unwrap();
+    fs::set_permissions(env.bin.join("catcher"), fs::Permissions::from_mode(0o755)).unwrap();
+
+    fs::write(alpha.join("uv.lock"), "ruff 1\n").unwrap();
+    git(&alpha, &["add", "uv.lock"], None);
+    git(&alpha, &["commit", "-qm", "lock"], None);
+    git(&alpha, &["push", "-q", "origin", "main"], None);
+    env.ok(&["scan", "--deps"]);
+    env.ok(&[
+        "config",
+        "projects.alpha.verify",
+        "grep -q 'ruff 1' uv.lock || { echo ruff-2-broke-the-tests; false; }",
+    ]);
+
+    let agents = env.ok(&["agent"]);
+    assert!(agents.contains("refresh"), "seeded: {agents}");
+    // Below one agent's budget: a refresh runs no model, so it still starts.
+    env.ok(&["config", "batch_budget", "0.5"]);
+    let out = env.ok(&["dispatch", "alpha:deps", "-a", "refresh"]);
+    assert!(!out.contains("not started"), "{out}");
+    env.ok(&["config", "batch_budget", "--reset"]);
+    let review = env.ok(&["review", "1"]);
+    assert!(review.contains("+ruff 2"), "the lock moved: {review}");
+    assert!(review.contains("base passed, head FAILED"), "{review}");
+    env.ok(&["review", "1", "--reject"]);
+
+    env.ok(&["agent", "set", "catcher", "command", "catcher"]);
+    env.ok(&["agent", "set", "catcher", "args", r#"["{prompt}"]"#]);
+    env.ok(&["dispatch", "alpha:deps", "-a", "catcher"]);
+    let prompt = fs::read_to_string(&prompt_log).unwrap();
+    assert!(prompt.contains("uv: ruff v1 -> v2"), "{prompt}");
+    assert!(
+        prompt.contains("`pma deps refresh` took every update")
+            && prompt.contains("ruff-2-broke-the-tests"),
+        "{prompt}"
     );
 }

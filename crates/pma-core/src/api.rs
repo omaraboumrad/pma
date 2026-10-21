@@ -389,9 +389,15 @@ pub fn portfolio(store: &Store, of: &Selection, all: bool) -> Result<Portfolio> 
             dirty: row.dirty,
             leftover: row.leftover,
             ahead: row.ahead,
-            deps: row
-                .deps
-                .map(|n| (n, row.deps_at.map_or(0, |t| (today - dates::day(t)).max(0)))),
+            deps: row.deps.map(|moves| {
+                let days = |t: i64| (today - dates::day(t)).max(0);
+                rank::Deps {
+                    moves,
+                    measured: row.deps_at.map_or(0, days),
+                    lock: row.lock_at.map(days),
+                    held_back: row.held_back,
+                }
+            }),
         };
         tasks.extend(own.iter().map(|t| rank::Task {
             project: row.name.clone(),

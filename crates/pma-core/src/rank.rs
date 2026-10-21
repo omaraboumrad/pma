@@ -65,9 +65,31 @@ pub struct Project {
     /// `pma/` branches that no open run owns.
     pub leftover: i64,
     pub ahead: Option<i64>,
-    /// Outdated dependencies and days since measured; `None` if never measured
-    /// or not applicable.
-    pub deps: Option<(i64, i64)>,
+    /// The last `--deps` measurement; `None` if never measured or not
+    /// applicable.
+    pub deps: Option<Deps>,
+}
+
+/// A dependency measurement and the age of the lock it measured. See
+/// `docs/dev/deps-refresh.md`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Deps {
+    /// Packages the locks would move within their constraints.
+    pub moves: i64,
+    /// Days since measured.
+    pub measured: i64,
+    /// Days since the stalest lock changed; `None` without a committed lock.
+    pub lock: Option<i64>,
+    /// Crates cargo's constraints hold back from their latest release.
+    pub held_back: Option<i64>,
+}
+
+impl Deps {
+    /// A measurement no older than `days` found movement, and the lock has
+    /// not changed for longer than `days`.
+    pub fn stale(&self, days: i64) -> bool {
+        self.measured <= days && self.moves > 0 && self.lock.is_some_and(|l| l > days)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -189,7 +211,7 @@ pub fn signal_tasks(cfg: &Config, p: &Project) -> Vec<Task> {
             )
         });
     }
-    if let Some((n, _)) = p.deps.filter(|(n, _)| *n > 0) {
+    if let Some(n) = p.deps.filter(|d| d.stale(cfg.deps_days)).map(|d| d.moves) {
         tasks.push(Task {
             key: Some("deps".into()),
             eligible: true,
@@ -235,6 +257,13 @@ fn count(n: i64, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 
+pub fn days_ago(days: i64) -> String {
+    match days {
+        0 => "today".to_string(),
+        d => format!("{} ago", count(d, "day", "days")),
+    }
+}
+
 pub fn local_changes(p: &Project) -> String {
     let mut parts = Vec::new();
     if p.dirty > 0 {
@@ -267,7 +296,8 @@ pub enum State {
     Unpublished,
     /// Open items under `## Critical`.
     Critical,
-    /// Outdated dependencies at the last measurement.
+    /// A current measurement found the lock can move, and the lock is older
+    /// than `deps.days`.
     StaleDeps,
     /// No commit that counts as activity within the tier's horizon.
     Idle,
@@ -336,13 +366,17 @@ pub fn states(cfg: &Config, p: &Project, facts: Facts<'_>) -> Vec<(State, String
     if critical > 0 {
         out.push((State::Critical, count(critical, "open item", "open items")));
     }
-    if let Some((n, age)) = p.deps.filter(|(n, _)| *n > 0) {
-        let when = match age {
-            0 => "today".to_string(),
-            1 => "1 day ago".to_string(),
-            d => format!("{d} days ago"),
-        };
-        out.push((State::StaleDeps, format!("{n} outdated, measured {when}")));
+    if let Some(d) = p.deps.filter(|d| d.stale(cfg.deps_days)) {
+        let mut why = format!(
+            "{} outdated, lock {} old, measured {}",
+            d.moves,
+            count(d.lock.unwrap_or_default(), "day", "days"),
+            days_ago(d.measured)
+        );
+        if let Some(n) = d.held_back.filter(|n| *n > 0) {
+            why.push_str(&format!("; {n} held back by constraints"));
+        }
+        out.push((State::StaleDeps, why));
     }
     let horizon = cfg.activity_horizon[usize::from(p.tier) - 1];
     match p.idle_days {
@@ -518,7 +552,12 @@ mod tests {
             ahead: Some(2),
             leftover: 1,
             idle_days: Some(31),
-            deps: Some((3, 2)),
+            deps: Some(Deps {
+                moves: 3,
+                measured: 2,
+                lock: Some(31),
+                held_back: None,
+            }),
             ..project(1)
         };
         let tasks = signal_tasks(&cfg, &p);
@@ -575,6 +614,29 @@ mod tests {
         );
     }
 
+    /// Each of the three conditions alone keeps a project out of stale deps.
+    #[test]
+    fn deps_are_stale_when_a_current_measurement_finds_an_old_lock_that_can_move() {
+        let d = Deps {
+            moves: 3,
+            measured: 30,
+            lock: Some(31),
+            held_back: None,
+        };
+        assert!(d.stale(30));
+        assert!(!Deps { measured: 31, ..d }.stale(30), "measurement too old");
+        assert!(!Deps { moves: 0, ..d }.stale(30), "nothing to move");
+        assert!(
+            !Deps {
+                lock: Some(30),
+                ..d
+            }
+            .stale(30),
+            "lock changed within the window"
+        );
+        assert!(!Deps { lock: None, ..d }.stale(30), "no committed lock");
+    }
+
     #[test]
     fn a_project_is_in_each_state_it_meets_worst_first() {
         let cfg = Config::default();
@@ -585,7 +647,12 @@ mod tests {
             dirty: 4,
             ahead: Some(1),
             leftover: 2,
-            deps: Some((3, 1)),
+            deps: Some(Deps {
+                moves: 3,
+                measured: 1,
+                lock: Some(40),
+                held_back: Some(6),
+            }),
             ..project(1)
         };
         let facts = Facts {
@@ -605,7 +672,8 @@ mod tests {
                 (State::Critical, "2 open items".to_string()),
                 (
                     State::StaleDeps,
-                    "3 outdated, measured 1 day ago".to_string()
+                    "3 outdated, lock 40 days old, measured 1 day ago; 6 held back by constraints"
+                        .to_string()
                 ),
                 (
                     State::Idle,

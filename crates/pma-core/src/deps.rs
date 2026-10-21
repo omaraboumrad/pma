@@ -1,9 +1,9 @@
-//! Outdated dependencies, per ecosystem, as each tool reports them.
+//! How far each lock can move within the project's declared constraints, as
+//! each tool reports it. Each measure is its fix run dry; see
+//! `docs/dev/deps-refresh.md`.
 //!
-//! - cargo: `cargo update --dry-run`, semver-compatible updates in `Cargo.lock`,
-//!   transitive ones included.
-//! - uv: `uv tree --frozen --outdated --depth 1`, direct dependencies with any
-//!   newer release.
+//! - cargo: `cargo update --dry-run`, transitive crates included.
+//! - uv: `uv lock --upgrade --dry-run`, transitive packages included.
 //! - go: `go list -u -m all`, direct modules with any newer version.
 //!
 //! None of the three writes to the project. Each needs the network.
@@ -19,6 +19,15 @@ use crate::scan::DepsFacts;
 /// How long one tool may run.
 const TIMEOUT: Duration = Duration::from_secs(180);
 
+/// Each ecosystem, the root file that says it applies, and its lock.
+pub const ECOSYSTEMS: [(&str, &str, &str); 3] = [
+    ("cargo", "Cargo.lock", "Cargo.lock"),
+    ("uv", "uv.lock", "uv.lock"),
+    ("go", "go.mod", "go.sum"),
+];
+
+/// One package the lock would move. `current` is `none` for a package the
+/// lock would add, and `latest` is `none` for one it would remove.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Outdated {
     pub name: String,
@@ -30,13 +39,22 @@ pub struct Outdated {
 /// when no ecosystem applies or every tool failed.
 pub fn measure(dir: &Path) -> DepsFacts {
     let mut found: Option<i64> = None;
+    let mut held_back: Option<i64> = None;
     let mut detail = Vec::new();
-    for (ecosystem, marker) in [("cargo", "Cargo.lock"), ("uv", "uv.lock"), ("go", "go.mod")] {
+    for (ecosystem, marker, _) in ECOSYSTEMS {
         if !dir.join(marker).is_file() {
             continue;
         }
         match run(ecosystem, dir) {
-            Ok(list) => {
+            Ok(output) => {
+                let list = match ecosystem {
+                    "cargo" => {
+                        held_back = parse_cargo_held_back(&output);
+                        parse_cargo(&output)
+                    }
+                    "uv" => parse_uv(&output),
+                    _ => parse_go(&output),
+                };
                 found = Some(found.unwrap_or(0) + list.len() as i64);
                 detail.extend(
                     list.iter()
@@ -48,11 +66,52 @@ pub fn measure(dir: &Path) -> DepsFacts {
     }
     DepsFacts {
         outdated: found,
+        held_back,
         detail: detail.join("\n"),
     }
 }
 
-fn run(ecosystem: &str, dir: &Path) -> Result<Vec<Outdated>, String> {
+/// The commands that move an ecosystem's lock within its constraints: each
+/// measure in `run` without its dry run.
+fn fixes(ecosystem: &str) -> &'static [&'static [&'static str]] {
+    match ecosystem {
+        "cargo" => &[&["cargo", "update"]],
+        "uv" => &[&["uv", "lock", "--upgrade"]],
+        _ => &[&["go", "get", "-u", "./..."], &["go", "mod", "tidy"]],
+    }
+}
+
+/// Moves every lock the project's root files call for, printing each command
+/// before its own output. Stops at the first that fails.
+pub fn refresh(dir: &Path) -> Result<(), String> {
+    let present: Vec<&str> = ECOSYSTEMS
+        .iter()
+        .filter(|(_, marker, _)| dir.join(marker).is_file())
+        .map(|(ecosystem, _, _)| *ecosystem)
+        .collect();
+    if present.is_empty() {
+        return Err(format!(
+            "{}: no Cargo.lock, uv.lock or go.mod",
+            dir.display()
+        ));
+    }
+    for argv in present.into_iter().flat_map(fixes) {
+        let line = argv.join(" ");
+        println!("$ {line}");
+        let status = Command::new(argv[0])
+            .args(&argv[1..])
+            .current_dir(dir)
+            .status()
+            .map_err(|e| format!("{line}: {e}"))?;
+        if !status.success() {
+            return Err(format!("`{line}` failed: {status}"));
+        }
+    }
+    Ok(())
+}
+
+/// The tool's output, or why it failed.
+fn run(ecosystem: &str, dir: &Path) -> Result<String, String> {
     let mut cmd = match ecosystem {
         "cargo" => {
             let mut c = Command::new("cargo");
@@ -61,7 +120,7 @@ fn run(ecosystem: &str, dir: &Path) -> Result<Vec<Outdated>, String> {
         }
         "uv" => {
             let mut c = Command::new("uv");
-            c.args(["tree", "--frozen", "--outdated", "--depth", "1"]);
+            c.args(["lock", "--upgrade", "--dry-run"]);
             c
         }
         _ => {
@@ -93,44 +152,67 @@ fn run(ecosystem: &str, dir: &Path) -> Result<Vec<Outdated>, String> {
     match finished?.success {
         None => Err(format!("timed out after {}s", TIMEOUT.as_secs())),
         Some(false) => Err(agent::tail(&output, 1)),
-        Some(true) => Ok(match ecosystem {
-            "cargo" => parse_cargo(&output),
-            "uv" => parse_uv(&output),
-            _ => parse_go(&output),
-        }),
+        Some(true) => Ok(output),
     }
 }
 
-/// `Updating clap v4.6.6 -> v4.6.7` lines.
+/// `Updating clap v4.6.6 -> v4.6.7`, `Downgrading`, `Adding` and `Removing`
+/// lines.
 fn parse_cargo(output: &str) -> Vec<Outdated> {
     output
         .lines()
         .filter_map(|l| {
             let w: Vec<&str> = l.split_whitespace().collect();
-            match w[..] {
-                ["Updating", name, current, "->", latest] => Some(Outdated {
-                    name: name.into(),
-                    current: current.into(),
-                    latest: latest.into(),
-                }),
-                _ => None,
-            }
+            let (name, current, latest) = match w[..] {
+                ["Updating" | "Downgrading", name, current, "->", latest] => {
+                    (name, current, latest)
+                }
+                ["Adding", name, latest, ..] => (name, "none", latest),
+                ["Removing", name, current, ..] => (name, current, "none"),
+                _ => return None,
+            };
+            Some(Outdated {
+                name: name.into(),
+                current: current.into(),
+                latest: latest.into(),
+            })
         })
         .collect()
 }
 
-/// `├── ruff v0.14.10 (group: dev) (latest: v0.16.7)` lines.
+/// Crates the constraints hold back, from cargo's closing note:
+/// `pass `--verbose` to see 6 unchanged dependencies behind latest`.
+fn parse_cargo_held_back(output: &str) -> Option<i64> {
+    output
+        .lines()
+        .filter(|l| l.contains("behind latest"))
+        .find_map(|l| {
+            l.split_once("to see ")?
+                .1
+                .split_whitespace()
+                .next()?
+                .parse()
+                .ok()
+        })
+}
+
+/// `Update ruff v0.14.10 -> v0.16.7`, `Add x v1.0`, `Remove y v2.0` lines. A
+/// package locked at several versions lists them comma-separated.
 fn parse_uv(output: &str) -> Vec<Outdated> {
     output
         .lines()
         .filter_map(|l| {
-            let latest = l.split("(latest: ").nth(1)?.strip_suffix(')')?;
-            let mut w = l
-                .trim_start_matches(|c: char| !c.is_ascii_alphanumeric())
-                .split_whitespace();
+            let (verb, rest) = l.split_once(' ')?;
+            let (name, versions) = rest.split_once(' ')?;
+            let (current, latest) = match verb {
+                "Update" => versions.split_once(" -> ")?,
+                "Add" => ("none", versions),
+                "Remove" => (versions, "none"),
+                _ => return None,
+            };
             Some(Outdated {
-                name: w.next()?.into(),
-                current: w.next()?.into(),
+                name: name.into(),
+                current: current.into(),
                 latest: latest.into(),
             })
         })
@@ -166,19 +248,40 @@ mod tests {
 
     #[test]
     fn cargo_dry_run_output() {
-        let out = "    Updating crates.io index\n     Locking 2 packages to latest Rust 1.88 compatible versions\n    Updating clap v4.6.6 -> v4.6.7\n    Updating clap_lex v1.1.0 -> v1.1.1\nwarning: not updating lockfile due to dry run\n";
+        let out = "    Updating crates.io index\n     Locking 4 packages to latest Rust 1.88 compatible versions\n    Updating clap v4.6.6 -> v4.6.7\n    Updating clap_lex v1.1.0 -> v1.1.1\n Downgrading cc v1.2.1 -> v1.2.0\n      Adding static_vcruntime v3.0.0\n    Removing windows-sys v0.59.0\nnote: pass `--verbose` to see 6 unchanged dependencies behind latest\nwarning: not updating lockfile due to dry run\n";
         assert_eq!(
             names(parse_cargo(out)),
-            ["clap v4.6.6 v4.6.7", "clap_lex v1.1.0 v1.1.1"]
+            [
+                "clap v4.6.6 v4.6.7",
+                "clap_lex v1.1.0 v1.1.1",
+                "cc v1.2.1 v1.2.0",
+                "static_vcruntime none v3.0.0",
+                "windows-sys v0.59.0 none"
+            ]
         );
+        assert_eq!(parse_cargo_held_back(out), Some(6));
     }
 
     #[test]
-    fn uv_tree_output() {
-        let out = "aldakit v0.4.0\n├── mkdocs v1.6.1 (group: dev)\n├── ruff v0.14.10 (group: dev) (latest: v0.16.7)\n└── ty v0.0.8 (latest: v0.0.81)\n";
+    fn cargo_without_the_note_holds_nothing_back() {
+        let out =
+            "    Updating clap v4.6.6 -> v4.6.7\nwarning: not updating lockfile due to dry run\n";
+        assert_eq!(parse_cargo_held_back(out), None);
+        let one = "note: pass `--verbose` to see 1 unchanged dependency behind latest\n";
+        assert_eq!(parse_cargo_held_back(one), Some(1));
+    }
+
+    #[test]
+    fn uv_lock_dry_run_output() {
+        let out = "warning: No `requires-python` value found in the workspace. Defaulting to `>=3.13`.\nResolved 11 packages in 731ms\nUpdate ruff v0.14.10 -> v0.16.7\nAdd py2tosc v0.6.0\nRemove setuptools v80.4.0\nUpdate tomli v1.2.3, v2.4.0 -> v1.2.3, v2.5.0\n";
         assert_eq!(
             names(parse_uv(out)),
-            ["ruff v0.14.10 v0.16.7", "ty v0.0.8 v0.0.81"]
+            [
+                "ruff v0.14.10 v0.16.7",
+                "py2tosc none v0.6.0",
+                "setuptools v80.4.0 none",
+                "tomli v1.2.3, v2.4.0 v1.2.3, v2.5.0"
+            ]
         );
     }
 
@@ -195,6 +298,13 @@ mod tests {
     }
 
     #[test]
+    fn each_fix_is_its_measure_without_the_dry_run() {
+        assert_eq!(fixes("cargo"), [["cargo", "update"]]);
+        assert_eq!(fixes("uv"), [["uv", "lock", "--upgrade"]]);
+        assert_eq!(fixes("go").len(), 2);
+    }
+
+    #[test]
     fn projects_without_a_known_lock_file_are_unmeasured() {
         let dir = std::env::temp_dir().join(format!("pma-deps-none-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -202,8 +312,14 @@ mod tests {
             measure(&dir),
             DepsFacts {
                 outdated: None,
+                held_back: None,
                 detail: String::new()
             }
+        );
+        assert!(
+            refresh(&dir)
+                .unwrap_err()
+                .ends_with("no Cargo.lock, uv.lock or go.mod")
         );
         let _ = std::fs::remove_dir_all(dir);
     }
