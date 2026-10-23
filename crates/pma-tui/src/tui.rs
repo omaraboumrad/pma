@@ -57,6 +57,10 @@ enum Mode {
         label: &'static str,
         input: String,
         pick: Pick,
+        /// For a prompt of several fields: the ones answered, and the labels
+        /// still to ask.
+        answers: Vec<String>,
+        rest: Vec<&'static str>,
     },
 }
 
@@ -293,14 +297,32 @@ impl App {
                         input.pop();
                     }
                     "Enter" => {
+                        if let Mode::Prompt {
+                            label,
+                            input,
+                            answers,
+                            rest,
+                            ..
+                        } = &mut self.mode
+                            && !rest.is_empty()
+                        {
+                            answers.push(std::mem::take(input));
+                            *label = rest.remove(0);
+                            return None;
+                        }
                         let Mode::Prompt {
-                            act, input, pick, ..
+                            act,
+                            input,
+                            pick,
+                            mut answers,
+                            ..
                         } = std::mem::replace(&mut self.mode, Mode::Normal)
                         else {
                             unreachable!("in a prompt");
                         };
+                        answers.push(input);
                         let (_, pane) = self.pick();
-                        return self.ask_done(act, &pick, &pane, &input);
+                        return self.ask_done(act, &pick, &pane, &answers.join("\n"));
                     }
                     k if k.chars().count() == 1 => input.push_str(k),
                     _ => {}
@@ -343,6 +365,7 @@ impl App {
                 return match self.pick().0 {
                     Pick::Run { id, .. } => Some(Request::Load(Query::Run { id })),
                     Pick::Job { id, .. } => Some(Request::Load(Query::JobLog { id })),
+                    Pick::Worker { name } => Some(Request::Load(Query::Worker { name })),
                     _ => None,
                 };
             }
@@ -380,6 +403,18 @@ impl App {
                             label,
                             input: screen::initial_input(act, &pick),
                             pick,
+                            answers: Vec::new(),
+                            rest: Vec::new(),
+                        };
+                    }
+                    Ask::Fields(labels) => {
+                        self.mode = Mode::Prompt {
+                            act,
+                            label: labels.first().copied().unwrap_or_default(),
+                            input: screen::initial_input(act, &pick),
+                            pick,
+                            answers: Vec::new(),
+                            rest: labels.iter().skip(1).copied().collect(),
                         };
                     }
                     Ask::Confirm => match screen::action_in(act, &pick, &pane, "", &self.project) {
@@ -455,7 +490,20 @@ impl App {
                 }
             }
             Mode::Confirm { question, .. } => self.render_confirm(frame, &question),
-            Mode::Prompt { label, input, .. } => self.render_prompt(frame, label, &input),
+            Mode::Prompt {
+                label,
+                input,
+                answers,
+                rest,
+                ..
+            } => {
+                let title = match answers.len() + rest.len() {
+                    0 => label.to_string(),
+                    n => format!("{label} ({} of {})", answers.len() + 1, n + 1),
+                };
+                let last = rest.is_empty();
+                self.render_prompt(frame, &title, &input, last)
+            }
             Mode::Normal => {}
         }
     }
@@ -512,6 +560,9 @@ impl App {
     fn footer(&self) -> Line<'static> {
         let p = self.palette;
         match &self.mode {
+            Mode::Prompt { rest, .. } if !rest.is_empty() => {
+                return hints(p, &[("Enter", "next field"), ("Esc", "cancel")]);
+            }
             Mode::Prompt { .. } => {
                 return hints(p, &[("Enter", "submit"), ("Esc", "cancel")]);
             }
@@ -534,7 +585,10 @@ impl App {
             .iter()
             .filter(|b| match b.command {
                 Command::Act(a) => a.on_row() && screen::fits(a, &pick),
-                Command::Open => matches!(pick, Pick::Run { .. } | Pick::Job { .. }),
+                Command::Open => matches!(
+                    pick,
+                    Pick::Run { .. } | Pick::Job { .. } | Pick::Worker { .. }
+                ),
                 Command::OpenProject => pick.project().is_some(),
                 _ => false,
             })
@@ -553,9 +607,9 @@ impl App {
         let [lists, preview] =
             Layout::vertical([Constraint::Min(4), Constraint::Length(3)]).areas(area);
         let t = index(self.tab);
-        let areas: Vec<Rect> = match panes.len() {
+        let areas: Vec<Rect> = match self.tab {
             // The matrix: urgent on the left, important on top.
-            4 => {
+            Tab::Matrix if panes.len() == 4 => {
                 let [upper, lower] =
                     Layout::vertical([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
                         .areas(lists);
@@ -884,7 +938,7 @@ impl App {
         );
     }
 
-    fn render_prompt(&self, frame: &mut Frame, label: &str, input: &str) {
+    fn render_prompt(&self, frame: &mut Frame, label: &str, input: &str, last: bool) {
         let p = self.palette;
         let area = centered(frame.area(), 70.min(frame.area().width), 5);
         frame.render_widget(Clear, area);
@@ -895,7 +949,13 @@ impl App {
                     Span::styled(" ", Style::new().add_modifier(Modifier::REVERSED)),
                 ]),
                 Line::raw(""),
-                Line::styled("Enter submits, Esc cancels", p.muted()),
+                Line::styled(
+                    match last {
+                        true => "Enter submits, Esc cancels",
+                        false => "Enter goes to the next field, Esc cancels",
+                    },
+                    p.muted(),
+                ),
             ])
             .wrap(Wrap { trim: false })
             .block(dialog(p, &format!(" {label} "), p.accent()).padding(Padding::horizontal(1))),
@@ -993,8 +1053,10 @@ fn heights(panes: &[Pane], total: u16) -> Vec<u16> {
     let spare = total.saturating_sub(base);
     let weight: u16 = extra.iter().sum();
     if weight == 0 {
-        if let Some(first) = out.first_mut() {
-            *first += spare;
+        // To the first list with rows, so an empty one stays one line.
+        let i = panes.iter().position(|p| !p.items.is_empty()).unwrap_or(0);
+        if let Some(h) = out.get_mut(i) {
+            *h += spare;
         }
     } else {
         for (h, e) in out.iter_mut().zip(&extra) {
@@ -1320,6 +1382,110 @@ mod tests {
         };
         plain.loaded(Ok(next_view()));
         assert_eq!(colour_of(&mut plain, "critical"), Some(Color::Reset));
+    }
+
+    fn agents_view() -> View {
+        let mut claude = pma_core::worker::Worker::blank("claude");
+        claude.command = "claude".into();
+        View::Agents {
+            state: "/tmp".into(),
+            jobs: Vec::new(),
+            runs: Vec::new(),
+            now: 0,
+            workers: vec![claude],
+            presets: vec![pma_core::store::Preset {
+                name: "claude-haiku".into(),
+                agent: "claude".into(),
+                model: Some("haiku".into()),
+                args: Vec::new(),
+            }],
+            agent: "claude".into(),
+            preset: None,
+        }
+    }
+
+    fn typed(app: &mut App, text: &str) -> Option<Request> {
+        for c in text.chars() {
+            app.key(&c.to_string());
+        }
+        app.key("Enter")
+    }
+
+    /// The agents tab lists the workers and presets, and its keys set a
+    /// field, edit, add, make default and open, as the CLI would.
+    #[test]
+    fn workers_and_presets_are_configured_from_the_agents_tab() {
+        let mut app = App::new();
+        app.key("5");
+        app.loaded(Ok(agents_view()));
+        let text = screen_text(&mut app);
+        assert!(text.contains("Workers (* default)"), "{text}");
+        assert!(text.contains("* claude"), "{text}");
+        assert!(text.contains("claude-haiku"), "{text}");
+        // Nothing runs, so the workers list has the focus.
+        assert_eq!(
+            app.key("u"),
+            Some(Request::Act(Action::UseWorker {
+                name: "claude".into()
+            }))
+        );
+        assert_eq!(
+            app.key("Enter"),
+            Some(Request::Load(Query::Worker {
+                name: "claude".into()
+            }))
+        );
+        app.key("f");
+        assert_eq!(
+            typed(&mut app, "sandbox true"),
+            Some(Request::Act(Action::SetWorker {
+                name: "claude".into(),
+                field: "sandbox".into(),
+                value: "true".into(),
+            }))
+        );
+        app.acted(Ok(Default::default()));
+        app.key("l");
+        app.key("e");
+        assert!(
+            screen_text(&mut app).contains("claude haiku"),
+            "starts from the preset"
+        );
+        assert_eq!(
+            typed(&mut app, " --effort high"),
+            Some(Request::Act(Action::SetPreset(pma_core::store::Preset {
+                name: "claude-haiku".into(),
+                agent: "claude".into(),
+                model: Some("haiku".into()),
+                args: vec!["--effort".into(), "high".into()],
+            })))
+        );
+        app.acted(Ok(Default::default()));
+        app.key("+");
+        assert_eq!(
+            typed(&mut app, "plain claude"),
+            Some(Request::Act(Action::SetPreset(pma_core::store::Preset {
+                name: "plain".into(),
+                agent: "claude".into(),
+                model: None,
+                args: Vec::new(),
+            })))
+        );
+        app.acted(Ok(Default::default()));
+        app.key("a");
+        assert!(screen_text(&mut app).contains("worker name (1 of 2)"));
+        assert_eq!(typed(&mut app, "codex"), None, "asks for the program next");
+        assert!(screen_text(&mut app).contains("program to run (2 of 2)"));
+        assert_eq!(
+            typed(&mut app, "codex"),
+            Some(Request::Act(Action::AddWorker {
+                name: "codex".into(),
+                command: "codex".into(),
+            }))
+        );
+        app.acted(Ok(Default::default()));
+        app.key("x");
+        assert!(screen_text(&mut app).contains("remove preset claude-haiku?"));
     }
 
     /// A prompt reads text, starts from the note's own, and builds the action

@@ -243,6 +243,7 @@ fn route(req: &Request, ctx: &Ctx) -> Response {
             let q = match pick_from(&b["pick"]) {
                 Some(Pick::Run { id, .. }) => api::Query::Run { id },
                 Some(Pick::Job { id, .. }) => api::Query::JobLog { id },
+                Some(Pick::Worker { name }) => api::Query::Worker { name },
                 _ => return Response::status(400),
             };
             answer(ctx, |store| {
@@ -343,6 +344,7 @@ fn keys_json() -> Value {
                 Ask::Nothing => json!({ "kind": "nothing" }),
                 Ask::Confirm => json!({ "kind": "confirm" }),
                 Ask::Text(label) => json!({ "kind": "text", "label": label }),
+                Ask::Fields(labels) => json!({ "kind": "fields", "labels": labels }),
             };
             json!({
                 "key": b.key,
@@ -437,6 +439,15 @@ fn pick_json(p: &Pick) -> Value {
         }
         Pick::Note { id, text } => json!({ "kind": "note", "id": id, "text": text }),
         Pick::Campaign { name } => json!({ "kind": "campaign", "name": name }),
+        Pick::Worker { name } => json!({ "kind": "worker", "name": name }),
+        Pick::Preset {
+            name,
+            agent,
+            model,
+            args,
+        } => {
+            json!({ "kind": "preset", "name": name, "agent": agent, "model": model, "args": args })
+        }
     }
 }
 
@@ -476,6 +487,17 @@ fn pick_from(v: &Value) -> Option<Pick> {
             text: s("text")?,
         },
         "campaign" => Pick::Campaign { name: s("name")? },
+        "worker" => Pick::Worker { name: s("name")? },
+        "preset" => Pick::Preset {
+            name: s("name")?,
+            agent: s("agent")?,
+            model: s("model")?,
+            args: v["args"]
+                .as_array()?
+                .iter()
+                .map(|a| a.as_str().map(String::from))
+                .collect::<Option<_>>()?,
+        },
         _ => return None,
     })
 }

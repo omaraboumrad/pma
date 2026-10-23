@@ -118,10 +118,22 @@ pub enum Act {
     RunCampaign,
     Sync,
     Verify,
+    /// Sets one field of the selected worker from a typed `field value`.
+    SetWorkerField,
+    /// Replaces the selected preset from a typed `worker [model] [args...]`.
+    EditPreset,
+    /// Names a preset from a typed `name worker [model] [args...]`.
+    AddPreset,
+    /// Creates a worker from a typed `name program`.
+    AddWorker,
+    /// Makes the selected worker or preset the default.
+    MakeDefault,
+    /// Removes the selected worker or preset.
+    RemoveConfig,
 }
 
 impl Act {
-    pub const ALL: [Act; 24] = [
+    pub const ALL: [Act; 30] = [
         Act::ApproveRun,
         Act::ApproveRuns,
         Act::RejectRun,
@@ -146,6 +158,12 @@ impl Act {
         Act::RunCampaign,
         Act::Sync,
         Act::Verify,
+        Act::SetWorkerField,
+        Act::EditPreset,
+        Act::AddPreset,
+        Act::AddWorker,
+        Act::MakeDefault,
+        Act::RemoveConfig,
     ];
 
     pub fn name(self) -> String {
@@ -164,6 +182,8 @@ impl Act {
                 | Act::SettlePrs
                 | Act::ApproveRuns
                 | Act::StartWorkflow
+                | Act::AddPreset
+                | Act::AddWorker
         )
     }
 
@@ -172,9 +192,12 @@ impl Act {
     pub fn weight(self) -> &'static str {
         match self {
             Act::ApproveRun | Act::ApproveJob | Act::Dispatch => "primary",
-            Act::RejectRun | Act::StopJob | Act::StopWorkflow | Act::RemoveNote | Act::Push => {
-                "danger"
-            }
+            Act::RejectRun
+            | Act::StopJob
+            | Act::StopWorkflow
+            | Act::RemoveNote
+            | Act::RemoveConfig
+            | Act::Push => "danger",
             _ => "default",
         }
     }
@@ -202,6 +225,11 @@ impl Act {
             Action::RunCampaign { .. } => &[Act::RunCampaign],
             Action::Sync { .. } => &[Act::Sync],
             Action::Verify { .. } => &[Act::Verify],
+            Action::SetWorker { .. } => &[Act::SetWorkerField],
+            Action::AddWorker { .. } => &[Act::AddWorker],
+            Action::SetPreset(_) => &[Act::EditPreset, Act::AddPreset],
+            Action::UseWorker { .. } | Action::UsePreset { .. } => &[Act::MakeDefault],
+            Action::RemoveWorker { .. } | Action::RemovePreset { .. } => &[Act::RemoveConfig],
         }
     }
 }
@@ -238,6 +266,9 @@ pub enum Ask {
     Confirm,
     /// A line of text, with this label.
     Text(&'static str),
+    /// A line for each label, asked in turn. The answers reach `action` one
+    /// per line.
+    Fields(&'static [&'static str]),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -284,7 +315,7 @@ const PANES: &[Tab] = &[
     Tab::Workflows,
     Tab::Project,
 ];
-const RUNS: &[Tab] = &[Tab::Runs, Tab::Project];
+const RUNS: &[Tab] = &[Tab::Next, Tab::Runs, Tab::Project];
 
 pub const BINDINGS: &[Binding] = &[
     bind("1", Command::Tab(Tab::Next), "next"),
@@ -316,7 +347,7 @@ pub const BINDINGS: &[Binding] = &[
         ..bind("h", Command::PrevPane, "previous list")
     },
     Binding {
-        tabs: &[Tab::Runs, Tab::Jobs, Tab::Project],
+        tabs: &[Tab::Next, Tab::Runs, Tab::Jobs, Tab::Agents, Tab::Project],
         ..bind("Enter", Command::Open, "open")
     },
     Binding {
@@ -399,6 +430,49 @@ pub const BINDINGS: &[Binding] = &[
         Act::RunCampaign,
         Ask::Confirm,
         "run",
+    ),
+    // A worker or a preset.
+    on(
+        "f",
+        &[Tab::Agents],
+        Act::SetWorkerField,
+        Ask::Text("field value"),
+        "set field",
+    ),
+    on(
+        "e",
+        &[Tab::Agents],
+        Act::EditPreset,
+        Ask::Text("worker [model] [args...]"),
+        "edit preset",
+    ),
+    on(
+        "+",
+        &[Tab::Agents],
+        Act::AddPreset,
+        Ask::Text("name worker [model] [args...]"),
+        "add preset",
+    ),
+    on(
+        "a",
+        &[Tab::Agents],
+        Act::AddWorker,
+        Ask::Fields(&["worker name", "program to run"]),
+        "add worker",
+    ),
+    on(
+        "u",
+        &[Tab::Agents],
+        Act::MakeDefault,
+        Ask::Nothing,
+        "make default",
+    ),
+    on(
+        "x",
+        &[Tab::Agents],
+        Act::RemoveConfig,
+        Ask::Confirm,
+        "remove",
     ),
     // A note.
     on("e", &[Tab::Notes], Act::EditNote, Ask::Text("note"), "edit"),

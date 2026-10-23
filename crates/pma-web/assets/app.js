@@ -410,9 +410,10 @@ function drawDrawer() {
         `Open ${named}`, el("kbd", {}, proj.key)));
     }
     const open = onTab().find((b) => b.command.kind === "Open");
-    if (open && (item.pick.kind === "run" || item.pick.kind === "job")) {
+    const opens = { run: "Review diff", job: "View log", worker: "Show worker" };
+    if (open && opens[item.pick.kind]) {
       actions.append(el("button", { class: "button primary", type: "button", onclick: () => run(open) },
-        item.pick.kind === "run" ? "Review diff" : "View log", el("kbd", {}, "Enter")));
+        opens[item.pick.kind], el("kbd", {}, "Enter")));
     }
   }
   // Only the acts the server says fit this row.
@@ -500,6 +501,15 @@ async function act(b) {
           cancel: true,
         });
         if (!yes) return;
+      } else if (b.ask.kind === "fields") {
+        const answers = [];
+        for (const [i, f] of b.ask.labels.entries()) {
+          const last = i === b.ask.labels.length - 1;
+          const typed = await dialog({ title: label(b.label), field: label(f), input: i ? "" : asked.input, ok: last ? label(b.label) : "Next", cancel: true });
+          if (typed === null) return;
+          answers.push(typed);
+        }
+        input = answers.join("\n");
       } else {
         const typed = await dialog({ title: label(b.label), field: label(b.ask.label), input: asked.input, ok: label(b.label), cancel: true });
         if (typed === null) return;
@@ -559,7 +569,7 @@ async function run(b) {
     case "Quit": toast("Close the browser tab to leave. pma web runs until Ctrl-C in its terminal.", "accent"); break;
     case "Open": {
       const pick = currentPick();
-      if (pick.kind !== "run" && pick.kind !== "job") break;
+      if (!["run", "job", "worker"].includes(pick.kind)) break;
       try {
         S.drawer = { mode: "detail", screen: await api("/api/open", { pick }) };
       } catch (e) {

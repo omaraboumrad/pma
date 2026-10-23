@@ -7,7 +7,8 @@
 
 use crate::api::{Action, Selection, View, WorkerChoice};
 use crate::keys::{Act, Tab};
-use crate::store::{Run, RunState};
+use crate::store::{Preset, Run, RunState};
+use crate::worker::Worker;
 use crate::{accept, dates, history, next, publish, rank, report, report_runs, scan, watch};
 
 /// What a row is about.
@@ -48,6 +49,17 @@ pub enum Pick {
     },
     Campaign {
         name: String,
+    },
+    Worker {
+        name: String,
+    },
+    /// A preset, whole, so editing it starts from what it says.
+    Preset {
+        name: String,
+        agent: String,
+        /// Empty for the worker's own default.
+        model: String,
+        args: Vec<String>,
     },
 }
 
@@ -130,6 +142,11 @@ pub fn fits(act: Act, pick: &Pick) -> bool {
         Act::ResumeWorkflow => matches!(pick, Pick::Instance { open: true, .. }),
         Act::RunCampaign => matches!(pick, Pick::Campaign { .. }),
         Act::EditNote | Act::RemoveNote => matches!(pick, Pick::Note { .. }),
+        Act::SetWorkerField => matches!(pick, Pick::Worker { .. }),
+        Act::EditPreset => matches!(pick, Pick::Preset { .. }),
+        Act::MakeDefault | Act::RemoveConfig => {
+            matches!(pick, Pick::Worker { .. } | Pick::Preset { .. })
+        }
         _ => !act.on_row(),
     }
 }
@@ -887,6 +904,10 @@ pub fn screen(view: View) -> Screen {
             jobs,
             runs,
             now,
+            workers,
+            presets,
+            agent,
+            preset,
         } => {
             let agents = watch::agents(&state, &runs, now)
                 .into_iter()
@@ -957,9 +978,64 @@ pub fn screen(view: View) -> Screen {
                         items: open,
                         empty: "No job is queued, running or waiting.",
                     },
+                    worker_pane(&workers, &presets, &agent),
+                    preset_pane(&presets, &workers, preset.as_deref()),
                 ],
             )
         }
+        View::Worker {
+            worker,
+            default,
+            presets,
+        } => detail(
+            None,
+            None,
+            Detail {
+                title: format!("Worker {}", worker.name),
+                badge: default.then(|| cell("default", Tone::Accent)),
+                notice: None,
+                fields: worker
+                    .fields()
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v))
+                    .collect(),
+                sections: vec![
+                    (
+                        "Presets".into(),
+                        Section::Log,
+                        match presets.is_empty() {
+                            true => format!(
+                                "None. `+` on the agents tab adds one: <name> {} [model]",
+                                worker.name
+                            ),
+                            false => presets
+                                .iter()
+                                .map(|p| {
+                                    format!(
+                                        "{}  {}  {}",
+                                        p.name,
+                                        p.model.as_deref().unwrap_or("its own default"),
+                                        p.args.join(" ")
+                                    )
+                                    .trim_end()
+                                    .to_string()
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                        },
+                    ),
+                    (
+                        "Fields".into(),
+                        Section::Log,
+                        crate::worker::FIELDS
+                            .iter()
+                            .map(|(n, what)| format!("{n:<16} {what}"))
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    ),
+                ],
+            },
+        ),
         View::Jobs(jobs) => {
             let items = jobs
                 .iter()
@@ -1333,9 +1409,101 @@ pub fn screen(view: View) -> Screen {
 }
 
 /// Text a prompt starts with: a note being edited starts as its text.
+/// The workers, the default one marked: how each program is run.
+fn worker_pane(workers: &[Worker], presets: &[Preset], default: &str) -> Pane {
+    let items = workers
+        .iter()
+        .map(|w| {
+            let flags = w.flags();
+            let used = presets.iter().filter(|p| p.agent == w.name).count();
+            Item {
+                cells: vec![
+                    match w.name == default {
+                        true => cell(format!("* {}", w.name), Tone::Accent),
+                        false => plain(format!("  {}", w.name)),
+                    },
+                    plain(w.command.clone()),
+                    muted(w.parse.name()),
+                    muted(match flags.is_empty() {
+                        true => "-".to_string(),
+                        false => flags.join(","),
+                    }),
+                    muted(used.to_string()),
+                ],
+                pick: Pick::Worker {
+                    name: w.name.clone(),
+                },
+            }
+        })
+        .collect();
+    Pane {
+        title: "Workers (* default)".into(),
+        columns: vec![
+            col("worker", Kind::Text),
+            col("command", Kind::Text),
+            col("parse", Kind::Text),
+            col("flags", Kind::Text),
+            col("presets", Kind::Number),
+        ],
+        items,
+        empty: "No worker. `pma agent set <name> command <program>` adds one.",
+    }
+}
+
+/// The presets, the default one marked: which model each worker runs at.
+fn preset_pane(presets: &[Preset], workers: &[Worker], default: Option<&str>) -> Pane {
+    let items = presets
+        .iter()
+        .map(|p| {
+            let missing = !workers.iter().any(|w| w.name == p.agent);
+            Item {
+                cells: vec![
+                    match default == Some(p.name.as_str()) {
+                        true => cell(format!("* {}", p.name), Tone::Accent),
+                        false => plain(format!("  {}", p.name)),
+                    },
+                    match missing {
+                        true => cell(format!("{} (no such worker)", p.agent), Tone::Bad),
+                        false => plain(p.agent.clone()),
+                    },
+                    plain(p.model.clone().unwrap_or_else(|| "its own default".into())),
+                    muted(p.args.join(" ")),
+                ],
+                pick: Pick::Preset {
+                    name: p.name.clone(),
+                    agent: p.agent.clone(),
+                    model: p.model.clone().unwrap_or_default(),
+                    args: p.args.clone(),
+                },
+            }
+        })
+        .collect();
+    Pane {
+        title: "Presets (* default)".into(),
+        columns: vec![
+            col("preset", Kind::Text),
+            col("worker", Kind::Text),
+            col("model", Kind::Text),
+            col("args", Kind::Wide),
+        ],
+        items,
+        empty: "No preset. `+` adds one: <name> <worker> [model] [args...]",
+    }
+}
+
 pub fn initial_input(act: Act, pick: &Pick) -> String {
     match (act, pick) {
         (Act::EditNote, Pick::Note { text, .. }) => text.clone(),
+        (
+            Act::EditPreset,
+            Pick::Preset {
+                agent, model, args, ..
+            },
+        ) => std::iter::once(agent.as_str())
+            .chain((!model.is_empty()).then_some(model.as_str()))
+            .chain(args.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join(" "),
         _ => String::new(),
     }
 }
@@ -1348,6 +1516,8 @@ pub fn question(act: Act, pick: &Pick) -> String {
         Pick::Run { id, .. } | Pick::Job { id, .. } | Pick::Note { id, .. } => format!("#{id}"),
         Pick::Instance { id, .. } => format!("instance {id}"),
         Pick::Campaign { name } => name.clone(),
+        Pick::Worker { name } => format!("worker {name}"),
+        Pick::Preset { name, .. } => format!("preset {name}"),
         Pick::Nothing => String::new(),
     };
     let verb = match act {
@@ -1359,6 +1529,7 @@ pub fn question(act: Act, pick: &Pick) -> String {
         Act::Push => "push",
         Act::StopJob | Act::StopWorkflow => "stop",
         Act::RemoveNote => "remove note",
+        Act::RemoveConfig => "remove",
         Act::RunCampaign => "run campaign",
         Act::ApproveRuns => "approve every clean run",
         Act::Sync => "sync critical items to GitHub issues",
@@ -1562,7 +1733,70 @@ pub fn action_in(
         },
         (Act::RemoveNote, Pick::Note { id, .. }) => Action::RemoveNote { id: *id },
         (Act::EditNote | Act::RemoveNote, _) => return need("a note"),
+        (Act::SetWorkerField, Pick::Worker { name }) => {
+            let (field, value) = input
+                .split_once(char::is_whitespace)
+                .map_or((input, ""), |(f, v)| (f, v.trim()));
+            if field.is_empty() {
+                return Err(format!(
+                    "type a field and its value; fields: {}",
+                    crate::worker::FIELDS.map(|(n, _)| n).join(", ")
+                ));
+            }
+            Action::SetWorker {
+                name: name.clone(),
+                field: field.into(),
+                value: value.into(),
+            }
+        }
+        (Act::SetWorkerField, _) => return need("a worker"),
+        (Act::EditPreset, Pick::Preset { name, .. }) => {
+            preset(std::iter::once(name.as_str()).chain(input.split_whitespace()))?
+        }
+        (Act::EditPreset, _) => return need("a preset"),
+        (Act::AddPreset, _) => preset(input.split_whitespace())?,
+        (Act::AddWorker, _) => {
+            let mut lines = input.lines().map(str::trim);
+            let name = lines.next().unwrap_or_default();
+            let command = lines.next().unwrap_or_default();
+            if name.is_empty() || name.contains(char::is_whitespace) {
+                return Err("the worker name is one word, such as `codex`".into());
+            }
+            if command.is_empty() {
+                return Err(format!("`{name}` needs a program to run, such as `codex`"));
+            }
+            Action::AddWorker {
+                name: name.into(),
+                command: command.into(),
+            }
+        }
+        (Act::MakeDefault, Pick::Worker { name }) => Action::UseWorker { name: name.clone() },
+        (Act::MakeDefault, Pick::Preset { name, .. }) => Action::UsePreset { name: name.clone() },
+        (Act::RemoveConfig, Pick::Worker { name }) => Action::RemoveWorker { name: name.clone() },
+        (Act::RemoveConfig, Pick::Preset { name, .. }) => {
+            Action::RemovePreset { name: name.clone() }
+        }
+        (Act::MakeDefault | Act::RemoveConfig, _) => return need("a worker or a preset"),
     })
+}
+
+/// `name worker [model] [args...]`, as `pma preset set` reads it. A model
+/// that starts with `-` is an argument instead: the worker's own default.
+fn preset<'a>(mut words: impl Iterator<Item = &'a str>) -> Result<Action, String> {
+    let usage = "type a name, a worker, then a model and arguments if any";
+    let name = words.next().ok_or(usage)?.to_string();
+    let agent = words.next().ok_or(usage)?.to_string();
+    let mut rest: Vec<String> = words.map(String::from).collect();
+    let model = match rest.first() {
+        Some(m) if !m.starts_with('-') => Some(rest.remove(0)),
+        _ => None,
+    };
+    Ok(Action::SetPreset(crate::store::Preset {
+        name,
+        agent,
+        model,
+        args: rest,
+    }))
 }
 
 #[cfg(test)]
