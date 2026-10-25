@@ -439,6 +439,12 @@ pub fn land_local(
                 true => Landed::Conflict,
                 false => Landed::Discarded,
             };
+            // Another edit's landing refused it, not the agent's work, so it
+            // is in no share.
+            if landed == Landed::Conflict {
+                run.infra = true;
+                store.update_run(run)?;
+            }
             Ok((landed, format!("discarded: {why}")))
         }
     }

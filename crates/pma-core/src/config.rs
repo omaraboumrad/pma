@@ -31,7 +31,7 @@ pub struct Config {
     /// `agent` and that worker's own model.
     pub preset: Option<String>,
     /// Tier for a project that has none, so untiered projects are ranked
-    /// rather than invisible. `None` leaves them out, as before.
+    /// rather than invisible. `None`, set as `never`, leaves them out.
     pub default_tier: Option<i64>,
     pub attribution: Attribution,
     /// Agents running at once.
@@ -103,7 +103,7 @@ impl Default for Config {
             deps_days: 30,
             agent: "claude".into(),
             preset: None,
-            default_tier: None,
+            default_tier: Some(5),
             attribution: Attribution::User,
             max_parallel: 2,
             batch_budget: 5.0,

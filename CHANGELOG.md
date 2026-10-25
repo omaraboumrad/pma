@@ -16,6 +16,8 @@ pma push 4      # then that commit, and nothing else, to origin's default branch
 
 Runs gain the states `staged` and `committed`, which hold their task. The TUI and web bind `s` and `m` on runs. `docs/dev/stage-commit-push.md`.
 
+**CI and release workflows.** `ci.yml` runs `make check` on Linux and macOS on every push. `release.yml` builds pma for x86_64 and aarch64 Linux and macOS when a version tag such as `0.8.0` is pushed. It publishes the archives and `SHA256SUMS` to a GitHub release, with that version's CHANGELOG section as its notes. Run by hand without a tag, it keeps the archives as run artifacts and publishes nothing. Windows is not built: pma-core uses Unix-only APIs, and a Windows build now stops with "pma supports Linux and macOS only".
+
 **Scan history: what changed, `pma history`, and `pma status --html`.** A scan reported only counts, such as "CI failing in 6", without naming the projects, and kept no record of earlier scans. It now prints what changed since the scan before and lists the projects with failing CI or broken. Each scan records every project's state and its changes: items opened and closed, CI failing or passing again, a project broken, mended, new, returned or absent. The last 100 scans are kept. The status view in the TUI, the web and the HTML page gains three panes: failing CI, one row per failing workflow with its latest failed run; the last scan's changes; and the recent scans. In the web and the HTML page, a project links to its GitHub repository, its CI to its Actions page, and a failing workflow to its run. The scan records each failing run's URL from `gh run list`. Schemas 36 and 37.
 
 ```sh
@@ -50,6 +52,8 @@ pma dispatch a:deps -a claude    # after a refused refresh: carries its check ou
 
 ### Changed
 
+**Untiered projects are ranked at tier 5.** `default_tier` now defaults to 5, so a new install's `pma next`, `matrix` and `status` cover every project, below the tiered ones. An untiered project's CI and deps signals are shown but not taken by `dispatch --auto`; name them, as `pma dispatch <project>:ci`, to dispatch one. Its `#agent` items stay eligible. Headers count untiered projects whatever the default, and `status` still shows their tier as `-`. `pma config default_tier never` restores the old behaviour.
+
 **`pma push` works in your clone, and publishing runs no check.** `push` committed, rebased, re-ran the check and pushed from the run's worktree, so the clone never showed the commit before it was public, and the name covered only the last step. It now commits in the clone if `pma commit` has not, and pushes that commit. The clone must be at the run's base, and `stage` refuses a non-empty index. The publish check is gone from `push` and `pr`: with no rebase, it re-tested the tree the run's check passed plus the tick, and git refuses a push onto a moved origin. A second run on the same base is refused once the first lands; publish it with `pma pr`.
 
 **`pma status` fits 80 columns.** The `local` column is now `dirty`, holding the count of changed files or `-`, and the todo column reads `N lint` and `error`.
@@ -59,6 +63,8 @@ pma dispatch a:deps -a claude    # after a refused refresh: carries its check ou
 **Docs.** The README's route example states its `approval`, without which the parser refuses it. `docs/dev/design.md` names the agents that are seeded and the crates in use (`toml_edit`, `serde_json`).
 
 ### Fixed
+
+**`pma report` counts local edits left unstaged.** A `--local` workflow edit applied to its clone was counted nowhere: not accepted, not landed, not open. It now has an `applied` column, and the headline names the count. It stays out of the accepted share: no one has judged it, and it has not reached the default branch. A local edit discarded because another edit's landing left it unable to apply now counts as an infrastructure rejection, in no share; it was counted against the agent.
 
 **A repository with no workflows reads as CI `none`, not unknown.** `gh` prints nothing for it, which was parsed as JSON and failed with "EOF while parsing".
 

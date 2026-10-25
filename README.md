@@ -113,6 +113,14 @@ Requirements:
 
 - `gh`, authenticated, for CI status, for opening pull requests and for `pma sync`. Without it CI reads as unknown, and `pma scan --offline` skips GitHub on purpose.
 
+What is supported:
+
+- **Forge: GitHub.** CI status, `pma pr` and `pma sync` need a GitHub remote. A repository elsewhere is still scanned, and dispatched to with `stage`, `commit` or `push`; its CI reads as unknown.
+
+- **Dependencies: Cargo, uv and Go modules.** `pma scan --deps` and the `refresh` worker read `Cargo.lock`, `uv.lock` and `go.mod`. Other projects show no deps state.
+
+- **Test command detection:** a `test:` target in the Makefile, then `cargo test`, `go test ./...`, `npm test` when `package.json` has a `test` script, then `uv run pytest` with a `uv.lock` or `python3 -m pytest` without one. For anything else, or a Python project that needs an environment, set `pma config projects.<name>.verify "<command>"` and check it with `pma verify <name>`.
+
 ## TODO.md format
 
 ```markdown
@@ -168,7 +176,7 @@ pma lint ~/projects/*/          # every project
 pma prune ~/projects/*/         # what would be removed; --apply to do it
 pma root add ~/projects/        # also `pma root` and `pma root rm`
 pma project                     # every project: tier, tags, last scanned
-pma project tier 1 alpha beta   # or `none`; untiered projects are not ranked
+pma project tier 1 alpha beta   # or `none`; untiered projects rank at default_tier, 5
 pma project export tiers.csv    # every project's tier and tags, to edit
 pma project import tiers.csv --apply   # read them back
 pma project tag add rust myproject     # private groups; --tag <t> elsewhere
@@ -180,7 +188,7 @@ pma scan --deps                 # also measure how far each cargo, uv and go loc
 pma next                        # for agents and for you; --all for every row
 pma matrix                      # the ranked 2x2; -q q1 for one quadrant
 pma status --explain            # projects worst first, with what placed each
-pma status --all                # untiered projects too, e.g. to find failing CI
+pma status --all                # untiered projects too, when default_tier is never
 pma status --all --html s.html  # the same, with the last scan's changes, as one HTML page
 pma history                     # past scans; `pma history last` for what the latest changed
 pma stale                       # open items by age, oldest first
