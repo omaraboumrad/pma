@@ -110,9 +110,9 @@ pub struct Task {
     pub tagged_urgent: bool,
     pub signal_urgent: bool,
     pub age_days: i64,
-    /// Whether an agent may take it: the `ci` and `deps` signals at any tier,
-    /// and items tagged `#agent`. Importance orders the queue; this decides
-    /// what is dispatched from it.
+    /// Whether an agent may take it: the `ci` and `deps` signals of a project
+    /// with its own tier, and items tagged `#agent`. Importance orders the
+    /// queue; this decides what is dispatched from it.
     pub eligible: bool,
 }
 

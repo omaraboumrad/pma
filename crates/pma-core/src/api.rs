@@ -286,28 +286,28 @@ pub struct Portfolio {
     pub today: i64,
     pub projects: Vec<(rank::Project, store::ProjectRow)>,
     pub tasks: Vec<rank::Task>,
+    /// Projects with no tier of their own.
     pub untiered: usize,
-    /// Whether the untiered projects are in `projects`, ranked as tier 5.
-    pub all: bool,
+    /// The tier the untiered projects are ranked at, from `default_tier` or
+    /// `--all`; `None` leaves them out of `projects`.
+    pub ranked_as: Option<u8>,
     pub scanned_ago: i64,
 }
 
 impl Portfolio {
     pub fn header(&self) -> String {
-        if self.all {
-            return format!(
-                "last scan {}; {} projects, {} untiered ranked as tier 5",
-                crate::report::ago(self.scanned_ago),
-                self.projects.len(),
-                self.untiered
-            );
+        let ago = crate::report::ago(self.scanned_ago);
+        let n = self.projects.len();
+        match (self.untiered, self.ranked_as) {
+            (0, _) => format!("last scan {ago}; {n} projects"),
+            (u, Some(t)) => {
+                format!("last scan {ago}; {n} projects, {u} untiered ranked as tier {t}")
+            }
+            (u, None) => format!(
+                "last scan {ago}; {n} tiered projects, {u} untiered \
+                 (pma project tier <1-5> <project>..., or pma config default_tier <1-5>)"
+            ),
         }
-        format!(
-            "last scan {}; {} tiered projects, {} untiered (pma project tier <1-5> <project>...)",
-            crate::report::ago(self.scanned_ago),
-            self.projects.len(),
-            self.untiered
-        )
     }
 }
 
@@ -365,17 +365,14 @@ pub fn portfolio(store: &Store, of: &Selection, all: bool) -> Result<Portfolio> 
         .filter(|r| names.is_empty() || names.contains(&r.name))
         .filter(|r| r.absent_since.is_none())
         .collect();
-    let fallback = cfg.tier_or_default(None);
-    let untiered = rows
-        .iter()
-        .filter(|r| r.tier.is_none() && fallback.is_none())
-        .count();
+    let ranked_as = cfg.tier_or_default(None).or(all.then_some(5));
+    let untiered = rows.iter().filter(|r| r.tier.is_none()).count();
     let task_rows = store.tasks()?;
 
     let mut projects = Vec::new();
     let mut tasks = Vec::new();
     for row in rows {
-        let Some(tier) = row.tier.or(fallback).or(all.then_some(5)) else {
+        let Some(tier) = row.tier.or(ranked_as) else {
             continue;
         };
         let own: Vec<&store::TaskRow> =
@@ -414,7 +411,13 @@ pub fn portfolio(store: &Store, of: &Selection, all: bool) -> Result<Portfolio> 
             age_days:
                 (today - dates::day(t.added_at.unwrap_or(t.first_seen).min(t.first_seen))).max(0),
         }));
-        tasks.extend(rank::signal_tasks(&cfg, &project));
+        let mut signals = rank::signal_tasks(&cfg, &project);
+        // Ranked at a default tier, a project's signals are shown, but an
+        // agent takes them only when named: no one chose it for `--auto`.
+        if row.tier.is_none() {
+            signals.iter_mut().for_each(|s| s.eligible = false);
+        }
+        tasks.extend(signals);
         projects.push((project, row));
     }
     Ok(Portfolio {
@@ -423,7 +426,7 @@ pub fn portfolio(store: &Store, of: &Selection, all: bool) -> Result<Portfolio> 
         projects,
         tasks,
         untiered,
-        all,
+        ranked_as,
         scanned_ago: now - last,
     })
 }
@@ -636,7 +639,7 @@ pub fn query(store: &Store, q: Query) -> Result<View> {
             let status = p.projects.first().and_then(|(project, row)| {
                 let r = crate::report::StatusRow {
                     project,
-                    tiered: row.tier.is_some() || p.cfg.default_tier.is_some(),
+                    tiered: row.tier.is_some(),
                     has_todo: row.has_todo,
                     lint_errors: row.lint_errors,
                     faults: &row.faults,

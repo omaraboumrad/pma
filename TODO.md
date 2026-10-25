@@ -4,7 +4,40 @@
 
 ## High
 
+- [x] `pma report` counts `applied` runs as neither accepted nor landed
+  21 runs in state `applied` (`--local` workflow fixes on `xtgen` and `argdec`) are missing from the headline, which reads "25% of 8 decided runs accepted, 2 landed". Count `applied` as landed, or give it its own column, and name it in the headline. (REVIEW.md U2)
+
+- [ ] Finish the pilot cohort and apply its gate #manual
+  1 of 20 items shipped since 2026-09-24 (`docs/dev/pilot.md`). Fix the `report` count above first, or the shares will mislead. (REVIEW.md U1)
+
+- [x] Rank untiered projects instead of leaving them out
+  77 of 80 projects are untiered, so `pma next` holds 12 of about 1,200 open items. Rank them at a default tier, below every tiered project. Optionally, propose tiers from idle days, CI and fork state. (REVIEW.md U3)
+
+- [ ] Decide whether pma is the dashboard or the dispatch loop #manual
+  The evidence supports `scan`/`status`/`history`; most of the code serves dispatch and workflows. pma is for other developers, one per install, so the adoption items below are in scope; multi-user use comes later. (REVIEW.md, Questions)
+
+- [ ] `pma lint --fix` for mechanical errors
+  `nanosrv` has 46 errors, all "a list entry in this section must be a `- [ ]` item", and a broken file hides every item it holds. Rewrite `- text` to `- [ ] text` under a priority heading; keep the parser strict. (REVIEW.md U9)
+
+- [ ] npm or pnpm dependency signals, and a better Python verify fallback
+  deps covers `cargo`, `uv` and `go` (`crates/pma-core/src/deps.rs:24-26`). Without `uv.lock`, verify detection picks `python3 -m pytest` (`crates/pma-core/src/agent.rs:263-268`), likely without the project's dependencies (unverified). The README's Requirements now state what is supported. (REVIEW.md U7)
+
 ## Medium
+
+- [ ] Show open pull requests and issues opened by others as signal tasks
+  `scan` reads only CI from GitHub (`crates/pma-core/src/scan.rs:680`), and `sync` lists issues by others as untriaged but ranks none. A project with unanswered contributor pull requests shows as `clear`. Read them with `gh pr list` and `gh issue list` during `scan`, rank them by age, and do not make them dispatchable by default. (REVIEW.md U6)
+
+- [ ] A task source that is never pushed, for public repositories
+  Dispatch needs the item in `TODO.md` on origin (`crates/pma-core/src/dispatch.rs:601`), so every task an agent takes on an OSS repository is published first. Options: a gitignored `.pma/TODO.md`, or items held in the database. This conflicts with "TODO.md is the only task file" (`docs/dev/design.md`); decide that first, or document the exposure. (REVIEW.md U5)
+
+- [ ] A per-project setting that refuses host mode
+  For private code, `projects.<name>.worker_mode = "container"` would stop a dispatch from running unconfined by accident. Host mode leaves `~/.ssh`, reads and the network open. (REVIEW.md U10)
+
+- [ ] Propose `#agent` tags across the portfolio
+  15 of 1,201 open items carry `#agent`, so `dispatch --auto` has little to take. A read-only workflow, as `todo-audit` is, could propose tags; or a per-project default could mark items that have a description. (REVIEW.md U4)
+
+- [ ] Per-project session locks
+  One agent command and one job run at a time across all projects (`docs/dev/async_dispatch.md`, open question 1), so a detached job on one project blocks a dispatch on another. Needs a shared `batch_budget` ledger. (REVIEW.md U8)
 
 - [ ] A project whose name contains a dot can take `projects.<name>.verify` #agent
 
@@ -24,7 +57,28 @@
 
 - [ ] The process-group kill does not reach a child that calls `setsid` (`src/agent.rs:105-106`, `119`). `docs/dev/design.md:377` says no agent outlives the session. A survivor's writes to the worktree no longer reach an approval or a publish: an approval must match the tree last shown, and publishing starts from the approved tree. It still runs, reads what the user can, and writes outside the worktree. A cgroup or PID namespace would bound it; `sanduk` does. (REVIEW.md M10)
 
+- [ ] Record each run's agent session id, so `resumes` does something
+  `Worker::resumes` is stored, settable and listed by `pma agent`, but no dispatch path reads it (`crates/pma-core/src/worker.rs:210`). `opencode()` sets it `true`, so the listing claims a feature pma lacks. A `{session}` placeholder in worker args (`claude --session-id <uuid>`, as wallfacer does) plus a session column on the run would let a rework continue the earlier session instead of re-prompting, and let `pma review N --open` hand the terminal to `claude --resume <id>` in the worktree. Takeover must run under the `agent::restrict` environment, or it gains push credentials. Open: does a `-p` session resume interactively; does a `sanduk` transcript survive its container; what is opencode's flag. If neither use is wanted, delete the field.
+
 ## Low
+
+- [ ] Mark commands without a recorded pilot as experimental in `--help` and the README
+  34 top-level commands; routes and campaigns have no recorded runs. (REVIEW.md U11)
+
+- [ ] Date or range the README's scan time
+  It says 95 repositories in about 15 s; 80 took 24.6 s on 2026-10-25. (REVIEW.md U12)
+
+- [ ] Record a hand estimate of each task's time, so a time-saved figure exists
+  `--minutes` records review time only. (REVIEW.md, Questions)
+
+- [ ] Citations of the earlier REVIEW.md (`M10`, `L5`, `D4`, ...) in TODO.md and `docs/dev/workflows.md` point at a file that now holds another review
+  Rewrite them, or keep earlier reviews under `docs/dev/`.
+
+- [ ] Dispatched runs likely leave untracked transcripts in `~/.claude/projects/<encoded-worktree>/`
+  Each worktree is a new cwd, so each run probably adds a session pma neither records nor removes, and it shows in `claude --resume`. Unverified: check after a real run. Then choose: keep them as an audit trail of what the agent did, which the diff does not show, or remove them with the worktree. wallfacer's `CompanionFiler` handles the same cleanup problem.
+
+- [ ] Accept an item id, or a unique prefix of one, as a dispatch target: `myproject:^k3f`
+  Targets are `project:line` (`crates/pma/src/main.rs:230`), and a line number goes stale when TODO.md is edited after the scan; an id does not. An ambiguous prefix lists the candidates rather than guessing, as wallfacer resolves its refs.
 
 - [ ] `retry` on `edit`, then lap edges, then recursion (`docs/dev/workflows.md` section 19, parts 6c-6e). Gated: 6c needs 10 runs published through batch approval.
 
@@ -43,3 +97,6 @@
 - [ ] Open: does `cargo update --dry-run` ever print lines `parse_cargo` (`crates/pma-core/src/deps.rs`) misses? The counting bug beside it is a pilot cohort item in Medium. (REVIEW.md L15)
 
 - [ ] Smaller review items, unverified: run scope stored comma-joined (`src/store.rs:1149`); the CI prompt has no byte cap and can exceed the argument limit (`src/dispatch.rs:726`); cost over budget is judged on cumulative cost across reworks (`src/accept.rs:91`); table widths count characters, not display columns. (REVIEW.md)
+
+- [ ] Windows support
+  pma-core assumes Unix, so a Windows build stops at a `compile_error!`; `release.yml` builds Linux and macOS only. Sites: the `sh` watchdog and `kill -KILL -<pgid>` (`crates/pma-core/src/agent.rs:121`, `:134`; `scan.rs:357`; `jobs.rs:186`), `process_group(0)` (`agent.rs:147`, `scan.rs:314`, `jobs.rs:63`), `Command::new("sh")` in `agent.rs`, `jobs.rs:152`, `scan.rs:1081` and `dispatch.rs:1401`, and mode bits in `agent.rs:70` and the hook snapshot (`dispatch.rs:375`). Needs a job object to kill a process tree (`windows-sys`), `CREATE_NEW_PROCESS_GROUP` for the runner, a Windows rule for which hooks git runs, and a Windows CI job. sanduk-sandbox has no Windows backend, so confined verify fails closed there. Open: is WSL, which runs the Linux binary unchanged, enough? Until then, a `compile_error!` in `pma-core/src/lib.rs` names the limit; remove it with the port.

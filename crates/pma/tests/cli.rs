@@ -410,6 +410,8 @@ fn scan_rank_and_explain_a_real_repo() {
     );
     assert!(!scanned.contains("since the scan before"), "{scanned}");
 
+    // `never` leaves untiered projects out of the ranking.
+    ok(&home, &["config", "default_tier", "never"]);
     let matrix = ok(&home, &["matrix", "--all"]);
     let expected = "\
 Q1 Do right away: 0
@@ -428,7 +430,8 @@ Q4 Later: 3
     let (head, body) = matrix.split_once("\n\n").unwrap();
     assert_eq!(
         head,
-        "last scan just now; 1 tiered projects, 1 untiered (pma project tier <1-5> <project>...)"
+        "last scan just now; 1 tiered projects, 1 untiered \
+         (pma project tier <1-5> <project>..., or pma config default_tier <1-5>)"
     );
     assert_eq!(body, expected);
 
@@ -481,12 +484,15 @@ Q4 Later: 3
     ok(&home, &["config", "tiers.1", "--reset"]);
     assert!(ok(&home, &["matrix", "-q", "q2"]).contains("Q2 Schedule for later: 2\n"));
 
-    // An untiered project joins the matrix once there is a tier for it.
-    assert!(ok(&home, &["matrix"]).contains("1 untiered"));
-    ok(&home, &["config", "default_tier", "5"]);
-    let matrix = ok(&home, &["matrix"]);
-    assert!(matrix.contains("2 tiered projects, 0 untiered"), "{matrix}");
+    // By default an untiered project is ranked at tier 5, still marked untiered.
     ok(&home, &["config", "default_tier", "--reset"]);
+    let matrix = ok(&home, &["matrix"]);
+    assert!(
+        matrix.starts_with("last scan just now; 2 projects, 1 untiered ranked as tier 5\n"),
+        "{matrix}"
+    );
+    let status = ok(&home, &["status"]);
+    assert!(status.contains("\nbeta     -     idle"), "{status}");
 
     // Age orders `pma stale`; it no longer moves anything into Q1.
     let stale = ok(&home, &["stale", "-n", "2"]);
@@ -822,8 +828,8 @@ fn dispatch_review_rework_and_push() {
         .split_whitespace()
         .collect();
     assert_eq!(
-        &b[..8],
-        ["B", "4", "1", "2", "1", "0", "4", "$0.40+1?"],
+        &b[..9],
+        ["B", "4", "1", "2", "1", "0", "0", "4", "$0.40+1?"],
         "{report}"
     );
     assert!(report.contains("10m00s"), "review time: {report}");
@@ -2359,6 +2365,17 @@ fn notes_and_measured_dependencies() {
             .contains("alpha  T1  medium  open 0d  update dependencies: 2 outdated"),
         "the deps signal task"
     );
+    assert!(ok(&["next"]).contains("\n  alpha:deps "), "for agents");
+
+    // Ranked only at the default tier, the signal is shown but not offered.
+    ok(&["project", "tier", "none", "alpha"]);
+    assert!(
+        ok(&["matrix", "--all"]).contains("alpha  T5  medium  open 0d  update dependencies"),
+        "still ranked"
+    );
+    let next = ok(&["next"]);
+    assert!(!next.contains("alpha:deps"), "{next}");
+    ok(&["project", "tier", "1", "alpha"]);
 
     fs::write(alpha.join("uv.lock"), "refreshing").unwrap();
     ok(&["scan", "--offline"]);
@@ -3759,6 +3776,13 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"ok","total
     assert!(out.contains("nothing left to run"), "{out}");
     let notes = fs::read_to_string(alpha.join("notes.txt")).unwrap();
     assert!(notes == "one\n" || notes == "two\n", "{notes}");
+    // The overtaken edit was refused by the other's landing, not judged.
+    let report = env.ok(&["report"]);
+    assert!(report.starts_with("nothing decided yet"), "{report}");
+    assert!(
+        report.contains("rejected for infrastructure, in no share: #"),
+        "{report}"
+    );
 }
 
 /// One request to a local server, read to the end; the server closes the

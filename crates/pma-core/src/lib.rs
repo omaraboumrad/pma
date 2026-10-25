@@ -2,6 +2,10 @@
 //! `api` module its front ends share. It prints nothing and depends on no
 //! UI crate. Design: `docs/dev/design.md`, `docs/dev/frontends.md`.
 
+// Process groups, `sh` and mode bits are assumed throughout. See TODO.md.
+#[cfg(not(unix))]
+compile_error!("pma supports Linux and macOS only");
+
 pub mod accept;
 pub mod agent;
 pub mod api;

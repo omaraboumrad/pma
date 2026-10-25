@@ -147,7 +147,7 @@ pub fn matrix(
 
 pub struct StatusRow<'a> {
     pub project: &'a Project,
-    /// False for an untiered project that `status --all` ranks as tier 5.
+    /// False for a project ranked at `default_tier`, or at tier 5 by `--all`.
     pub tiered: bool,
     pub has_todo: bool,
     pub lint_errors: i64,

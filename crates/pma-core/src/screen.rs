@@ -715,7 +715,7 @@ pub fn screen(view: View) -> Screen {
                 .iter()
                 .map(|(project, row)| report::StatusRow {
                     project,
-                    tiered: row.tier.is_some() || p.cfg.default_tier.is_some(),
+                    tiered: row.tier.is_some(),
                     has_todo: row.has_todo,
                     lint_errors: row.lint_errors,
                     faults: &row.faults,

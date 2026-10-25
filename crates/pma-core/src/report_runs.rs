@@ -48,6 +48,9 @@ struct Tally {
     accepted: i64,
     /// Runs whose change reached the default branch: pushed, or merged.
     landed: i64,
+    /// Local edits left unstaged in the clone. No one has judged them, and
+    /// they have not landed, so they are in no share.
+    applied: i64,
     open: i64,
     /// Runs rejected for infrastructure, in no share.
     infra: Vec<i64>,
@@ -77,6 +80,7 @@ impl Tally {
             // Neither accepted nor refused until someone merges or closes it,
             // so it is in no share.
             RunState::PrOpen => self.open += 1,
+            RunState::Applied => self.applied += 1,
             // Failed and never reviewed: no one has judged it.
             _ => {}
         }
@@ -98,6 +102,7 @@ impl Tally {
             self.first_pass.to_string(),
             self.accepted.to_string(),
             self.landed.to_string(),
+            self.applied.to_string(),
             self.open.to_string(),
             self.attempts.to_string(),
             match self.cost_unknown {
@@ -110,8 +115,9 @@ impl Tally {
     }
 }
 
-pub const HEADINGS: [&str; 9] = [
-    "runs", "1st pass", "accepted", "landed", "open", "attempts", "cost", "agent", "review",
+pub const HEADINGS: [&str; 10] = [
+    "runs", "1st pass", "accepted", "landed", "applied", "open", "attempts", "cost", "agent",
+    "review",
 ];
 
 /// A run still queued or running has not produced a result yet, so it is left
@@ -164,6 +170,10 @@ pub fn table_of(runs: &[Run], attempts: &[Attempt], by: By) -> Option<(String, V
         1 => "; 1 pull request open, in no share".into(),
         n => format!("; {n} pull requests open, in no share"),
     };
+    let applied = match total.applied {
+        0 => String::new(),
+        n => format!("; {n} applied unstaged, in no share"),
+    };
     let infra = match total.infra.as_slice() {
         [] => String::new(),
         ids => format!(
@@ -174,7 +184,7 @@ pub fn table_of(runs: &[Run], attempts: &[Attempt], by: By) -> Option<(String, V
                 .join(" ")
         ),
     };
-    Some((format!("{share}{pending}{infra}"), rows))
+    Some((format!("{share}{pending}{applied}{infra}"), rows))
 }
 
 pub fn report(runs: &[Run], attempts: &[Attempt], by: By) -> String {
@@ -247,7 +257,26 @@ mod tests {
             .split_whitespace()
             .collect();
         // The running run is not counted at all; the open one only as open.
-        assert_eq!(&cells[..6], ["A", "2", "0", "1", "1", "1"], "{out}");
+        assert_eq!(&cells[..7], ["A", "2", "0", "1", "1", "0", "1"], "{out}");
+    }
+
+    /// A local edit left unstaged has neither landed nor been judged, so it
+    /// is counted apart and in no share.
+    #[test]
+    fn an_applied_local_edit_is_counted_apart_and_in_no_share() {
+        let runs = [
+            run(1, Class::Specified, RunState::Merged),
+            run(2, Class::Specified, RunState::Applied),
+            run(3, Class::Specified, RunState::Applied),
+            run(4, Class::Specified, RunState::Rejected),
+        ];
+        let out = report(&runs, &[], By::Class);
+        assert!(out.contains("50% of 2 decided runs accepted"), "{out}");
+        assert!(out.contains("; 2 applied unstaged, in no share"), "{out}");
+        let row = out.lines().find(|l| l.starts_with("B ")).unwrap();
+        let cells: Vec<&str> = row.split_whitespace().collect();
+        // class, runs, 1st pass, accepted, landed, applied, open
+        assert_eq!(&cells[..7], ["B", "4", "0", "1", "1", "2", "0"], "{row}");
     }
 
     /// The check or the machine failing is not the agent failing: such a
@@ -285,8 +314,12 @@ mod tests {
         let out = report(&runs, &attempts, By::Class);
         let row = out.lines().find(|l| l.starts_with("B ")).unwrap();
         let cells: Vec<&str> = row.split_whitespace().collect();
-        // class, runs, 1st pass, accepted, landed, open, attempts
-        assert_eq!(&cells[..7], ["B", "2", "1", "2", "2", "0", "3"], "{row}");
+        // class, runs, 1st pass, accepted, landed, applied, open, attempts
+        assert_eq!(
+            &cells[..8],
+            ["B", "2", "1", "2", "2", "0", "0", "3"],
+            "{row}"
+        );
     }
 
     /// A worker that reports no cost must not read as free.
