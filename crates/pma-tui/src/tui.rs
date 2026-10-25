@@ -1040,7 +1040,7 @@ pub fn key_name(code: KeyCode) -> Option<String> {
         KeyCode::Left => "h".into(),
         KeyCode::Right => "l".into(),
         KeyCode::Home => "Home".into(),
-        KeyCode::End => "G".into(),
+        KeyCode::End => "End".into(),
         KeyCode::PageUp => "PageUp".into(),
         KeyCode::PageDown => "PageDown".into(),
         _ => return None,
@@ -1065,6 +1065,13 @@ fn execute(store: &Store, app: &mut App, request: Request) {
 /// or an agent run is under way, and every 30 otherwise.
 pub fn run(store: &Store) -> Result<()> {
     let mut terminal = ratatui::try_init()?;
+    // `try_init` installs no panic hook, so a panic would leave the terminal
+    // raw on the alternate screen, with the message drawn over it.
+    let report = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        ratatui::restore();
+        report(info);
+    }));
     let mut app = App::new();
     let result = (|| -> Result<()> {
         let first = Request::Load(app.query());
@@ -1108,6 +1115,7 @@ pub fn run(store: &Store) -> Result<()> {
         }
     })();
     ratatui::try_restore()?;
+    let _ = std::panic::take_hook();
     result
 }
 
@@ -1437,6 +1445,41 @@ mod tests {
         }
     }
 
+    /// A small terminal, or one made small mid-run, still draws every mode
+    /// rather than panicking on a width or height that went to zero.
+    #[test]
+    fn every_mode_renders_in_a_small_terminal() {
+        for (w, h) in [(40, 8), (12, 4), (3, 1)] {
+            let mut app = App::new();
+            app.loaded(Ok(next_view()));
+            let modes = [
+                Mode::Normal,
+                Mode::Help,
+                Mode::Confirm {
+                    action: Action::Scan {
+                        of: api::Selection::default(),
+                        offline: true,
+                        deps: false,
+                    },
+                    question: "scan every project?".into(),
+                },
+                Mode::Prompt {
+                    act: Act::AddNote,
+                    label: "note",
+                    input: "x".into(),
+                    pick: Pick::Nothing,
+                },
+            ];
+            for mode in modes {
+                app.mode = mode.clone();
+                let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+                terminal
+                    .draw(|f| app.render(f))
+                    .unwrap_or_else(|e| panic!("{w}x{h} {mode:?}: {e}"));
+            }
+        }
+    }
+
     #[test]
     fn terminal_keys_take_the_table_names() {
         assert_eq!(key_name(KeyCode::Esc).as_deref(), Some("Escape"));
@@ -1445,7 +1488,16 @@ mod tests {
         for b in keys::BINDINGS {
             assert!(
                 b.key.chars().count() == 1
-                    || ["Enter", "Escape", "Tab", "ArrowDown", "ArrowUp"].contains(&b.key),
+                    || [
+                        "Enter",
+                        "Escape",
+                        "Tab",
+                        "ArrowDown",
+                        "ArrowUp",
+                        "Home",
+                        "End"
+                    ]
+                    .contains(&b.key),
                 "the TUI cannot send `{}`",
                 b.key
             );

@@ -2792,6 +2792,41 @@ impl Workflow {
         }
         out
     }
+
+    /// The graph with its arguments written into its guards: `{$p}` in a
+    /// membership test becomes the value, and a bound in a comparison its
+    /// number. Guards hold against unit data alone, so a pass resolves them
+    /// once, when the instance's arguments are known.
+    pub fn with_arguments(&self, params: &BTreeMap<String, Value>) -> Workflow {
+        let text = |v: &Value| match v {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        let mut w = self.clone();
+        for e in &mut w.edges {
+            let Some(guard) = &mut e.when else { continue };
+            for (_, test) in &mut guard.0 {
+                match test {
+                    Test::In(values) => {
+                        for v in values.iter_mut() {
+                            if let Some(p) = param_ref(v)
+                                && let Some(given) = params.get(&p)
+                            {
+                                *v = text(given);
+                            }
+                        }
+                    }
+                    Test::Compare(cmp, Count::Param(p)) => {
+                        if let Some(n) = params.get(p).and_then(Value::as_i64) {
+                            *test = Test::Compare(*cmp, Count::Fixed(n));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        w
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -3143,6 +3178,70 @@ mod tests {
 
     /// `unbuilt` names what the runtime does not take, and the library
     /// document states none of it.
+    /// A guard names a parameter; the instance's argument decides it.
+    #[test]
+    fn guards_take_the_arguments_given() {
+        let d = Document::parse(
+            r#"{
+              "types": {"finding": {"fields": {
+                "severity": {"type": "enum", "required": true, "values": ["critical", "high"]},
+                "title": {"type": "line", "required": true, "max": 200}}}},
+              "workflow": [{
+                "name": "severe", "in": "project", "out": "finding", "effects": [],
+                "params": {"severity": {"type": "enum", "default": "critical",
+                                        "values": ["critical", "high"]},
+                           "depth": {"type": "int", "default": 1, "max": 3}},
+                "caps": {"max_units": 10, "max_edits": 0},
+                "nodes": [{"name": "review", "op": "map", "out": "0..n", "in": "project",
+                           "emits": "finding", "max_units": 5, "task": "Review `{name}`."}],
+                "edges": [
+                  {"from": "@input", "to": "review"},
+                  {"from": "review", "to": "@output",
+                   "when": {"severity": ["{$severity}"], "@depth": {"<": "{$depth}"}}}]
+              }]
+            }"#,
+        )
+        .unwrap();
+        let w = d.flatten("severe").unwrap();
+        let guard = |w: &Workflow| w.edges[1].when.clone().expect("guarded");
+        assert_eq!(
+            guard(&w).0,
+            [
+                (
+                    Key::System("depth".into()),
+                    Test::Compare(Cmp::Lt, Count::Param("depth".into()))
+                ),
+                (
+                    Key::Field("severity".into()),
+                    Test::In(vec!["{$severity}".into()])
+                ),
+            ],
+            "as written, keys sorted"
+        );
+        let high =
+            w.with_arguments(&w.arguments(&serde_json::json!({"severity": "high", "depth": 2})));
+        assert_eq!(
+            guard(&high).0,
+            [
+                (
+                    Key::System("depth".into()),
+                    Test::Compare(Cmp::Lt, Count::Fixed(2))
+                ),
+                (Key::Field("severity".into()), Test::In(vec!["high".into()])),
+            ]
+        );
+        let by_default = w.with_arguments(&w.arguments(&serde_json::json!({})));
+        assert_eq!(guard(&by_default).0[1].1, Test::In(vec!["critical".into()]));
+        let system = std::collections::BTreeMap::from([("depth".to_string(), Value::from(1))]);
+        let unit = |s: &str| serde_json::json!({"severity": s, "title": "t"});
+        assert!(holds(&guard(&high), &unit("high"), &system).is_ok());
+        assert!(holds(&guard(&high), &unit("critical"), &system).is_err());
+        assert!(
+            holds(&guard(&w), &unit("high"), &system).is_err(),
+            "unresolved, it holds for nothing"
+        );
+    }
+
     #[test]
     fn unbuilt_constructs_are_named() {
         assert!(doc().unbuilt().is_empty(), "{:?}", doc().unbuilt());

@@ -6,6 +6,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+**Five more library workflows.** `security-review` and `test-gaps` are `find-issues` aimed at one class of fault, each with a confirm that must find the path or the missing test. `project-brief` writes one note per project: what it does, for whom, in what. `fix-findings` is `apply-fixes` without the lap and retry the runtime does not take, so it runs; `review-and-fix` composes it with `find-issues`, fixing the critical and high findings and printing the rest. All five are in `pma run`. A `brief` type joins the document's types. `docs/dev/workflows.md` 15.16 to 15.20.
+
 **`pma run`: a review, a CI fix or an upgrade, by name.** One command over `pma workflow run` and `pma dispatch`. A target is a project's name or its path. Reviews run to the end and print what they found and where the prose is. `fix-ci` and `deps-upgrade` write each edit that passes verify into the clone, unstaged; `--review` leaves it in `pma review`. With no revision of your own in effect, the bundled library is put in effect on first use, within `workflow_budget`. `docs/dev/run.md`.
 
 ```sh
@@ -78,6 +80,10 @@ pma dispatch a:deps -a claude    # after a refused refresh: carries its check ou
 **Docs.** The README's route example states its `approval`, without which the parser refuses it. `docs/dev/design.md` names the agents that are seeded and the crates in use (`toml_edit`, `serde_json`).
 
 ### Fixed
+
+**A guard that names a parameter now reads the argument.** `{"severity": ["{$severity}"]}` compared the field with the literal text `{$severity}`, so the edge was never taken and a default edge, or settling, took the unit instead; a comparison with a parameter failed outright. Section 6.4 states both forms. A pass now writes the instance's arguments into its guards before any unit enters the graph.
+
+**Front-end fixes from an accessibility pass.** The TUI restores the terminal on a panic; `ratatui::try_init` installs no hook, so a panic left it raw on the alternate screen. `Home` and `End` move to the first and last row in the TUI and the web; only `g` and `G` were bound, and the TUI sent `End` as `G` but `Home` as itself. In the web, `Tab` switches lists only while nothing has focus, so a keyboard user can tab from a button onward; and the light theme's `good` and `warn` pills were 4.49:1 against their backgrounds, under the 4.5:1 that 12px text needs. The Health tabs name their panel, not its heading.
 
 **`pma report` counts local edits left unstaged.** A `--local` workflow edit applied to its clone was counted nowhere: not accepted, not landed, not open. It now has an `applied` column, and the headline names the count. It stays out of the accepted share: no one has judged it, and it has not reached the default branch. A local edit discarded because another edit's landing left it unable to apply now counts as an infrastructure rejection, in no share; it was counted against the agent.
 

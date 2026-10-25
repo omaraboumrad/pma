@@ -5344,22 +5344,30 @@ print(json.dumps({"type": "result", "subtype": "success", "is_error": False,
                   "result": "ok", "total_cost_usd": 0.1}))
 "#;
 
-/// A stand-in for `claude -p` that plays the library's `find-issues`: its
-/// review writes one high finding, and its confirm keeps each unit it reads
-/// with a `reason`. Every invocation is logged.
+/// A stand-in for `claude -p` that plays the library's agent nodes: a review
+/// writes one high finding, a brief one unit, a confirm keeps each unit it
+/// reads with a `reason`, and a fix writes the file the verify wants. Every
+/// invocation is logged.
 const LIBRARY_CLAUDE: &str = r#"#!/usr/bin/env python3
 import json, os, re, sys
 home = os.path.dirname(os.environ["PMA_HOME"])
 prompt = sys.argv[2]
 with open(os.path.join(home, "worker.log"), "a") as f:
     f.write(" ".join(sys.argv[1:]) + "\n")
-out = re.search(r"(\S*out\.json)", prompt).group(1)
-if prompt.startswith("Review"):
-    open(re.search(r"(\S*REVIEW\.md)", prompt).group(1), "w").write("prose\n")
-    json.dump([{"severity": "high", "title": "a real bug"}], open(out, "w"))
-else:
+def out():
+    return re.search(r"(\S*out\.json)", prompt).group(1)
+if "Fix this in" in prompt:
+    open("hello.txt", "w").write("hi\n")
+elif "`summary`" in prompt:
+    json.dump([{"summary": "says hello", "stack": "sh"}], open(out(), "w"))
+elif "in.json" in prompt:
     units = json.load(open(re.search(r"(\S*in\.json)", prompt).group(1)))
-    json.dump([{"@id": u["@id"], "reason": "proved"} for u in units], open(out, "w"))
+    json.dump([{"@id": u["@id"], "reason": "proved"} for u in units], open(out(), "w"))
+else:
+    doc = re.search(r"(\S*REVIEW\.md)", prompt)
+    if doc:
+        open(doc.group(1), "w").write("prose\n")
+    json.dump([{"severity": "high", "title": "a real bug"}], open(out(), "w"))
 print(json.dumps({"type": "result", "subtype": "success", "is_error": False,
                   "result": "ok", "total_cost_usd": 0.1}))
 "#;
@@ -5435,6 +5443,23 @@ fn pma_run_reviews_a_path_with_the_bundled_library() {
     assert!(out.contains("written into its clone"), "{out}");
     let (_, err, success) = env.run(&["run", "review", "/nowhere/at/all"]);
     assert!(!success && err.contains("/nowhere/at/all"), "{err}");
+
+    // The added workflows run end to end on the same stand-in.
+    for name in ["security-review", "test-gaps"] {
+        let out = env.ok(&["run", name, "alpha"]);
+        assert!(out.contains("high  alpha  a real bug"), "{name}: {out}");
+    }
+    let out = env.ok(&["run", "project-brief", "alpha"]);
+    assert!(out.contains("1 brief(s)"), "{out}");
+    let notes = env.ok(&["note"]);
+    assert!(notes.contains("alpha (sh): says hello"), "{notes}");
+    let out = env.ok(&["run", "review-and-fix", "alpha"]);
+    assert!(out.contains("high  alpha  a real bug"), "{out}");
+    let review = env.ok(&["review"]);
+    assert!(
+        review.contains("ready") && review.contains("verify ok"),
+        "the fix passed verify and waits in review: {review}"
+    );
 }
 
 /// A review, then a confirm that keeps what it can prove, then a note.
@@ -5965,7 +5990,7 @@ fn the_documented_workflow_library_reads_as_documented() {
     let types = blocks(&section("## 6. The document", "### 6.1"))[0]["types"].clone();
     let library = section("## 15. A library", "## 16. Acceptance");
     let workflows: Vec<serde_json::Value> = blocks(&library);
-    assert_eq!(workflows.len(), 14, "the library's fourteen examples");
+    assert_eq!(workflows.len(), 19, "the library's nineteen examples");
     let named = |name: &str| {
         workflows
             .iter()
@@ -5987,6 +6012,11 @@ fn the_documented_workflow_library_reads_as_documented() {
         "portfolio-sweep",
         "todo-audit",
         "doc-drift",
+        "security-review",
+        "test-gaps",
+        "project-brief",
+        "fix-findings",
+        "review-and-fix",
     ];
     for w in &workflows {
         let name = w["name"].as_str().unwrap();

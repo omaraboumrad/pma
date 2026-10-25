@@ -57,6 +57,30 @@ const CATALOG: &[Entry] = &[
         model: Some("opus"),
     },
     Entry {
+        name: "security-review",
+        about: "Review for security faults; confirm each by tracing input to its sink",
+        runs: Runs::Workflow("security-review"),
+        model: Some("opus"),
+    },
+    Entry {
+        name: "test-gaps",
+        about: "Find code no test reaches and tests that cannot fail; confirm each",
+        runs: Runs::Workflow("test-gaps"),
+        model: Some("opus"),
+    },
+    Entry {
+        name: "review-and-fix",
+        about: "Review, confirm, then fix the critical and high findings; edits wait in `pma review`",
+        runs: Runs::Workflow("review-and-fix"),
+        model: Some("opus"),
+    },
+    Entry {
+        name: "project-brief",
+        about: "One note per project: what it does, for whom, in what",
+        runs: Runs::Workflow("project-brief"),
+        model: None,
+    },
+    Entry {
         name: "triage-issues",
         about: "Judge each open GitHub issue against the code, by severity",
         runs: Runs::Workflow("triage-issues"),
@@ -267,9 +291,13 @@ const TARGETABLE: [&str; 3] = ["project", "item", "signal"];
 /// name is left out, and said so.
 fn list() -> Result<()> {
     let store = Store::open_default()?;
+    // A library revision is replaced at the next run when `pma` ships
+    // another, so the bundled text is what would run.
     let (doc, from) = match store.active_workflow()? {
-        Some(r) => (r.document()?, format!("revision {}", r.revision)),
-        None => (
+        Some(r) if r.proposed_by != LIBRARY_BY => {
+            (r.document()?, format!("revision {}", r.revision))
+        }
+        _ => (
             workflow::Document::parse(workflow::LIBRARY)?,
             "the bundled library".to_string(),
         ),
@@ -487,7 +515,7 @@ fn print_outputs(store: &Store, doc: &workflow::Document, name: &str, instance: 
         rows.push(vec![
             field(&d, &["severity", "verdict"]),
             u.project.clone().unwrap_or_default(),
-            field(&d, &["title", "text"]),
+            field(&d, &["title", "text", "summary"]),
         ]);
         let reason = field(&d, &["reason"]);
         if !reason.is_empty() {

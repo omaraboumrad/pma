@@ -117,6 +117,20 @@
           "max": 30
         }
       }
+    },
+    "brief": {
+      "fields": {
+        "summary": {
+          "type": "line",
+          "required": true,
+          "max": 300
+        },
+        "stack": {
+          "type": "line",
+          "required": true,
+          "max": 100
+        }
+      }
     }
   },
   "workflow": [
@@ -696,6 +710,289 @@
         },
         {
           "from": "dedupe",
+          "to": "@output"
+        }
+      ]
+    },
+    {
+      "name": "security-review",
+      "in": "project",
+      "out": "finding",
+      "effects": [],
+      "params": {
+        "breadth": {
+          "type": "int",
+          "default": 20,
+          "max": 40
+        }
+      },
+      "caps": {
+        "max_units": 60,
+        "max_edits": 0
+      },
+      "nodes": [
+        {
+          "name": "review",
+          "op": "map",
+          "out": "0..n",
+          "in": "project",
+          "emits": "finding",
+          "max_units": "{$breadth}",
+          "task": "Review `{name}` for security faults: input that reaches a shell, a query, a path or a deserializer unchecked; secrets in the tree or in logs; permissions wider than needed; TLS or signature checks turned off; unsafe code; dependencies with a known advisory. Set `severity` by what an attacker gains. Cite file:line in `detail`. At most {$breadth} findings to {out}. Change no file."
+        },
+        {
+          "name": "confirm",
+          "op": "map",
+          "out": "0..1",
+          "in": "finding",
+          "emits": "finding",
+          "writes": [
+            "reason"
+          ],
+          "task": "The unit in {in} claims a security fault in `{@project}`. Trace the path from an entry point to the sink in the code. If it is reachable, write it to {out} with a one-line `reason` naming the entry point; otherwise write an empty list. Change nothing else."
+        },
+        {
+          "name": "dedupe",
+          "op": "reduce",
+          "via": "rule",
+          "rule": "dedupe",
+          "group_by": [
+            "title"
+          ],
+          "in": "finding",
+          "emits": "finding"
+        }
+      ],
+      "edges": [
+        {
+          "from": "@input",
+          "to": "review"
+        },
+        {
+          "from": "review",
+          "to": "confirm"
+        },
+        {
+          "from": "confirm",
+          "to": "dedupe"
+        },
+        {
+          "from": "dedupe",
+          "to": "@output"
+        }
+      ]
+    },
+    {
+      "name": "test-gaps",
+      "in": "project",
+      "out": "finding",
+      "effects": [],
+      "params": {
+        "breadth": {
+          "type": "int",
+          "default": 20,
+          "max": 40
+        }
+      },
+      "caps": {
+        "max_units": 60,
+        "max_edits": 0
+      },
+      "nodes": [
+        {
+          "name": "review",
+          "op": "map",
+          "out": "0..n",
+          "in": "project",
+          "emits": "finding",
+          "max_units": "{$breadth}",
+          "task": "Read `{name}`'s tests against its code. Report each public function, branch or error path no test reaches, and each test that asserts nothing or cannot fail. Prefer the paths a user hits first. Set `severity` by what would break unnoticed. Cite file:line in `detail`. At most {$breadth} findings to {out}. Change no file."
+        },
+        {
+          "name": "confirm",
+          "op": "map",
+          "out": "0..1",
+          "in": "finding",
+          "emits": "finding",
+          "writes": [
+            "reason"
+          ],
+          "task": "The unit in {in} claims a gap in `{@project}`'s tests. Search the tests for one that covers it. If none does, write it to {out} with a one-line `reason`; otherwise write an empty list. Change nothing else."
+        },
+        {
+          "name": "dedupe",
+          "op": "reduce",
+          "via": "rule",
+          "rule": "dedupe",
+          "group_by": [
+            "title"
+          ],
+          "in": "finding",
+          "emits": "finding"
+        }
+      ],
+      "edges": [
+        {
+          "from": "@input",
+          "to": "review"
+        },
+        {
+          "from": "review",
+          "to": "confirm"
+        },
+        {
+          "from": "confirm",
+          "to": "dedupe"
+        },
+        {
+          "from": "dedupe",
+          "to": "@output"
+        }
+      ]
+    },
+    {
+      "name": "project-brief",
+      "in": "project",
+      "out": "brief",
+      "effects": [
+        "writes"
+      ],
+      "params": {},
+      "caps": {
+        "max_units": 20,
+        "max_edits": 0
+      },
+      "nodes": [
+        {
+          "name": "describe",
+          "op": "map",
+          "out": "0..n",
+          "in": "project",
+          "emits": "brief",
+          "max_units": 1,
+          "task": "Read `{name}`: its README, its manifest and its entry points. Write one unit to {out}: `summary`, one sentence on what it does and for whom; `stack`, its language and main framework or runtime. Change no file."
+        },
+        {
+          "name": "note",
+          "op": "emit",
+          "in": "brief",
+          "sink": "note",
+          "action": "add",
+          "map": {
+            "text": "{@project} ({stack}): {summary}"
+          }
+        }
+      ],
+      "edges": [
+        {
+          "from": "@input",
+          "to": "describe"
+        },
+        {
+          "from": "describe",
+          "to": "note"
+        },
+        {
+          "from": "note",
+          "to": "@output"
+        }
+      ]
+    },
+    {
+      "name": "fix-findings",
+      "in": "finding",
+      "out": "finding",
+      "effects": [
+        "repo"
+      ],
+      "params": {},
+      "caps": {
+        "max_units": 40,
+        "max_edits": 10
+      },
+      "nodes": [
+        {
+          "name": "fix",
+          "op": "edit",
+          "in": "finding",
+          "check": "verify",
+          "task": "Fix this in `{@project}`, with a test where one is missing:\n\n{title}\n\n{detail}"
+        }
+      ],
+      "edges": [
+        {
+          "from": "@input",
+          "to": "fix"
+        },
+        {
+          "from": "fix",
+          "to": "@output"
+        }
+      ]
+    },
+    {
+      "name": "review-and-fix",
+      "in": "project",
+      "out": "finding",
+      "effects": [
+        "repo"
+      ],
+      "params": {
+        "severity": {
+          "type": "enum",
+          "default": "high",
+          "values": [
+            "critical",
+            "high",
+            "medium"
+          ]
+        }
+      },
+      "caps": {
+        "max_units": 120,
+        "max_edits": 8
+      },
+      "nodes": [
+        {
+          "name": "issues",
+          "op": "call",
+          "workflow": "find-issues",
+          "in": "project",
+          "with": {
+            "review_doc": "REVIEW.md",
+            "breadth": 20
+          }
+        },
+        {
+          "name": "repair",
+          "op": "call",
+          "workflow": "fix-findings",
+          "in": "finding",
+          "with": {}
+        }
+      ],
+      "edges": [
+        {
+          "from": "@input",
+          "to": "issues"
+        },
+        {
+          "from": "issues",
+          "to": "repair",
+          "when": {
+            "severity": [
+              "critical",
+              "{$severity}"
+            ]
+          }
+        },
+        {
+          "from": "issues",
+          "to": "@output",
+          "default": true
+        },
+        {
+          "from": "repair",
           "to": "@output"
         }
       ]

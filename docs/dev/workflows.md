@@ -276,6 +276,12 @@ A document may also be built by a Rhai script, which is a second way to write th
         "evidence": {"type": "line",  "required": true, "max": 500},
         "reason":   {"type": "lines", "max": 30}
       }
+    },
+    "brief": {
+      "fields": {
+        "summary": {"type": "line", "required": true, "max": 300},
+        "stack":   {"type": "line", "required": true, "max": 100}
+      }
     }
   },
   "workflow": [
@@ -1292,6 +1298,165 @@ Documentation that no longer matches the code: a README example the parser refus
   ]
 }
 ```
+
+### 15.16 `security-review(in: [Project], breadth = 20) -> [Finding] !pure`
+
+A review aimed at one class of fault. Asked for everything, a reviewer lists what it notices; asked for security alone, it traces input to the sinks. 15.1's shape, with a `confirm` that must find the path from an entry point, so a claim with none is dropped.
+
+```
+@input -> review -> confirm -> dedupe -> @output
+```
+
+```json
+{
+  "name": "security-review",
+  "in": "project", "out": "finding", "effects": [],
+  "params": {"breadth": {"type": "int", "default": 20, "max": 40}},
+  "caps": {"max_units": 60, "max_edits": 0},
+  "nodes": [
+    {"name": "review", "op": "map", "out": "0..n", "in": "project", "emits": "finding",
+     "max_units": "{$breadth}",
+     "task": "Review `{name}` for security faults: input that reaches a shell, a query, a path or a deserializer unchecked; secrets in the tree or in logs; permissions wider than needed; TLS or signature checks turned off; unsafe code; dependencies with a known advisory. Set `severity` by what an attacker gains. Cite file:line in `detail`. At most {$breadth} findings to {out}. Change no file."},
+    {"name": "confirm", "op": "map", "out": "0..1", "in": "finding", "emits": "finding",
+     "writes": ["reason"],
+     "task": "The unit in {in} claims a security fault in `{@project}`. Trace the path from an entry point to the sink in the code. If it is reachable, write it to {out} with a one-line `reason` naming the entry point; otherwise write an empty list. Change nothing else."},
+    {"name": "dedupe", "op": "reduce", "via": "rule", "rule": "dedupe",
+     "group_by": ["title"], "in": "finding", "emits": "finding"}
+  ],
+  "edges": [
+    {"from": "@input", "to": "review"},
+    {"from": "review", "to": "confirm"},
+    {"from": "confirm", "to": "dedupe"},
+    {"from": "dedupe", "to": "@output"}
+  ]
+}
+```
+
+Worst case: 1 review, 40 confirms.
+
+### 15.17 `test-gaps(in: [Project], breadth = 20) -> [Finding] !pure`
+
+What breaks unnoticed. `ensemble-review` (15.2) has a tests node among three; alone it costs a third, and its `confirm` searches the suite for a covering test rather than judging prose.
+
+```
+@input -> review -> confirm -> dedupe -> @output
+```
+
+```json
+{
+  "name": "test-gaps",
+  "in": "project", "out": "finding", "effects": [],
+  "params": {"breadth": {"type": "int", "default": 20, "max": 40}},
+  "caps": {"max_units": 60, "max_edits": 0},
+  "nodes": [
+    {"name": "review", "op": "map", "out": "0..n", "in": "project", "emits": "finding",
+     "max_units": "{$breadth}",
+     "task": "Read `{name}`'s tests against its code. Report each public function, branch or error path no test reaches, and each test that asserts nothing or cannot fail. Prefer the paths a user hits first. Set `severity` by what would break unnoticed. Cite file:line in `detail`. At most {$breadth} findings to {out}. Change no file."},
+    {"name": "confirm", "op": "map", "out": "0..1", "in": "finding", "emits": "finding",
+     "writes": ["reason"],
+     "task": "The unit in {in} claims a gap in `{@project}`'s tests. Search the tests for one that covers it. If none does, write it to {out} with a one-line `reason`; otherwise write an empty list. Change nothing else."},
+    {"name": "dedupe", "op": "reduce", "via": "rule", "rule": "dedupe",
+     "group_by": ["title"], "in": "finding", "emits": "finding"}
+  ],
+  "edges": [
+    {"from": "@input", "to": "review"},
+    {"from": "review", "to": "confirm"},
+    {"from": "confirm", "to": "dedupe"},
+    {"from": "dedupe", "to": "@output"}
+  ]
+}
+```
+
+Worst case: 1 review, 40 confirms.
+
+### 15.18 `project-brief(in: [Project]) -> [Brief] !writes`
+
+One line per project, for a portfolio nobody holds in their head: what it does, for whom, in what. A note per project, so `pma note` is the index. One unit per project, so the worst case is one run each.
+
+```
+@input -> describe => note -> @output
+```
+
+```json
+{
+  "name": "project-brief",
+  "in": "project", "out": "brief", "effects": ["writes"],
+  "params": {},
+  "caps": {"max_units": 20, "max_edits": 0},
+  "nodes": [
+    {"name": "describe", "op": "map", "out": "0..n", "in": "project", "emits": "brief",
+     "max_units": 1,
+     "task": "Read `{name}`: its README, its manifest and its entry points. Write one unit to {out}: `summary`, one sentence on what it does and for whom; `stack`, its language and main framework or runtime. Change no file."},
+    {"name": "note", "op": "emit", "in": "brief", "sink": "note", "action": "add",
+     "map": {"text": "{@project} ({stack}): {summary}"}}
+  ],
+  "edges": [
+    {"from": "@input", "to": "describe"},
+    {"from": "describe", "to": "note"},
+    {"from": "note", "to": "@output"}
+  ]
+}
+```
+
+### 15.19 `fix-findings(in: [Finding]) -> [Finding] !repo`
+
+15.3 without the lap and the retry, which the runtime does not take yet. One edit per finding, gated by `verify`; every edit waits in `pma review`. No audit node: the review is the audit.
+
+```
+@input -> fix -> @output
+```
+
+```json
+{
+  "name": "fix-findings",
+  "in": "finding", "out": "finding", "effects": ["repo"],
+  "params": {},
+  "caps": {"max_units": 40, "max_edits": 10},
+  "nodes": [
+    {"name": "fix", "op": "edit", "in": "finding", "check": "verify",
+     "task": "Fix this in `{@project}`, with a test where one is missing:\n\n{title}\n\n{detail}"}
+  ],
+  "edges": [
+    {"from": "@input", "to": "fix"},
+    {"from": "fix", "to": "@output"}
+  ]
+}
+```
+
+Worst case: 10 edits.
+
+### 15.20 `review-and-fix(in: [Project], severity = "high") -> [Finding] !repo`
+
+15.10 made runnable: find, confirm, then fix the severe ones. A finding below the bar still reaches the output, so the run prints it. `severity` is the bar, and critical always clears it.
+
+```
+@input -> call find-issues -+-> call fix-findings [severity critical or {$severity}] -> @output
+                             \-> @output (default)
+```
+
+```json
+{
+  "name": "review-and-fix",
+  "in": "project", "out": "finding", "effects": ["repo"],
+  "params": {"severity": {"type": "enum", "default": "high",
+                          "values": ["critical", "high", "medium"]}},
+  "caps": {"max_units": 120, "max_edits": 8},
+  "nodes": [
+    {"name": "issues", "op": "call", "workflow": "find-issues", "in": "project",
+     "with": {"review_doc": "REVIEW.md", "breadth": 20}},
+    {"name": "repair", "op": "call", "workflow": "fix-findings", "in": "finding",
+     "with": {}}
+  ],
+  "edges": [
+    {"from": "@input", "to": "issues"},
+    {"from": "issues", "to": "repair", "when": {"severity": ["critical", "{$severity}"]}},
+    {"from": "issues", "to": "@output", "default": true},
+    {"from": "repair", "to": "@output"}
+  ]
+}
+```
+
+Worst case: 15.1's 41 runs, then 8 edits.
 
 ## 16. Acceptance
 

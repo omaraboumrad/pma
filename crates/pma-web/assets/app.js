@@ -296,7 +296,7 @@ function draw() {
           role: "tab",
           id: `page-${pi}`,
           "aria-selected": String(pi === at),
-          "aria-controls": `pane-${pi}`,
+          "aria-controls": `card-${pi}`,
           onclick: () => { S.pane[S.tab] = pi; draw(); },
         }, p.title, el("span", { class: "count" }, p.items.length)))));
       content.append(card(ps[at], at));
@@ -328,7 +328,7 @@ function shownNode(c, col) {
 function card(p, pi) {
   const focused = pi === (S.pane[S.tab] || 0);
   const id = `pane-${pi}`;
-  const box = el("section", { class: `card ${focused ? "focused" : ""}`, "aria-labelledby": id },
+  const box = el("section", { class: `card ${focused ? "focused" : ""}`, id: `card-${pi}`, "aria-labelledby": id },
     el("header", { class: "card-head" }, el("h2", { id }, p.title), el("span", { class: "count" }, p.items.length)));
   if (!p.items.length) {
     box.append(el("p", { class: "empty" }, p.empty));
@@ -593,8 +593,9 @@ function onKey(e) {
   if ($("dialog").open) return;
   if (e.ctrlKey || e.metaKey || e.altKey) return;
   if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
-  // Tab moves between panes only where the table binds it; elsewhere it
-  // moves the browser's focus as usual.
+  // Tab moves between panes only where the table binds it and nothing has
+  // focus; from a button or a link it moves the browser's focus as usual.
+  if (e.key === "Tab" && e.target !== document.body) return;
   const b = lookup(e.key);
   if (!b) return;
   if (e.key === "Enter" && e.target instanceof HTMLButtonElement) return;

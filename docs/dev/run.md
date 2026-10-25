@@ -10,6 +10,10 @@
 | `ensemble-review` | `ensemble-review` | `opus` |
 | `doc-drift` | `doc-drift` | `opus` |
 | `todo-audit` | `todo-audit` | `opus` |
+| `security-review` | `security-review` | `opus` |
+| `test-gaps` | `test-gaps` | `opus` |
+| `review-and-fix` | `review-and-fix` | `opus` |
+| `project-brief` | `project-brief` | the settings |
 | `triage-issues` | `triage-issues` | the settings |
 | `fix-ci` | `pma dispatch <project>:ci` | the settings |
 | `deps-upgrade` | `pma dispatch <project>:deps` | the settings |

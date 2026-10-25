@@ -302,7 +302,9 @@ pub const BINDINGS: &[Binding] = &[
     bind("k", Command::Up, "up"),
     bind("ArrowUp", Command::Up, "up"),
     bind("g", Command::First, "first"),
+    bind("Home", Command::First, "first"),
     bind("G", Command::Last, "last"),
+    bind("End", Command::Last, "last"),
     Binding {
         tabs: PANES,
         ..bind("Tab", Command::NextPane, "next list")

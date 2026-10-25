@@ -2989,6 +2989,7 @@ fn workflow_command(action: Option<WorkflowAction>) -> Result<()> {
                         store.reopen_instance(id, &args.to_string())?;
                         println!("instance {id}: caps raised, recorded on the instance");
                     }
+                    w = w.with_arguments(&w.arguments(&args));
                     (id, args)
                 }
                 None => {
@@ -3004,6 +3005,9 @@ fn workflow_command(action: Option<WorkflowAction>) -> Result<()> {
                     if local {
                         args["@local"] = serde_json::Value::Bool(true);
                     }
+                    // Guards hold against unit data alone, so the arguments
+                    // go into them here, before any unit enters the graph.
+                    w = w.with_arguments(&w.arguments(&args));
                     let units = pass::root_units(&store, &doc, &name, &names)?;
                     // The per-unit ceiling was weighed at activation. What a
                     // pass spends is bounded by `batch_budget` and by the plan
