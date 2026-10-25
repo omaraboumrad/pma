@@ -2,7 +2,7 @@
 //! changed since the scan before. `Store::save_scan` writes both; this module
 //! decides what counts as a change.
 
-use crate::scan::Ci;
+use crate::scan::{Ci, Fault};
 
 /// Scans kept. An older one is deleted with its rows.
 pub const KEPT: i64 = 100;
@@ -19,9 +19,10 @@ pub enum Change {
     CiFailing(Vec<String>),
     /// CI no longer fails.
     CiPassing,
-    /// Lint errors or a scan error, where there were none.
-    Broken(String),
-    Mended,
+    /// A fault the scan before did not find, with its cause.
+    Fault(Fault, String),
+    /// A fault the scan before found is gone.
+    Mended(Fault),
     Opened {
         priority: String,
         text: String,
@@ -41,8 +42,8 @@ impl Change {
             Change::Absent => "absent",
             Change::CiFailing(_) => "CI failing",
             Change::CiPassing => "CI passing",
-            Change::Broken(_) => "broken",
-            Change::Mended => "mended",
+            Change::Fault(f, _) => f.name(),
+            Change::Mended(_) => "mended",
             Change::Opened { .. } => "opened",
             Change::Closed { .. } => "closed",
         }
@@ -52,7 +53,7 @@ impl Change {
     pub fn good(&self) -> bool {
         matches!(
             self,
-            Change::CiPassing | Change::Mended | Change::Closed { .. } | Change::Returned
+            Change::CiPassing | Change::Mended(_) | Change::Closed { .. } | Change::Returned
         )
     }
 
@@ -60,14 +61,15 @@ impl Change {
     pub fn bad(&self) -> bool {
         matches!(
             self,
-            Change::CiFailing(_) | Change::Broken(_) | Change::Absent
+            Change::CiFailing(_) | Change::Fault(..) | Change::Absent
         )
     }
 
     pub fn detail(&self) -> String {
         match self {
             Change::CiFailing(names) => names.join(", "),
-            Change::Broken(why) => why.clone(),
+            Change::Fault(_, why) => why.clone(),
+            Change::Mended(f) => f.name().into(),
             Change::Opened { priority, text } | Change::Closed { priority, text } => {
                 format!("{priority}: {text}")
             }
@@ -83,8 +85,8 @@ impl Change {
             Change::Absent => ("absent", None, String::new()),
             Change::CiFailing(names) => ("ci_failing", None, names.join("\n")),
             Change::CiPassing => ("ci_passing", None, String::new()),
-            Change::Broken(why) => ("broken", None, why.clone()),
-            Change::Mended => ("mended", None, String::new()),
+            Change::Fault(f, why) => (f.column(), None, why.clone()),
+            Change::Mended(f) => ("mended", None, f.column().into()),
             Change::Opened { priority, text } => ("opened", Some(priority), text.clone()),
             Change::Closed { priority, text } => ("closed", Some(priority), text.clone()),
         }
@@ -98,8 +100,7 @@ impl Change {
             "absent" => Change::Absent,
             "ci_failing" => Change::CiFailing(detail.lines().map(String::from).collect()),
             "ci_passing" => Change::CiPassing,
-            "broken" => Change::Broken(detail),
-            "mended" => Change::Mended,
+            "mended" => Change::Mended(Fault::from_column(&detail)?),
             "opened" => Change::Opened {
                 priority,
                 text: detail,
@@ -108,7 +109,7 @@ impl Change {
                 priority,
                 text: detail,
             },
-            _ => return None,
+            kind => Change::Fault(Fault::from_column(kind)?, detail),
         })
     }
 }
@@ -128,7 +129,8 @@ pub struct Scan {
     pub full: bool,
     pub projects: i64,
     pub failing: i64,
-    pub broken: i64,
+    /// Projects with each fault, in `Fault::ALL` order.
+    pub faults: [i64; 7],
     /// Open items in the projects it read.
     pub open: i64,
     pub opened: i64,
@@ -149,22 +151,18 @@ pub fn ci_change(before: Option<&Ci>, after: &Ci) -> Option<Change> {
     }
 }
 
-/// Why a project counts as broken, or `None`.
-pub fn broken(lint_errors: i64, scan_error: Option<&str>) -> Option<String> {
-    match (lint_errors, scan_error) {
-        (_, Some(e)) => Some(e.lines().next().unwrap_or_default().to_string()),
-        (0, None) => None,
-        (1, None) => Some("1 lint error".into()),
-        (n, None) => Some(format!("{n} lint errors")),
-    }
-}
-
-pub fn broken_change(before: Option<&str>, after: Option<&str>) -> Option<Change> {
-    match (before, after) {
-        (None, Some(why)) => Some(Change::Broken(why.to_string())),
-        (Some(_), None) => Some(Change::Mended),
-        _ => None,
-    }
+/// The faults found or gone between two scans' fault lists.
+pub fn fault_changes(before: &[(Fault, String)], after: &[(Fault, String)]) -> Vec<Change> {
+    let has = |list: &[(Fault, String)], f: Fault| list.iter().any(|(g, _)| *g == f);
+    let found = after
+        .iter()
+        .filter(|(f, _)| !has(before, *f))
+        .map(|(f, why)| Change::Fault(*f, why.clone()));
+    let gone = before
+        .iter()
+        .filter(|(f, _)| !has(after, *f))
+        .map(|(f, _)| Change::Mended(*f));
+    found.chain(gone).collect()
 }
 
 /// When a project's CI began failing.
@@ -238,21 +236,21 @@ mod tests {
         assert_eq!(ci_change(Some(&Ci::Passing), &Ci::NoRuns), None);
     }
 
+    /// A fault is news when it appears or goes; a new cause for a fault
+    /// already found is not.
     #[test]
-    fn broken_names_the_first_reason() {
-        assert_eq!(broken(0, None), None);
-        assert_eq!(broken(1, None).as_deref(), Some("1 lint error"));
-        assert_eq!(broken(3, None).as_deref(), Some("3 lint errors"));
+    fn a_fault_changes_when_it_appears_or_goes() {
+        let lint = |why: &str| (Fault::TodoLint, why.to_string());
+        let git = [(Fault::GitUnreadable, "git status: timed out".to_string())];
+        assert_eq!(fault_changes(&[], &[]), []);
+        assert_eq!(fault_changes(&[lint("a")], &[lint("b")]), []);
         assert_eq!(
-            broken(3, Some("git status: timed out\nmore")).as_deref(),
-            Some("git status: timed out")
+            fault_changes(&[lint("a")], &git),
+            [
+                Change::Fault(Fault::GitUnreadable, "git status: timed out".into()),
+                Change::Mended(Fault::TodoLint),
+            ]
         );
-        assert_eq!(
-            broken_change(None, Some("2 lint errors")),
-            Some(Change::Broken("2 lint errors".into()))
-        );
-        assert_eq!(broken_change(Some("x"), None), Some(Change::Mended));
-        assert_eq!(broken_change(Some("x"), Some("y")), None);
     }
 
     #[test]
@@ -285,8 +283,9 @@ mod tests {
             Change::Absent,
             Change::CiFailing(vec!["a".into(), "b".into()]),
             Change::CiPassing,
-            Change::Broken("2 lint errors".into()),
-            Change::Mended,
+            Change::Fault(Fault::TodoLint, "line 2: the item has no text".into()),
+            Change::Fault(Fault::ScanPartial, "git log: timed out".into()),
+            Change::Mended(Fault::GitUnreadable),
             Change::Opened {
                 priority: "High".into(),
                 text: "x".into(),

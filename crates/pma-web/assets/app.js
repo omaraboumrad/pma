@@ -285,8 +285,25 @@ function draw() {
         el("div", { class: "stat" }, el("dt", {}, label(k)), el("dd", { class: `tone-${c.tone}` }, ...inline(c.text))))));
     }
     const ps = panes();
-    if (ps.length === 4) content.className = "content grid";
-    ps.forEach((p, pi) => content.append(card(p, pi)));
+    if (S.tab === "status" && ps.length > 1) {
+      // One table a page: four side by side each scroll both ways.
+      const at = S.pane[S.tab] || 0;
+      content.className = "content paged";
+      content.append(el("div", { class: "pages", role: "tablist", "aria-label": "Tables" }, ps.map((p, pi) =>
+        el("button", {
+          class: "page-tab",
+          type: "button",
+          role: "tab",
+          id: `page-${pi}`,
+          "aria-selected": String(pi === at),
+          "aria-controls": `pane-${pi}`,
+          onclick: () => { S.pane[S.tab] = pi; draw(); },
+        }, p.title, el("span", { class: "count" }, p.items.length)))));
+      content.append(card(ps[at], at));
+    } else {
+      if (ps.length === 4) content.className = "content grid";
+      ps.forEach((p, pi) => content.append(card(p, pi)));
+    }
   }
   drawDrawer();
 }

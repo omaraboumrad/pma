@@ -305,9 +305,12 @@ fn a_scan_reports_what_changed_and_history_keeps_it() {
     git(&beta, &["init", "-q"], None);
     let second = ok(&home, &["scan", "--offline"]);
     assert!(second.contains("since the scan before:"), "{second}");
-    assert!(second.contains("alpha  broken"), "{second}");
     assert!(
-        second.contains("alpha  items   1 opened, 1 closed"),
+        second.contains("alpha  TODO lint  line 8: a second `#` heading"),
+        "the fault is named, with its first error: {second}"
+    );
+    assert!(
+        second.contains("alpha  items      1 opened, 1 closed"),
         "{second}"
     );
     assert!(second.contains("beta   new"), "{second}");
@@ -319,8 +322,9 @@ fn a_scan_reports_what_changed_and_history_keeps_it() {
     assert!(lines[1].starts_with("2 "), "newest first: {listed}");
     let changed = ok(&home, &["history", "last"]);
     assert!(changed.starts_with("scan 2, "), "{changed}");
-    assert!(changed.contains("opened  high: new one"), "{changed}");
-    assert!(changed.contains("closed  high: finish"), "{changed}");
+    assert!(changed.contains("1 TODO lint, 2 open items"), "{changed}");
+    assert!(changed.contains("opened     high: new one"), "{changed}");
+    assert!(changed.contains("closed     high: finish"), "{changed}");
     assert!(ok(&home, &["history", "1"]).contains("no change since the scan before"));
     let (_, err, success) = pma_in(&home, &["history", "9"]);
     assert!(!success && err.contains("no scan 9"), "{err}");

@@ -227,14 +227,22 @@ Measuring takes 0.6s (uv) to 10s (go) per project, and 44s for 80 repos on 2026-
 | Order | State | When |
 |-|-|-|
 | 1 | failing CI | a workflow's latest decisive run on the default branch failed |
-| 2 | broken | `TODO.md` has lint errors, or the scan could not read the project |
-| 3 | unpublished | commits not pushed, or `pma/` branches no open run owns |
-| 4 | critical | open items under `## Critical` |
-| 5 | stale deps | a measurement within `deps.days` finds the lock can move, and the lock has not changed for `deps.days` |
-| 6 | idle | no counted commit within the tier's horizon, or none at all |
-| 7 | clear | none of the above |
+| 2 | git settings changed | a failed run left hooks or git settings changed; pma runs no git there |
+| 3 | git unreadable | `git status` failed or timed out; nothing after it was read |
+| 4 | CI unknown | `gh` failed or timed out, or the default branch is unknown; not offline or off GitHub |
+| 5 | unpublished | commits not pushed, or `pma/` branches no open run owns |
+| 6 | unpublished unknown | the upstream is gone, or the `pma/` branches could not be listed |
+| 7 | critical | open items under `## Critical` |
+| 8 | TODO unreadable | `TODO.md` exists but could not be read |
+| 9 | TODO lint | `TODO.md` has lint errors; the first is named |
+| 10 | stale deps | a measurement within `deps.days` finds the lock can move, and the lock has not changed for `deps.days` |
+| 11 | scan partial | another git call failed or timed out; the detail names each fact lost: activity, lock age, task ages, origin |
+| 12 | idle | no counted commit within the tier's horizon, or none at all |
+| 13 | clear | none of the above |
 
-The order is what to do first: a failing check blocks the repository, broken facts make the rest unreliable, unpublished work is at risk, then the work itself, then upkeep. A signal not measured, such as CI offline or dependencies never counted, places a project in no state. Changed files alone place it nowhere either, since an uncommitted `TODO.md` edit is routine. `pma status --explain` lists every state a project is in and what put it there.
+A fault whose missing fact could hide a state ranks just below that state: a known state outranks a possible one. The git faults hide every state, so they rank first. A git call fails as an answer only where `git status --porcelain=v2 --branch` says it will: no commit yet, or no upstream; no origin is also an answer. Any other failure loses its fact.
+
+The order is what to do first: a failing check blocks the repository, unpublished work is at risk, then the work itself, then upkeep. A signal not measured, such as CI offline or dependencies never counted, places a project in no state. Changed files alone place it nowhere either, since an uncommitted `TODO.md` edit is routine. `pma status --explain` lists every state a project is in and what put it there.
 
 It replaces a health score, `tier * sum(w_i * s_i) / sum(w_i)` over five signals. The score prompted no action, its five weights were never calibrated, it counted again signals the matrix already lists as tasks, and `status` was its only reader. Migration 27 drops the stored `weights.*` settings.
 

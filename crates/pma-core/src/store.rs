@@ -17,13 +17,13 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::class::Class;
 use crate::complexity::Features;
 use crate::route::{Approval, Policy};
-use crate::scan::{Ci, Facts};
+use crate::scan::{Ci, Facts, Fault};
 use crate::todo::Priority;
 use crate::worker::{Parser, Worker};
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
-const VERSION: i64 = 39;
+const VERSION: i64 = 40;
 
 const SCHEMA: &str = "
 CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -318,6 +318,61 @@ CREATE TABLE IF NOT EXISTS ci_runs (
     url TEXT NOT NULL,
     PRIMARY KEY (project, workflow)
 );
+";
+
+/// Version 40. Each fault a scan found, by kind, in place of `scan_error`:
+/// one free-text column could not say whether git, the file or a timeout
+/// failed. Rows from before are classified by the text the scan wrote; a
+/// `mended` change names the fault it mends, taken from the change that
+/// found it, and one with none to name is dropped.
+const SCAN_FAULTS: &str = "
+CREATE TABLE IF NOT EXISTS project_faults (
+    project TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,
+    kind TEXT NOT NULL,
+    detail TEXT NOT NULL,
+    PRIMARY KEY (project, kind)
+);
+CREATE TABLE IF NOT EXISTS scan_faults (
+    scan INTEGER NOT NULL REFERENCES scans(id) ON DELETE CASCADE,
+    project TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    detail TEXT NOT NULL,
+    PRIMARY KEY (scan, project, kind)
+);
+CREATE TEMP VIEW fault_kind (ord, prefix, kind) AS
+ VALUES (1, 'the repository''s hooks or git settings changed%', 'git_settings_changed'),
+        (2, 'git status:%', 'git_unreadable'),
+        (3, 'TODO.md:%', 'todo_unreadable'),
+        (4, '%lint error%', 'todo_lint'),
+        (5, '%git rev-list:%', 'unpublished_unknown'),
+        (6, '%git for-each-ref:%', 'unpublished_unknown');
+INSERT OR IGNORE INTO project_faults (project, kind, detail)
+ SELECT name, coalesce((SELECT kind FROM fault_kind WHERE scan_error LIKE prefix ORDER BY ord LIMIT 1),
+                       'scan_partial'), scan_error
+ FROM projects WHERE scan_error IS NOT NULL;
+INSERT OR IGNORE INTO project_faults (project, kind, detail)
+ SELECT name, 'todo_lint', lint_errors || iif(lint_errors = 1, ' lint error', ' lint errors')
+ FROM projects WHERE lint_errors > 0;
+INSERT OR IGNORE INTO scan_faults (scan, project, kind, detail)
+ SELECT scan, project, coalesce((SELECT kind FROM fault_kind WHERE scan_error LIKE prefix ORDER BY ord LIMIT 1),
+                                'scan_partial'), scan_error
+ FROM scan_projects WHERE scan_error IS NOT NULL;
+INSERT OR IGNORE INTO scan_faults (scan, project, kind, detail)
+ SELECT scan, project, 'todo_lint', lint_errors || iif(lint_errors = 1, ' lint error', ' lint errors')
+ FROM scan_projects WHERE lint_errors > 0;
+UPDATE scan_changes
+ SET kind = coalesce((SELECT kind FROM fault_kind WHERE detail LIKE prefix ORDER BY ord LIMIT 1), 'scan_partial')
+ WHERE kind = 'broken';
+UPDATE scan_changes SET detail = coalesce(
+    (SELECT b.kind FROM scan_changes b
+      WHERE b.project = scan_changes.project AND b.scan < scan_changes.scan
+        AND b.kind IN (SELECT kind FROM fault_kind UNION SELECT 'scan_partial')
+      ORDER BY b.scan DESC LIMIT 1), '')
+ WHERE kind = 'mended' AND detail = '';
+DELETE FROM scan_changes WHERE kind = 'mended' AND detail = '';
+DROP VIEW fault_kind;
+ALTER TABLE projects DROP COLUMN scan_error;
+ALTER TABLE scan_projects DROP COLUMN scan_error;
 ";
 
 /// Version 39. Seeds `refresh`, the worker that runs `pma deps refresh`.
@@ -631,28 +686,53 @@ ALTER TABLE projects ADD COLUMN slug TEXT;
 /// A project's state as the history compares it.
 struct ScanState {
     ci: Ci,
-    lint_errors: i64,
-    scan_error: Option<String>,
+    faults: Vec<(Fault, String)>,
 }
 
 /// Every scanned project's state, by name. A row a tier made before any
 /// scan read the project has no state to compare against.
 fn scan_state(conn: &Connection) -> Result<HashMap<String, ScanState>> {
-    let mut stmt = conn.prepare(
-        "SELECT name, ci, ci_detail, lint_errors, scan_error FROM projects
-         WHERE scanned_at IS NOT NULL",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT name, ci, ci_detail FROM projects WHERE scanned_at IS NOT NULL")?;
     let rows = stmt.query_map([], |r| {
         Ok((
             r.get::<_, String>(0)?,
             ScanState {
                 ci: Ci::from_columns(&r.get::<_, String>(1)?, r.get(2)?),
-                lint_errors: r.get(3)?,
-                scan_error: r.get(4)?,
+                faults: Vec::new(),
             },
         ))
     })?;
-    Ok(rows.collect::<rusqlite::Result<_>>()?)
+    let mut states: HashMap<String, ScanState> = rows.collect::<rusqlite::Result<_>>()?;
+    for (project, faults) in project_faults(conn)? {
+        if let Some(s) = states.get_mut(&project) {
+            s.faults = faults;
+        }
+    }
+    Ok(states)
+}
+
+/// Each project's faults, worst first.
+fn project_faults(conn: &Connection) -> Result<HashMap<String, Vec<(Fault, String)>>> {
+    let mut stmt = conn.prepare("SELECT project, kind, detail FROM project_faults")?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut out: HashMap<String, Vec<(Fault, String)>> = HashMap::new();
+    for row in rows {
+        let (project, kind, detail) = row?;
+        if let Some(f) = Fault::from_column(&kind) {
+            out.entry(project).or_default().push((f, detail));
+        }
+    }
+    for faults in out.values_mut() {
+        faults.sort_by_key(|(f, _)| *f);
+    }
+    Ok(out)
 }
 
 /// The last CI state an earlier scan knew for a project.
@@ -697,7 +777,8 @@ pub struct ProjectRow {
     pub ci: Ci,
     /// Each failing workflow's latest failed run, as `(workflow, url)`.
     pub ci_runs: Vec<(String, String)>,
-    pub scan_error: Option<String>,
+    /// Each fault the last scan found, worst first, with its cause.
+    pub faults: Vec<(Fault, String)>,
     /// Outdated dependencies at the last measurement; `None` if never measured.
     pub deps: Option<i64>,
     /// One `ecosystem: name current -> latest` per line.
@@ -897,6 +978,7 @@ impl Store {
                     CI_RUNS,
                     PROJECT_DEPS,
                     REFRESH_WORKER,
+                    SCAN_FAULTS,
                 ];
                 let tx = conn.unchecked_transaction()?;
                 for step in &steps[version as usize..] {
@@ -1119,7 +1201,7 @@ impl Store {
     pub fn projects(&self) -> Result<Vec<ProjectRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT name, path, tier, scanned_at, has_todo, lint_errors, dirty, ahead,
-                    last_activity, ci, ci_detail, scan_error, deps, deps_detail, deps_at,
+                    last_activity, ci, ci_detail, deps, deps_detail, deps_at,
                     leftover, slug, absent_since, d.held_back, d.lock_at
              FROM projects LEFT JOIN project_deps d ON d.project = projects.name
              ORDER BY name",
@@ -1136,16 +1218,16 @@ impl Store {
                 ahead: r.get(7)?,
                 last_activity: r.get(8)?,
                 ci: Ci::from_columns(&r.get::<_, String>(9)?, r.get::<_, String>(10)?),
-                scan_error: r.get(11)?,
-                deps: r.get(12)?,
-                deps_detail: r.get(13)?,
-                deps_at: r.get(14)?,
-                leftover: r.get(15)?,
-                slug: r.get(16)?,
-                absent_since: r.get(17)?,
-                held_back: r.get(18)?,
-                lock_at: r.get(19)?,
+                deps: r.get(11)?,
+                deps_detail: r.get(12)?,
+                deps_at: r.get(13)?,
+                leftover: r.get(14)?,
+                slug: r.get(15)?,
+                absent_since: r.get(16)?,
+                held_back: r.get(17)?,
+                lock_at: r.get(18)?,
                 ci_runs: Vec::new(),
+                faults: Vec::new(),
             })
         })?;
         let mut rows: Vec<ProjectRow> = rows.collect::<rusqlite::Result<_>>()?;
@@ -1160,6 +1242,10 @@ impl Store {
             if let Some(row) = rows.iter_mut().find(|r| r.name == project) {
                 row.ci_runs.push((workflow, url));
             }
+        }
+        let mut faults = project_faults(&self.conn)?;
+        for row in &mut rows {
+            row.faults = faults.remove(&row.name).unwrap_or_default();
         }
         Ok(rows)
     }
@@ -1222,11 +1308,38 @@ impl Store {
                 (Some(_), true) => changes.push((f.name.clone(), Change::Returned)),
                 _ => {}
             }
+            // What this scan did not read keeps the last scan's fault: an
+            // unread file its lint errors, as its tasks; CI not asked, its
+            // `CiUnknown`.
+            let keep_lint = f.held || f.todo_unread;
+            let keep_ci = !f.ci_read;
+            tx.execute(
+                "DELETE FROM project_faults WHERE project = ?1
+                    AND NOT (kind = ?2 AND ?3) AND NOT (kind = ?4 AND ?5)",
+                params![
+                    f.name,
+                    Fault::TodoLint.column(),
+                    keep_lint,
+                    Fault::CiUnknown.column(),
+                    keep_ci
+                ],
+            )?;
+            let save_faults = |tx: &rusqlite::Transaction| -> rusqlite::Result<()> {
+                for (fault, why) in &f.faults {
+                    tx.execute(
+                        "INSERT OR REPLACE INTO project_faults (project, kind, detail)
+                         VALUES (?1, ?2, ?3)",
+                        params![f.name, fault.column(), why],
+                    )?;
+                }
+                Ok(())
+            };
             if f.held {
                 tx.execute(
-                    "UPDATE projects SET scan_error = ?2, absent_since = NULL WHERE name = ?1",
-                    params![f.name, f.error],
+                    "UPDATE projects SET absent_since = NULL WHERE name = ?1",
+                    [&f.name],
                 )?;
+                save_faults(&tx)?;
                 continue;
             }
             let (ci, ci_detail) = f.ci.to_columns();
@@ -1241,16 +1354,16 @@ impl Store {
                 .count() as i64;
             tx.execute(
                 "INSERT INTO projects (name, path, scanned_at, has_todo, lint_errors, dirty, ahead,
-                                       last_activity, ci, ci_detail, scan_error, leftover, slug)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                                       last_activity, ci, ci_detail, leftover, slug)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                  ON CONFLICT (name) DO UPDATE SET
                     path = excluded.path, scanned_at = excluded.scanned_at,
-                    has_todo = CASE WHEN ?14 THEN projects.has_todo ELSE excluded.has_todo END,
-                    lint_errors = CASE WHEN ?14 THEN projects.lint_errors
+                    has_todo = CASE WHEN ?13 THEN projects.has_todo ELSE excluded.has_todo END,
+                    lint_errors = CASE WHEN ?13 THEN projects.lint_errors
                                        ELSE excluded.lint_errors END,
                     dirty = excluded.dirty, ahead = excluded.ahead,
                     last_activity = excluded.last_activity, ci = excluded.ci,
-                    ci_detail = excluded.ci_detail, scan_error = excluded.scan_error,
+                    ci_detail = excluded.ci_detail,
                     leftover = excluded.leftover, slug = excluded.slug,
                     absent_since = NULL",
                 params![
@@ -1264,12 +1377,12 @@ impl Store {
                     f.last_activity,
                     ci,
                     ci_detail,
-                    f.error,
                     leftover,
                     f.slug,
                     f.todo_unread,
                 ],
             )?;
+            save_faults(&tx)?;
             tx.execute("DELETE FROM ci_runs WHERE project = ?1", [&f.name])?;
             for (workflow, url) in &f.ci_runs {
                 tx.execute(
@@ -1391,11 +1504,18 @@ impl Store {
             };
             let (ci, detail) = state.ci.to_columns();
             tx.execute(
-                "INSERT INTO scan_projects (scan, project, ci, ci_detail, lint_errors, scan_error, open)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6,
+                "INSERT INTO scan_projects (scan, project, ci, ci_detail, lint_errors, open)
+                 VALUES (?1, ?2, ?3, ?4,
+                         (SELECT lint_errors FROM projects WHERE name = ?2),
                          (SELECT count(*) FROM tasks WHERE project = ?2))",
-                params![scan, f.name, ci, detail, state.lint_errors, state.scan_error],
+                params![scan, f.name, ci, detail],
             )?;
+            for (fault, why) in &state.faults {
+                tx.execute(
+                    "INSERT INTO scan_faults (scan, project, kind, detail) VALUES (?1, ?2, ?3, ?4)",
+                    params![scan, f.name, fault.column(), why],
+                )?;
+            }
             let Some(was) = before.get(&f.name) else {
                 continue;
             };
@@ -1403,13 +1523,10 @@ impl Store {
                 Ci::Unknown(_) => last_known_ci(&tx, &f.name, scan)?,
                 ci => Some(ci.clone()),
             };
-            let broke = history::broken_change(
-                history::broken(was.lint_errors, was.scan_error.as_deref()).as_deref(),
-                history::broken(state.lint_errors, state.scan_error.as_deref()).as_deref(),
-            );
-            for c in [history::ci_change(known_ci.as_ref(), &state.ci), broke]
+            let faults = history::fault_changes(&was.faults, &state.faults);
+            for c in history::ci_change(known_ci.as_ref(), &state.ci)
                 .into_iter()
-                .flatten()
+                .chain(faults)
             {
                 changes.push((f.name.clone(), c));
             }
@@ -1458,8 +1575,6 @@ impl Store {
             "SELECT s.id, s.at, s.full,
                     (SELECT count(*) FROM scan_projects p WHERE p.scan = s.id),
                     (SELECT count(*) FROM scan_projects p WHERE p.scan = s.id AND p.ci = 'failing'),
-                    (SELECT count(*) FROM scan_projects p WHERE p.scan = s.id
-                        AND (p.lint_errors > 0 OR p.scan_error IS NOT NULL)),
                     (SELECT coalesce(sum(p.open), 0) FROM scan_projects p WHERE p.scan = s.id),
                     (SELECT count(*) FROM scan_changes c WHERE c.scan = s.id AND c.kind = 'opened'),
                     (SELECT count(*) FROM scan_changes c WHERE c.scan = s.id AND c.kind = 'closed'),
@@ -1467,6 +1582,9 @@ impl Store {
                         AND c.kind NOT IN ('opened', 'closed'))
              FROM scans s ORDER BY s.id DESC LIMIT ?1",
         )?;
+        let mut by_fault = self
+            .conn
+            .prepare("SELECT kind, count(*) FROM scan_faults WHERE scan = ?1 GROUP BY kind")?;
         let rows = stmt.query_map([limit as i64], |r| {
             Ok(crate::history::Scan {
                 id: r.get(0)?,
@@ -1474,14 +1592,26 @@ impl Store {
                 full: r.get(2)?,
                 projects: r.get(3)?,
                 failing: r.get(4)?,
-                broken: r.get(5)?,
-                open: r.get(6)?,
-                opened: r.get(7)?,
-                closed: r.get(8)?,
-                other: r.get(9)?,
+                faults: [0; 7],
+                open: r.get(5)?,
+                opened: r.get(6)?,
+                closed: r.get(7)?,
+                other: r.get(8)?,
             })
         })?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+        let mut scans: Vec<crate::history::Scan> = rows.collect::<rusqlite::Result<_>>()?;
+        for s in &mut scans {
+            let counts = by_fault.query_map([s.id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })?;
+            for c in counts {
+                let (kind, n) = c?;
+                if let Some(i) = Fault::ALL.iter().position(|f| f.column() == kind) {
+                    s.faults[i] = n;
+                }
+            }
+        }
+        Ok(scans)
     }
 
     /// What a scan recorded as changed, by project, in the order recorded.
@@ -3289,6 +3419,7 @@ mod tests {
             slug: Some(format!("shakfu/{name}")),
             todo: Some(TodoFacts {
                 lint_errors: 1,
+                first_lint: Some("line 1: the file must start with `# TODO`".into()),
                 items,
             }),
             dirty: 3,
@@ -3302,7 +3433,11 @@ mod tests {
             )],
             lock_at: None,
             deps: None,
-            error: None,
+            faults: vec![(
+                Fault::TodoLint,
+                "line 1: the file must start with `# TODO`".into(),
+            )],
+            ci_read: true,
             todo_unread: false,
             held: false,
         }
@@ -3622,6 +3757,7 @@ mod tests {
                     .conn
                     .execute("UPDATE agents SET args = ?1 WHERE name = 'claude'", [args])
                     .unwrap();
+                store.conn.execute_batch(BEFORE_SCAN_FAULTS).unwrap();
                 store.conn.pragma_update(None, "user_version", 32).unwrap();
             }
             let store = Store::open(&path).unwrap();
@@ -3632,6 +3768,86 @@ mod tests {
             }
             let _ = std::fs::remove_dir_all(dir);
         }
+    }
+
+    /// The columns version 40 drops, for a test that replays it.
+    const BEFORE_SCAN_FAULTS: &str = "
+        ALTER TABLE projects ADD COLUMN scan_error TEXT;
+        ALTER TABLE scan_projects ADD COLUMN scan_error TEXT;
+    ";
+
+    /// Version 40 sorts each old `scan_error` and `broken` change by the
+    /// prefix the scan wrote, and names the fault a `mended` change mends.
+    #[test]
+    fn scan_errors_become_faults_after_the_migration() {
+        let dir = scratch("faults");
+        let path = dir.join("p.db");
+        {
+            let store = Store::open(&path).unwrap();
+            store.conn.execute_batch(BEFORE_SCAN_FAULTS).unwrap();
+            store
+                .conn
+                .execute_batch(
+                    "DROP TABLE project_faults; DROP TABLE scan_faults;
+                     INSERT INTO projects (name, path, lint_errors, scan_error) VALUES
+                        ('held', '/h', 0, 'the repository''s hooks or git settings changed since run #3'),
+                        ('git', '/g', 2, 'git status: timed out'),
+                        ('todo', '/t', 0, 'TODO.md: permission denied'),
+                        ('slow', '/s', 0, 'git log: timed out'),
+                        ('ahead', '/a', 0, 'git remote: timed out; git rev-list: timed out');
+                     INSERT INTO scans (id, at, full) VALUES (1, 10, 1), (2, 20, 1);
+                     INSERT INTO scan_projects (scan, project, ci, ci_detail, lint_errors, scan_error, open)
+                        VALUES (1, 'git', 'unknown', '', 2, NULL, 0);
+                     INSERT INTO scan_changes (scan, project, kind, priority, detail) VALUES
+                        (1, 'git', 'broken', NULL, '2 lint errors'),
+                        (2, 'git', 'mended', NULL, ''),
+                        (2, 'todo', 'mended', NULL, '');",
+                )
+                .unwrap();
+            store.conn.pragma_update(None, "user_version", 39).unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let faults: Vec<_> = store
+            .projects()
+            .unwrap()
+            .into_iter()
+            .map(|p| {
+                (
+                    p.name,
+                    p.faults.into_iter().map(|(f, _)| f).collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            faults,
+            [
+                ("ahead".into(), vec![Fault::UnpublishedUnknown]),
+                ("git".into(), vec![Fault::GitUnreadable, Fault::TodoLint]),
+                ("held".into(), vec![Fault::GitSettingsChanged]),
+                ("slow".into(), vec![Fault::ScanPartial]),
+                ("todo".into(), vec![Fault::TodoUnreadable]),
+            ]
+        );
+        assert_eq!(store.scans(10).unwrap()[1].faults, [0, 0, 0, 0, 0, 1, 0]);
+        use crate::history::Change;
+        let changes = |scan| -> Vec<Change> {
+            store
+                .scan_changes(scan)
+                .unwrap()
+                .into_iter()
+                .map(|c| c.change)
+                .collect()
+        };
+        assert_eq!(
+            changes(1),
+            [Change::Fault(Fault::TodoLint, "2 lint errors".into())]
+        );
+        assert_eq!(
+            changes(2),
+            [Change::Mended(Fault::TodoLint)],
+            "a mended change with no fault to name is dropped"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Only a workflow run with no branch, which a non-`edit` node made, is
@@ -3654,6 +3870,7 @@ mod tests {
                     )
                     .unwrap();
             }
+            store.conn.execute_batch(BEFORE_SCAN_FAULTS).unwrap();
             store.conn.pragma_update(None, "user_version", 33).unwrap();
         }
         let store = Store::open(&path).unwrap();
@@ -3689,6 +3906,7 @@ mod tests {
                 .conn
                 .execute("UPDATE agents SET model = 'opus' WHERE name = 'claude'", [])
                 .unwrap();
+            store.conn.execute_batch(BEFORE_SCAN_FAULTS).unwrap();
             store.conn.pragma_update(None, "user_version", 23).unwrap();
         }
         let store = Store::open(&path).unwrap();
@@ -4402,7 +4620,17 @@ mod tests {
         assert_eq!((p.dirty, p.absent_since), (3, None));
         assert!(matches!(p.ci, Ci::Failing(_)), "{:?}", p.ci);
         assert_eq!(p.ci_runs[0].1, "https://github.com/shakfu/x/actions/runs/7");
-        assert_eq!(p.scan_error.as_deref(), Some("settings changed"));
+        assert_eq!(
+            p.faults,
+            [
+                (Fault::GitSettingsChanged, "settings changed".to_string()),
+                (
+                    Fault::TodoLint,
+                    "line 1: the file must start with `# TODO`".to_string()
+                ),
+            ],
+            "the lint error the last scan read stands"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -4418,7 +4646,7 @@ mod tests {
         let unread = Facts {
             todo: None,
             todo_unread: true,
-            error: Some("TODO.md: permission denied".into()),
+            faults: vec![(Fault::TodoUnreadable, "TODO.md: permission denied".into())],
             ..facts("one", vec![])
         };
         store.save_scan(&[unread], true, 2000).unwrap();
@@ -4431,7 +4659,53 @@ mod tests {
         assert_eq!(kept, [("x".to_string(), 1000)]);
         let p = store.project("one").unwrap().unwrap();
         assert_eq!((p.has_todo, p.lint_errors), (true, 1));
-        assert_eq!(p.scan_error.as_deref(), Some("TODO.md: permission denied"));
+        assert_eq!(
+            p.faults,
+            [
+                (
+                    Fault::TodoUnreadable,
+                    "TODO.md: permission denied".to_string()
+                ),
+                (
+                    Fault::TodoLint,
+                    "line 1: the file must start with `# TODO`".to_string()
+                ),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A scan that did not ask CI says nothing about it: an offline scan
+    /// keeps `CiUnknown`, and the next online scan that reads CI mends it.
+    #[test]
+    fn ci_unknown_stands_until_ci_is_read() {
+        let dir = scratch("ci-unknown");
+        let mut store = Store::open(&dir.join("p.db")).unwrap();
+        let lost = Facts {
+            faults: vec![
+                (Fault::CiUnknown, "gh run list: timed out after 60s".into()),
+                (Fault::TodoLint, "line 1: x".into()),
+            ],
+            ci: Ci::Unknown("gh run list: timed out after 60s".into()),
+            ..facts("one", vec![])
+        };
+        let kinds = |store: &Store| -> Vec<Fault> {
+            let p = store.project("one").unwrap().unwrap();
+            p.faults.into_iter().map(|(f, _)| f).collect()
+        };
+        store.save_scan(&[lost], true, 1000).unwrap();
+        assert_eq!(kinds(&store), [Fault::CiUnknown, Fault::TodoLint]);
+        let offline = Facts {
+            ci: Ci::Unknown("offline".into()),
+            ci_read: false,
+            ..facts("one", vec![])
+        };
+        store.save_scan(&[offline], true, 2000).unwrap();
+        assert_eq!(kinds(&store), [Fault::CiUnknown, Fault::TodoLint]);
+        store
+            .save_scan(&[facts("one", vec![])], true, 3000)
+            .unwrap();
+        assert_eq!(kinds(&store), [Fault::TodoLint]);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -4537,6 +4811,7 @@ mod tests {
         // Offline: CI unknown is not news, and the failing state is kept.
         one.todo.as_mut().unwrap().items = vec![item("y", 6), item("z", 7)];
         one.todo.as_mut().unwrap().lint_errors = 0;
+        one.faults.clear();
         one.ci = Ci::Unknown("offline".into());
         store
             .save_scan(&[one.clone(), facts("two", vec![])], true, 2000)
@@ -4566,7 +4841,7 @@ mod tests {
                         text: high("x").0
                     }
                 ),
-                ("one".into(), Change::Mended),
+                ("one".into(), Change::Mended(Fault::TodoLint)),
                 ("two".into(), Change::New),
             ]
         );
@@ -4577,9 +4852,9 @@ mod tests {
                 scan.opened,
                 scan.closed,
                 scan.other,
-                scan.broken
+                scan.faults
             ),
-            (2, 2, 1, 1, 2, 1)
+            (2, 2, 1, 1, 2, [0, 0, 0, 0, 0, 1, 0])
         );
 
         // Online again: passing against the failing state before the offline scan.

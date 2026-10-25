@@ -35,7 +35,7 @@ pma push 1                     # commit and push it; or `pma pr 1` after --appro
 
 - Projects worst first by what needs attention (`pma status`), and an oldest-first list to prune (`pma stale`).
 
-- Each scan says what changed since the one before: items opened and closed, CI failing or fixed, projects broken or new. `pma history` keeps the last 100 scans, and `pma status --html` writes the view as one page.
+- Each scan says what changed since the one before: items opened and closed, CI failing or fixed, a fault found or mended, projects new. `pma history` keeps the last 100 scans, and `pma status --html` writes the view as one page.
 
 - Portfolio notes that belong to no single project.
 

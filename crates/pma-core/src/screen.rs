@@ -270,8 +270,15 @@ pub fn priority_tone(priority: &str) -> Tone {
 /// A project's worst state, as `pma status` names it.
 fn state_tone(state: &str) -> Tone {
     match state.split(" +").next().unwrap_or(state) {
-        "failing CI" | "broken" | "critical" => Tone::Bad,
-        "unpublished" | "stale deps" => Tone::Warn,
+        "failing CI"
+        | "git settings changed"
+        | "git unreadable"
+        | "TODO unreadable"
+        | "TODO lint"
+        | "critical" => Tone::Bad,
+        "CI unknown" | "unpublished" | "unpublished unknown" | "scan partial" | "stale deps" => {
+            Tone::Warn
+        }
         "idle" => Tone::Muted,
         "clear" => Tone::Good,
         _ => Tone::Plain,
@@ -491,35 +498,53 @@ fn scans_pane(scans: Vec<history::Scan>, now: i64) -> Pane {
         0 => muted("0"),
         n => cell(n.to_string(), tone),
     };
+    // A fault no scan found leaves its cells empty, so its column is hidden.
+    let fault = |n: i64, f: scan::Fault| match (n, f) {
+        (0, _) => plain(""),
+        (n, scan::Fault::GitSettingsChanged) => cell(n.to_string(), Tone::Bad),
+        (n, _) => cell(n.to_string(), Tone::Warn),
+    };
+    let mut columns = vec![
+        col("scan", Kind::Text),
+        col("when", Kind::Text),
+        col("kind", Kind::Text),
+        col("projects", Kind::Number),
+        col("failing", Kind::Number),
+    ];
+    columns.extend(scan::Fault::ALL.map(|f| col(f.name(), Kind::Number)));
+    columns.extend([
+        col("open", Kind::Number),
+        col("opened", Kind::Number),
+        col("closed", Kind::Number),
+        col("other", Kind::Number),
+    ]);
     Pane {
         title: "Recent scans".into(),
-        columns: vec![
-            col("scan", Kind::Text),
-            col("when", Kind::Text),
-            col("kind", Kind::Text),
-            col("projects", Kind::Number),
-            col("failing", Kind::Number),
-            col("broken", Kind::Number),
-            col("open", Kind::Number),
-            col("opened", Kind::Number),
-            col("closed", Kind::Number),
-            col("other", Kind::Number),
-        ],
+        columns,
         items: scans
             .into_iter()
             .map(|s| Item {
-                cells: vec![
+                cells: [
                     muted(format!("#{}", s.id)),
                     plain(report::ago(now - s.at)),
                     muted(if s.full { "full" } else { "partial" }),
                     plain(s.projects.to_string()),
                     count(s.failing, Tone::Bad),
-                    count(s.broken, Tone::Warn),
+                ]
+                .into_iter()
+                .chain(
+                    scan::Fault::ALL
+                        .iter()
+                        .zip(s.faults)
+                        .map(|(f, n)| fault(n, *f)),
+                )
+                .chain([
                     plain(s.open.to_string()),
                     count(s.opened, Tone::Accent),
                     count(s.closed, Tone::Good),
                     count(s.other, Tone::Plain),
-                ],
+                ])
+                .collect(),
                 pick: Pick::Nothing,
             })
             .collect(),
@@ -693,7 +718,7 @@ pub fn screen(view: View) -> Screen {
                     tiered: row.tier.is_some() || p.cfg.default_tier.is_some(),
                     has_todo: row.has_todo,
                     lint_errors: row.lint_errors,
-                    scan_error: row.scan_error.as_deref(),
+                    faults: &row.faults,
                 })
                 .collect();
             let row_of = |name: &str| p.projects.iter().map(|(_, r)| r).find(|r| r.name == name);

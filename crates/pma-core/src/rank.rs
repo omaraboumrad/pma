@@ -9,7 +9,7 @@
 use std::cmp::Ordering;
 
 use crate::config::Config;
-use crate::scan::Ci;
+use crate::scan::{Ci, Fault};
 use crate::todo::Priority;
 
 /// Tolerance for comparing a product of weights against the threshold.
@@ -284,21 +284,31 @@ pub fn local_changes(p: &Project) -> String {
 
 /// What places a project in `pma status`, worst first. Each is a condition
 /// with an action, so the order says what to do first: a failing check blocks
-/// the repository, broken facts make the rest unreliable, unpublished work is
-/// at risk, then the work itself, then upkeep.
+/// the repository, unpublished work is at risk, then the work itself, then
+/// upkeep. A fault ranks just below the state it could hide.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum State {
     /// CI fails on the default branch.
     FailingCi,
-    /// `TODO.md` has lint errors, or the scan could not read the project.
-    Broken,
+    /// The `scan::Fault`s, each just below the state it could hide: a state
+    /// known outranks one that is only possible. The git faults hide every
+    /// state, so they come first.
+    GitSettingsChanged,
+    GitUnreadable,
+    CiUnknown,
     /// Commits not pushed, or `pma/` branches no open run owns.
     Unpublished,
+    UnpublishedUnknown,
     /// Open items under `## Critical`.
     Critical,
+    /// Hide or misfile items, critical ones among them.
+    TodoUnreadable,
+    TodoLint,
     /// A current measurement found the lock can move, and the lock is older
     /// than `deps.days`.
     StaleDeps,
+    /// Hides at most stale deps or idle.
+    ScanPartial,
     /// No commit that counts as activity within the tier's horizon.
     Idle,
     /// None of the above.
@@ -309,7 +319,13 @@ impl State {
     pub fn name(self) -> &'static str {
         match self {
             State::FailingCi => "failing CI",
-            State::Broken => "broken",
+            State::GitSettingsChanged => Fault::GitSettingsChanged.name(),
+            State::GitUnreadable => Fault::GitUnreadable.name(),
+            State::CiUnknown => Fault::CiUnknown.name(),
+            State::TodoUnreadable => Fault::TodoUnreadable.name(),
+            State::TodoLint => Fault::TodoLint.name(),
+            State::UnpublishedUnknown => Fault::UnpublishedUnknown.name(),
+            State::ScanPartial => Fault::ScanPartial.name(),
             State::Unpublished => "unpublished",
             State::Critical => "critical",
             State::StaleDeps => "stale deps",
@@ -323,8 +339,7 @@ impl State {
 /// not carry.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Facts<'a> {
-    pub lint_errors: i64,
-    pub scan_error: Option<&'a str>,
+    pub faults: &'a [(Fault, String)],
 }
 
 /// Every state a project is in, worst first, each with what put it there.
@@ -335,18 +350,17 @@ pub fn states(cfg: &Config, p: &Project, facts: Facts<'_>) -> Vec<(State, String
     if let Ci::Failing(workflows) = &p.ci {
         out.push((State::FailingCi, workflows.join(", ")));
     }
-    let mut broken = Vec::new();
-    if let Some(e) = facts.scan_error {
-        broken.push(format!("scan error: {e}"));
-    }
-    if facts.lint_errors > 0 {
-        broken.push(format!(
-            "{} in TODO.md",
-            count(facts.lint_errors, "lint error", "lint errors")
-        ));
-    }
-    if !broken.is_empty() {
-        out.push((State::Broken, broken.join("; ")));
+    for (fault, why) in facts.faults {
+        let state = match fault {
+            Fault::GitSettingsChanged => State::GitSettingsChanged,
+            Fault::GitUnreadable => State::GitUnreadable,
+            Fault::CiUnknown => State::CiUnknown,
+            Fault::TodoUnreadable => State::TodoUnreadable,
+            Fault::TodoLint => State::TodoLint,
+            Fault::UnpublishedUnknown => State::UnpublishedUnknown,
+            Fault::ScanPartial => State::ScanPartial,
+        };
+        out.push((state, why.clone()));
     }
     let mut unpublished = Vec::new();
     if let Some(n) = p.ahead.filter(|n| *n > 0) {
@@ -390,6 +404,8 @@ pub fn states(cfg: &Config, p: &Project, facts: Facts<'_>) -> Vec<(State, String
         None => out.push((State::Idle, "no code commits found".into())),
         Some(_) => {}
     }
+    // Faults are pushed together, but rank among the other states.
+    out.sort_by_key(|(s, _)| *s);
     if out.is_empty() {
         out.push((State::Clear, String::new()));
     }
@@ -658,21 +674,23 @@ mod tests {
             }),
             ..project(1)
         };
-        let facts = Facts {
-            lint_errors: 1,
-            scan_error: None,
-        };
+        let faults = [
+            (Fault::GitUnreadable, "git status: timed out".to_string()),
+            (Fault::TodoLint, "line 3: the item has no text".to_string()),
+        ];
+        let facts = Facts { faults: &faults };
         let got = states(&cfg, &p, facts);
         assert_eq!(
             got,
             [
                 (State::FailingCi, "test".to_string()),
-                (State::Broken, "1 lint error in TODO.md".to_string()),
+                (State::GitUnreadable, "git status: timed out".to_string()),
                 (
                     State::Unpublished,
                     "1 unpushed commit, 2 leftover pma branches".to_string()
                 ),
                 (State::Critical, "2 open items".to_string()),
+                (State::TodoLint, "line 3: the item has no text".to_string()),
                 (
                     State::StaleDeps,
                     "3 to move, lock 40d old, measured 1d ago; 6 held back".to_string()
@@ -700,14 +718,20 @@ mod tests {
             states(&cfg, &quiet, Facts::default()),
             [(State::Clear, String::new())]
         );
-        let scan = Facts {
-            lint_errors: 0,
-            scan_error: Some("git status failed"),
+        // A lost activity date or lock age hides at most stale deps or idle.
+        let faults = [(
+            Fault::ScanPartial,
+            "last activity: git log timed out".to_string(),
+        )];
+        let critical = Project {
+            open: vec![Priority::Critical],
+            ..project(1)
         };
-        assert_eq!(
-            states(&cfg, &project(1), scan)[0],
-            (State::Broken, "scan error: git status failed".to_string())
-        );
+        let got: Vec<State> = states(&cfg, &critical, Facts { faults: &faults })
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect();
+        assert_eq!(got, [State::Critical, State::ScanPartial]);
         let never = Project {
             idle_days: None,
             ..project(5)

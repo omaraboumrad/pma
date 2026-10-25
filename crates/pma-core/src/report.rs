@@ -151,7 +151,7 @@ pub struct StatusRow<'a> {
     pub tiered: bool,
     pub has_todo: bool,
     pub lint_errors: i64,
-    pub scan_error: Option<&'a str>,
+    pub faults: &'a [(crate::scan::Fault, String)],
 }
 
 /// Projects worst first: by the worst state each is in, then by tier, then by
@@ -165,10 +165,7 @@ fn placed<'a>(
     let mut placed: Vec<(Vec<(State, String)>, &StatusRow)> = rows
         .iter()
         .map(|r| {
-            let facts = rank::Facts {
-                lint_errors: r.lint_errors,
-                scan_error: r.scan_error,
-            };
+            let facts = rank::Facts { faults: r.faults };
             (rank::states(cfg, r.project, facts), r)
         })
         .collect();
@@ -220,13 +217,19 @@ fn status_cells(states: &[(State, String)], r: &StatusRow) -> Vec<String> {
         } else {
             local
         },
-        match (r.has_todo, r.lint_errors, r.scan_error) {
-            (_, _, Some(_)) => "scan error".into(),
+        match (r.has_todo, r.lint_errors, todo_unread(r)) {
+            (_, _, true) => "unreadable".into(),
             (false, _, _) => "missing".into(),
             (true, 0, _) => "ok".into(),
             (true, n, _) => format!("{n} lint errors"),
         },
     ]
+}
+
+fn todo_unread(r: &StatusRow) -> bool {
+    r.faults
+        .iter()
+        .any(|(f, _)| *f == crate::scan::Fault::TodoUnreadable)
 }
 
 pub const STATUS_HEADINGS: [&str; 9] = [
@@ -255,9 +258,9 @@ fn terse(cells: &mut [String], r: &StatusRow) {
         0 => "-".into(),
         n => n.to_string(),
     };
-    cells[8] = match (r.has_todo, r.lint_errors, r.scan_error) {
-        (_, _, Some(_)) => "error".into(),
-        (true, n, None) if n > 0 => format!("{n} lint"),
+    cells[8] = match (r.has_todo, r.lint_errors, todo_unread(r)) {
+        (_, _, true) => "unread".into(),
+        (true, n, false) if n > 0 => format!("{n} lint"),
         _ => std::mem::take(&mut cells[8]),
     };
 }
@@ -560,29 +563,33 @@ pub fn run_detail(run: &Run, attempts: &[Attempt], changelog: Option<&str>, diff
     out
 }
 
-/// Recorded scans as a table, in the order given.
+/// Recorded scans as a table, in the order given. A fault no listed scan
+/// found has no column.
 pub fn scans(scans: &[history::Scan], now: i64) -> String {
-    let mut rows = vec![
-        [
-            "scan", "when", "kind", "projects", "failing", "broken", "open", "opened", "closed",
-            "other",
-        ]
+    let found: Vec<usize> = (0..crate::scan::Fault::ALL.len())
+        .filter(|&i| scans.iter().any(|s| s.faults[i] > 0))
+        .collect();
+    let mut head: Vec<String> = ["scan", "when", "kind", "projects", "failing"]
         .map(String::from)
-        .to_vec(),
-    ];
+        .to_vec();
+    head.extend(
+        found
+            .iter()
+            .map(|&i| crate::scan::Fault::ALL[i].name().to_string()),
+    );
+    head.extend(["open", "opened", "closed", "other"].map(String::from));
+    let mut rows = vec![head];
     for s in scans {
-        rows.push(vec![
+        let mut row = vec![
             s.id.to_string(),
             ago(now - s.at),
             if s.full { "full" } else { "partial" }.into(),
             s.projects.to_string(),
             s.failing.to_string(),
-            s.broken.to_string(),
-            s.open.to_string(),
-            s.opened.to_string(),
-            s.closed.to_string(),
-            s.other.to_string(),
-        ]);
+        ];
+        row.extend(found.iter().map(|&i| s.faults[i].to_string()));
+        row.extend([s.open, s.opened, s.closed, s.other].map(|n| n.to_string()));
+        rows.push(row);
     }
     table(&rows, "")
 }
@@ -678,6 +685,34 @@ mod tests {
             urgency,
             quadrant: q,
         }
+    }
+
+    /// A fault no listed scan found has no column; one any scan found does.
+    #[test]
+    fn scans_list_only_the_faults_found() {
+        let scan = |id, lint| history::Scan {
+            id,
+            at: 0,
+            full: true,
+            projects: 3,
+            failing: 0,
+            faults: [0, 0, 0, 0, 0, lint, 0],
+            open: 0,
+            opened: 0,
+            closed: 0,
+            other: 0,
+        };
+        let head = |t: String| t.lines().next().unwrap().to_string();
+        let none = head(scans(&[scan(1, 0)], 0));
+        assert!(
+            !none.contains("lint") && !none.contains("unknown"),
+            "{none}"
+        );
+        let some = head(scans(&[scan(2, 1), scan(1, 0)], 0));
+        assert!(
+            some.contains("TODO lint") && !some.contains("CI unknown"),
+            "{some}"
+        );
     }
 
     #[test]
@@ -790,7 +825,7 @@ mod tests {
             tiered: true,
             has_todo: true,
             lint_errors: 0,
-            scan_error: None,
+            faults: &[],
         };
         let out = status(&cfg, &[row(&quiet), row(&busy), row(&red)], true);
         let lines: Vec<&str> = out.lines().collect();
@@ -846,7 +881,7 @@ mod tests {
             tiered: true,
             has_todo: true,
             lint_errors: 146,
-            scan_error: None,
+            faults: &[],
         };
         let out = status(&cfg, &[row], true);
         let long: Vec<&str> = out.lines().filter(|l| l.chars().count() > 80).collect();

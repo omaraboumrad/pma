@@ -639,7 +639,7 @@ pub fn query(store: &Store, q: Query) -> Result<View> {
                     tiered: row.tier.is_some() || p.cfg.default_tier.is_some(),
                     has_todo: row.has_todo,
                     lint_errors: row.lint_errors,
-                    scan_error: row.scan_error.as_deref(),
+                    faults: &row.faults,
                 };
                 crate::report::status_rows(&p.cfg, &[r]).into_iter().next()
             });

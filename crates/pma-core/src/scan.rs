@@ -13,6 +13,70 @@ use std::time::{Duration, Instant};
 
 use crate::todo::{self, Priority, normal_text};
 
+/// Why a project's facts are missing or suspect, worst first. Each ranks
+/// just below the state it could hide; see `rank::State`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Fault {
+    /// A failed run left hooks or git settings changed, so pma runs no git
+    /// there until they are restored. See `dispatch::clone_held`.
+    GitSettingsChanged,
+    /// `git status` failed or timed out, so nothing after it was read.
+    GitUnreadable,
+    /// `gh` failed or timed out, or the default branch is unknown, so
+    /// failing CI would go unseen. Not a fault offline or off GitHub.
+    CiUnknown,
+    /// The `pma/` branches could not be listed, or the upstream is gone, so
+    /// unpublished work would go unseen.
+    UnpublishedUnknown,
+    /// TODO.md exists but could not be read.
+    TodoUnreadable,
+    /// TODO.md has lint errors, so its items may be misread.
+    TodoLint,
+    /// Another git call failed or timed out; the facts it reads are named.
+    ScanPartial,
+}
+
+impl Fault {
+    pub const ALL: [Fault; 7] = [
+        Fault::GitSettingsChanged,
+        Fault::GitUnreadable,
+        Fault::CiUnknown,
+        Fault::UnpublishedUnknown,
+        Fault::TodoUnreadable,
+        Fault::TodoLint,
+        Fault::ScanPartial,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Fault::GitSettingsChanged => "git settings changed",
+            Fault::GitUnreadable => "git unreadable",
+            Fault::CiUnknown => "CI unknown",
+            Fault::TodoUnreadable => "TODO unreadable",
+            Fault::TodoLint => "TODO lint",
+            Fault::UnpublishedUnknown => "unpublished unknown",
+            Fault::ScanPartial => "scan partial",
+        }
+    }
+
+    /// As stored.
+    pub fn column(self) -> &'static str {
+        match self {
+            Fault::GitSettingsChanged => "git_settings_changed",
+            Fault::GitUnreadable => "git_unreadable",
+            Fault::CiUnknown => "ci_unknown",
+            Fault::TodoUnreadable => "todo_unreadable",
+            Fault::TodoLint => "todo_lint",
+            Fault::UnpublishedUnknown => "unpublished_unknown",
+            Fault::ScanPartial => "scan_partial",
+        }
+    }
+
+    pub fn from_column(s: &str) -> Option<Fault> {
+        Fault::ALL.into_iter().find(|f| f.column() == s)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Facts {
     pub name: String,
@@ -38,7 +102,10 @@ pub struct Facts {
     pub lock_at: Option<i64>,
     /// `None` when this scan did not measure dependencies.
     pub deps: Option<DepsFacts>,
-    pub error: Option<String>,
+    /// Each fault the scan found, worst first, with what caused it.
+    pub faults: Vec<(Fault, String)>,
+    /// CI was asked: not offline, and git could be read.
+    pub ci_read: bool,
     /// Not read, because git there would run a hook or setting a failed run
     /// found added. The store keeps what the last scan recorded, and `error`.
     pub held: bool,
@@ -49,7 +116,7 @@ impl Facts {
     pub fn held(name: &str, path: &Path, error: String) -> Facts {
         Facts {
             held: true,
-            error: Some(error),
+            faults: vec![(Fault::GitSettingsChanged, error)],
             ..Facts::blank(name, path)
         }
     }
@@ -69,7 +136,8 @@ impl Facts {
             ci_runs: Vec::new(),
             lock_at: None,
             deps: None,
-            error: None,
+            faults: Vec::new(),
+            ci_read: false,
             held: false,
         }
     }
@@ -89,6 +157,8 @@ pub struct DepsFacts {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TodoFacts {
     pub lint_errors: i64,
+    /// The first lint error, as `line N: message`.
+    pub first_lint: Option<String>,
     /// Open items in priority sections.
     pub items: Vec<ScannedItem>,
 }
@@ -224,49 +294,124 @@ pub fn scan_project(
     let mut facts = Facts::blank(name, path);
 
     let git = Git::new(path);
+    let status = call(
+        git.command(&["status", "--porcelain=v2", "--branch"]),
+        CALL_TIMEOUT,
+    )
+    .map(|out| Status::parse(&out));
+    if let Err(e) = &status {
+        facts
+            .faults
+            .push((Fault::GitUnreadable, format!("git status: {e}")));
+    }
+    // With no commit, `git log` fails and has nothing to read.
+    let history = status.as_ref().is_ok_and(|s| !s.initial);
     match std::fs::read_to_string(path.join("TODO.md")) {
-        Ok(text) => facts.todo = Some(todo_facts(&text, &added_times(&git))),
+        Ok(text) => {
+            let added = match history {
+                true => added_times(&git),
+                false => HashMap::new(),
+            };
+            let todo = todo_facts(&text, &added);
+            if let Some(first) = &todo.first_lint {
+                let more = match todo.lint_errors - 1 {
+                    0 => String::new(),
+                    n => format!(" (+{n} more)"),
+                };
+                facts
+                    .faults
+                    .push((Fault::TodoLint, format!("{first}{more}")));
+            }
+            facts.todo = Some(todo);
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => {
             facts.todo_unread = true;
-            facts.error = Some(format!("TODO.md: {e}"));
+            facts
+                .faults
+                .push((Fault::TodoUnreadable, format!("TODO.md: {e}")));
         }
     }
-
-    facts.slug = git
-        .run(&["remote", "get-url", "origin"])
-        .and_then(|url| github_slug(url.trim()));
-
-    let status = match call(git.command(&["status", "--porcelain"]), CALL_TIMEOUT) {
-        Ok(out) => out,
-        Err(e) => {
-            facts.error = Some(git.noted(Some(format!("git status: {e}"))));
-            return facts;
-        }
+    let Ok(status) = status else {
+        git.note_lost(&mut facts.faults);
+        return facts;
     };
-    facts.dirty = status.lines().count() as i64;
+
+    // No origin is an answer, not a lost fact.
+    facts.slug = git
+        .read_optional(Fact::Origin, &["remote", "get-url", "origin"])
+        .and_then(|url| github_slug(url.trim()));
+    facts.dirty = status.changes.len() as i64;
     facts.pma_branches = git
-        .run(&[
-            "for-each-ref",
-            "--format=%(refname:lstrip=2)",
-            "refs/heads/pma/",
-        ])
+        .read(
+            Fact::PmaBranches,
+            &[
+                "for-each-ref",
+                "--format=%(refname:lstrip=2)",
+                "refs/heads/pma/",
+            ],
+        )
         .map(|out| out.lines().map(String::from).collect())
         .unwrap_or_default();
-    facts.ahead = git
-        .run(&["rev-list", "--count", "@{u}..HEAD"])
-        .and_then(|s| s.trim().parse().ok());
-    facts.last_activity = last_activity(&git, ignore);
+    facts.ahead = status.ahead;
+    if let (Some(up), None) = (&status.upstream, status.ahead) {
+        git.lost(Fact::Unpushed, format!("upstream {up} is gone"));
+    }
+    if history {
+        facts.last_activity = last_activity(&git, ignore);
+    }
     facts.lock_at = lock_changed_at(&git, path, &status);
     if !offline {
-        (facts.ci, facts.ci_runs) = ci_state(path);
+        facts.ci_read = true;
+        match ci_state(path) {
+            Ok((ci, runs)) => (facts.ci, facts.ci_runs) = (ci, runs),
+            Err(why) => {
+                facts.faults.push((Fault::CiUnknown, why.clone()));
+                facts.ci = Ci::Unknown(why);
+            }
+        }
         if deps {
             facts.deps = Some(crate::deps::measure(path));
         }
     }
-    let noted = git.noted(facts.error.take());
-    facts.error = (!noted.is_empty()).then_some(noted);
+    git.note_lost(&mut facts.faults);
     facts
+}
+
+/// What `git status --porcelain=v2 --branch` says. Its `# branch.` headers
+/// tell an empty repository, a missing upstream and a gone one apart, which
+/// a failed `git log` or `git rev-list` cannot.
+#[derive(Debug, Default, PartialEq)]
+struct Status {
+    /// One entry per changed or untracked path.
+    changes: Vec<String>,
+    /// No commit yet.
+    initial: bool,
+    upstream: Option<String>,
+    /// Commits not on the upstream; `None` without one, or when it is gone.
+    ahead: Option<i64>,
+}
+
+impl Status {
+    fn parse(out: &str) -> Status {
+        let mut s = Status::default();
+        for line in out.lines() {
+            match line.strip_prefix("# ") {
+                Some(h) => {
+                    if h == "branch.oid (initial)" {
+                        s.initial = true;
+                    } else if let Some(up) = h.strip_prefix("branch.upstream ") {
+                        s.upstream = Some(up.to_string());
+                    } else if let Some(ab) = h.strip_prefix("branch.ab +") {
+                        s.ahead = ab.split(' ').next().and_then(|n| n.parse().ok());
+                    }
+                }
+                None if !line.is_empty() => s.changes.push(line.to_string()),
+                None => {}
+            }
+        }
+        s
+    }
 }
 
 /// How long one `git` or `gh` call in a scan may take. One hung call would
@@ -376,19 +521,43 @@ pub fn bounded(mut cmd: Command, timeout: Duration) -> Result<Ran, CallError> {
     })
 }
 
-/// `git -C dir` for one project's scan. A call that fails reads as absent, as
-/// it always has; one that times out is also remembered, so the project's
-/// detail says the facts are incomplete rather than that they are empty.
+/// What one git call in a scan reads, named when the call times out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fact {
+    Origin,
+    PmaBranches,
+    Unpushed,
+    Activity,
+    LockAge,
+    TaskAges,
+}
+
+impl Fact {
+    fn name(self) -> &'static str {
+        match self {
+            Fact::Origin => "GitHub origin",
+            Fact::PmaBranches => "pma branches",
+            Fact::Unpushed => "unpushed commits",
+            Fact::Activity => "last activity",
+            Fact::LockAge => "lock age",
+            Fact::TaskAges => "task ages",
+        }
+    }
+}
+
+/// `git -C dir` for one project's scan. A call that fails or times out is
+/// remembered with the fact it reads, so the project's detail says which
+/// fact is missing rather than reading it as empty.
 struct Git<'a> {
     dir: &'a Path,
-    timed_out: Mutex<Vec<String>>,
+    lost: Mutex<Vec<(Fact, String)>>,
 }
 
 impl<'a> Git<'a> {
     fn new(dir: &'a Path) -> Git<'a> {
         Git {
             dir,
-            timed_out: Mutex::new(Vec::new()),
+            lost: Mutex::new(Vec::new()),
         }
     }
 
@@ -398,38 +567,61 @@ impl<'a> Git<'a> {
         cmd
     }
 
-    fn run(&self, args: &[&str]) -> Option<String> {
-        match call(self.command(args), CALL_TIMEOUT) {
-            Ok(out) => Some(out),
-            Err(e @ CallError::TimedOut(_)) => {
-                let what = args.first().copied().unwrap_or_default();
-                self.timed_out
-                    .lock()
-                    .unwrap()
-                    .push(format!("git {what}: {e}"));
-                None
-            }
-            Err(CallError::Failed(_)) => None,
-        }
+    fn read(&self, fact: Fact, args: &[&str]) -> Option<String> {
+        self.call(fact, args, true)
     }
 
-    /// `first`, then every timeout, joined for the project's detail.
-    fn noted(&self, first: Option<String>) -> String {
-        first
-            .into_iter()
-            .chain(self.timed_out.lock().unwrap().iter().cloned())
-            .collect::<Vec<_>>()
-            .join("; ")
+    /// As `read`, for a call whose failure is an answer: only a timeout
+    /// loses the fact.
+    fn read_optional(&self, fact: Fact, args: &[&str]) -> Option<String> {
+        self.call(fact, args, false)
+    }
+
+    fn call(&self, fact: Fact, args: &[&str], failure_loses: bool) -> Option<String> {
+        match call(self.command(args), CALL_TIMEOUT) {
+            Ok(out) => return Some(out),
+            Err(CallError::Failed(_)) if !failure_loses => {}
+            Err(e) => {
+                let what = args.first().copied().unwrap_or_default();
+                self.lost(fact, format!("git {what}: {e}"));
+            }
+        }
+        None
+    }
+
+    fn lost(&self, fact: Fact, why: String) {
+        let why = format!("{}: {why}", fact.name());
+        self.lost.lock().unwrap().push((fact, why));
+    }
+
+    /// The lost facts as faults: one for those that show unpublished work,
+    /// one for the rest. The faults are kept worst first.
+    fn note_lost(&self, faults: &mut Vec<(Fault, String)>) {
+        let lost = self.lost.lock().unwrap();
+        for (fault, publish) in [
+            (Fault::UnpublishedUnknown, true),
+            (Fault::ScanPartial, false),
+        ] {
+            let why: Vec<&str> = lost
+                .iter()
+                .filter(|(f, _)| matches!(f, Fact::PmaBranches | Fact::Unpushed) == publish)
+                .map(|(_, why)| why.as_str())
+                .collect();
+            if !why.is_empty() {
+                faults.push((fault, why.join("; ")));
+            }
+        }
+        faults.sort_by_key(|(f, _)| *f);
     }
 }
 
 fn todo_facts(text: &str, added: &HashMap<String, i64>) -> TodoFacts {
     let parsed = todo::parse(text);
-    let lint_errors = parsed
+    let errors: Vec<_> = parsed
         .diagnostics
         .iter()
         .filter(|d| d.severity == todo::Severity::Error)
-        .count();
+        .collect();
     let mut keys = HashSet::new();
     let items = parsed
         .items
@@ -459,14 +651,17 @@ fn todo_facts(text: &str, added: &HashMap<String, i64>) -> TodoFacts {
         })
         .collect();
     TodoFacts {
-        lint_errors: lint_errors as i64,
+        lint_errors: errors.len() as i64,
+        first_lint: errors
+            .first()
+            .map(|d| format!("line {}: {}", d.line, d.message)),
         items,
     }
 }
 
 /// Runs `git -C dir`, bounded by `CALL_TIMEOUT`; stdout when it succeeds.
 pub fn git(dir: &Path, args: &[&str]) -> Option<String> {
-    Git::new(dir).run(args)
+    call(Git::new(dir).command(args), CALL_TIMEOUT).ok()
 }
 
 /// Commit time at which each item text first appeared in TODO.md, keyed by
@@ -474,17 +669,20 @@ pub fn git(dir: &Path, args: &[&str]) -> Option<String> {
 /// a later commit moves it, retags it, or changes the file's format, all of
 /// which `git blame` reports as a new line.
 fn added_times(git: &Git) -> HashMap<String, i64> {
-    git.run(&[
-        "log",
-        "--reverse",
-        "--no-merges",
-        "--no-color",
-        "--format=%x00%ct",
-        "-p",
-        "--unified=0",
-        "--",
-        "TODO.md",
-    ])
+    git.read(
+        Fact::TaskAges,
+        &[
+            "log",
+            "--reverse",
+            "--no-merges",
+            "--no-color",
+            "--format=%x00%ct",
+            "-p",
+            "--unified=0",
+            "--",
+            "TODO.md",
+        ],
+    )
     .map(|log| parse_history(&log))
     .unwrap_or_default()
 }
@@ -546,14 +744,17 @@ fn normalise(line: &str) -> String {
 }
 
 fn last_activity(git: &Git, ignore: &[String]) -> Option<i64> {
-    let log = git.run(&[
-        "log",
-        "-n",
-        "1000",
-        "--no-merges",
-        "--format=%x00%ct",
-        "--name-only",
-    ])?;
+    let log = git.read(
+        Fact::Activity,
+        &[
+            "log",
+            "-n",
+            "1000",
+            "--no-merges",
+            "--format=%x00%ct",
+            "--name-only",
+        ],
+    )?;
     newest_counted_commit(&log, ignore)
 }
 
@@ -561,7 +762,15 @@ fn last_activity(git: &Git, ignore: &[String]) -> Option<i64> {
 /// refresh published but not yet pulled counts. A lock with uncommitted
 /// changes is being refreshed and counts as changed now. `None` without a
 /// committed lock.
-fn lock_changed_at(git: &Git, dir: &Path, status: &str) -> Option<i64> {
+fn lock_changed_at(git: &Git, dir: &Path, status: &Status) -> Option<i64> {
+    if status.initial {
+        return None;
+    }
+    // `@{u}` only while the upstream exists; git fails on it otherwise.
+    let upstream: &[&str] = match status.ahead {
+        Some(_) => &["@{u}"],
+        None => &[],
+    };
     crate::deps::ECOSYSTEMS
         .iter()
         .map(|(_, _, lock)| *lock)
@@ -570,21 +779,31 @@ fn lock_changed_at(git: &Git, dir: &Path, status: &str) -> Option<i64> {
             if modified(status, lock) {
                 return Some(crate::dates::now());
             }
-            git.run(&["log", "-1", "--format=%ct", "HEAD", "@{u}", "--", lock])
-                .or_else(|| git.run(&["log", "-1", "--format=%ct", "HEAD", "--", lock]))?
-                .trim()
-                .parse()
-                .ok()
+            let mut args = vec!["log", "-1", "--format=%ct", "HEAD"];
+            args.extend(upstream);
+            args.extend(["--", lock]);
+            git.read(Fact::LockAge, &args)?.trim().parse().ok()
         })
         .min()
 }
 
-/// Whether `git status --porcelain` lists `path` as changed. Untracked is
-/// not changed: a lock never committed has no age to reset.
-fn modified(status: &str, path: &str) -> bool {
-    status
-        .lines()
-        .any(|l| !l.starts_with("??") && l.get(3..) == Some(path))
+/// Whether `git status` lists `path` as changed. Untracked is not changed: a
+/// lock never committed has no age to reset. Tracked entries are `1`, `2`
+/// (renamed, `path<TAB>orig`) and `u`, with 8, 9 and 10 fields before the
+/// path.
+fn modified(status: &Status, path: &str) -> bool {
+    status.changes.iter().any(|l| {
+        let fields = match l.as_bytes().first() {
+            Some(b'1') => 9,
+            Some(b'2') => 10,
+            Some(b'u') => 11,
+            _ => return false,
+        };
+        l.splitn(fields, ' ')
+            .nth(fields - 1)
+            .and_then(|p| p.split('\t').next())
+            == Some(path)
+    })
 }
 
 fn newest_counted_commit(log: &str, ignore: &[String]) -> Option<i64> {
@@ -660,21 +879,21 @@ pub fn default_branch(dir: &Path) -> Option<String> {
 /// Judged over the workflows that still exist and are enabled. `gh run list`
 /// keeps a deleted workflow's runs, whose last failure would otherwise read as
 /// failing CI until newer runs pushed it out of the window.
-/// The CI state, and each failing workflow's latest failed run.
-fn ci_state(dir: &Path) -> (Ci, Vec<(String, String)>) {
+/// The CI state, and each failing workflow's latest failed run. `Err` with
+/// why when a GitHub project's CI could not be read; no origin, or one off
+/// GitHub, is `Ci::Unknown` and no error.
+fn ci_state(dir: &Path) -> Result<(Ci, Vec<(String, String)>), String> {
     let Some(url) = git(dir, &["remote", "get-url", "origin"]) else {
-        return (Ci::Unknown("no origin remote".into()), Vec::new());
+        return Ok((Ci::Unknown("no origin remote".into()), Vec::new()));
     };
     let Some(slug) = github_slug(url.trim()) else {
-        return (Ci::Unknown("origin is not on GitHub".into()), Vec::new());
+        return Ok((Ci::Unknown("origin is not on GitHub".into()), Vec::new()));
     };
-    let Some(branch) = default_branch(dir) else {
-        return (Ci::Unknown(DEFAULT_BRANCH_UNKNOWN.into()), Vec::new());
-    };
+    let branch = default_branch(dir).ok_or(DEFAULT_BRANCH_UNKNOWN)?;
     let gh = |args: &[&str]| {
         let mut cmd = Command::new("gh");
         cmd.args(args);
-        call(cmd, CALL_TIMEOUT).map_err(|e| Ci::Unknown(format!("gh {}: {e}", args[..2].join(" "))))
+        call(cmd, CALL_TIMEOUT).map_err(|e| format!("gh {}: {e}", args[..2].join(" ")))
     };
     let runs = |extra: &[&str]| {
         let mut args = vec!["run", "list", "-R", &slug, "--branch", &branch];
@@ -687,7 +906,7 @@ fn ci_state(dir: &Path) -> (Ci, Vec<(String, String)>) {
         ]);
         gh(&args).map(|tsv| (latest_verdicts(&tsv), decisive_urls(&tsv)))
     };
-    let judged = (|| {
+    (|| {
         let listed = gh(&[
             "workflow",
             "list",
@@ -698,7 +917,7 @@ fn ci_state(dir: &Path) -> (Ci, Vec<(String, String)>) {
             "--json",
             "id,name,state",
         ])?;
-        let active = active_workflows(&listed).map_err(Ci::Unknown)?;
+        let active = active_workflows(&listed)?;
         let (mut verdicts, mut urls) = runs(&["--limit", "100"])?;
         // A workflow that runs rarely can fall outside that window, so it is
         // asked about alone rather than read as having no runs.
@@ -721,8 +940,7 @@ fn ci_state(dir: &Path) -> (Ci, Vec<(String, String)>) {
             _ => Vec::new(),
         };
         Ok((ci, failed_runs))
-    })();
-    judged.unwrap_or_else(|unknown| (unknown, Vec::new()))
+    })()
 }
 
 /// Enabled workflows as `(id, name)`, from `gh workflow list --json id,name,state`.
@@ -891,6 +1109,126 @@ pub fn github_slug(url: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// A lost fact that shows unpublished work is its own fault; the rest
+    /// are one `ScanPartial` that names each fact lost.
+    #[test]
+    fn lost_facts_are_named() {
+        let git = Git::new(Path::new("/r"));
+        git.lost(Fact::Activity, "git log: timed out after 60s".into());
+        git.lost(Fact::Unpushed, "upstream origin/main is gone".into());
+        git.lost(Fact::LockAge, "git log: bad object HEAD".into());
+        let mut faults = vec![(Fault::TodoLint, "line 1: x".to_string())];
+        git.note_lost(&mut faults);
+        assert_eq!(
+            faults,
+            [
+                (
+                    Fault::UnpublishedUnknown,
+                    "unpushed commits: upstream origin/main is gone".to_string()
+                ),
+                (Fault::TodoLint, "line 1: x".to_string()),
+                (
+                    Fault::ScanPartial,
+                    "last activity: git log: timed out after 60s; \
+                     lock age: git log: bad object HEAD"
+                        .to_string()
+                ),
+            ]
+        );
+        let none = Git::new(Path::new("/r"));
+        let mut faults = Vec::new();
+        none.note_lost(&mut faults);
+        assert!(faults.is_empty());
+    }
+
+    #[test]
+    fn status_headers_tell_no_upstream_from_a_gone_one() {
+        let s = Status::parse(
+            "# branch.oid abc\n# branch.head main\n# branch.upstream origin/main\n\
+             # branch.ab +2 -1\n? new.txt\n",
+        );
+        assert_eq!(
+            (s.initial, s.upstream.as_deref(), s.ahead, s.changes.len()),
+            (false, Some("origin/main"), Some(2), 1)
+        );
+        let gone = Status::parse("# branch.oid abc\n# branch.upstream origin/main\n");
+        assert_eq!((gone.upstream.is_some(), gone.ahead), (true, None));
+        let none = Status::parse("# branch.oid abc\n# branch.head main\n");
+        assert_eq!((none.upstream, none.ahead), (None, None));
+        assert!(Status::parse("# branch.oid (initial)\n# branch.head main\n").initial);
+    }
+
+    /// Against real repositories: an empty one and one with no upstream lose
+    /// nothing; a gone upstream loses the unpushed count.
+    #[test]
+    fn a_scan_loses_only_what_git_could_not_answer() {
+        let dir = std::env::temp_dir().join(format!("pma-lost-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sh = |args: &[&str]| {
+            let ok = Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        let scan = || scan_project("p", &dir, &[], true, false);
+        sh(&["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join("TODO.md"), "# TODO\n\n## High\n\n- [ ] x\n").unwrap();
+        std::fs::write(dir.join("uv.lock"), "").unwrap();
+        let empty = scan();
+        assert_eq!(
+            empty.faults,
+            [],
+            "an empty repository answers every question"
+        );
+        assert_eq!(empty.dirty, 2);
+
+        sh(&["add", "."]);
+        sh(&["commit", "-qm", "first"]);
+        let alone = scan();
+        assert_eq!(alone.faults, [], "no upstream is an answer");
+        assert_eq!(alone.ahead, None);
+        assert!(alone.last_activity.is_some() && alone.lock_at.is_some());
+
+        sh(&["remote", "add", "origin", "/nonexistent"]);
+        sh(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        sh(&["branch", "-q", "--set-upstream-to=origin/main"]);
+        sh(&["commit", "-q", "--allow-empty", "-m", "second"]);
+        let tracked = scan();
+        assert_eq!((tracked.faults.len(), tracked.ahead), (0, Some(1)));
+        assert!(tracked.lock_at.is_some(), "read on HEAD and its upstream");
+        // Online, an origin off GitHub has no CI to read; nothing is lost.
+        let online = scan_project("p", &dir, &[], false, false);
+        assert_eq!(online.faults, []);
+        assert!(online.ci_read && matches!(online.ci, Ci::Unknown(_)));
+
+        sh(&["update-ref", "-d", "refs/remotes/origin/main"]);
+        let gone = scan();
+        assert_eq!(
+            gone.faults,
+            [(
+                Fault::UnpublishedUnknown,
+                "unpushed commits: upstream origin/main is gone".to_string()
+            )]
+        );
+        assert!(gone.lock_at.is_some(), "read on HEAD alone");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn globs() {
         for (pattern, path, want) in [
@@ -913,13 +1251,30 @@ mod tests {
         }
     }
 
+    const Z: &str = "0000000000000000000000000000000000000000";
+
+    /// A `--porcelain=v2` entry for a tracked path.
+    fn changed(xy: &str, path: &str) -> String {
+        format!("1 {xy} N... 100644 100644 100644 {Z} {Z} {path}")
+    }
+
     #[test]
     fn a_staged_or_edited_lock_is_modified_and_an_untracked_one_is_not() {
-        let status = " M Cargo.lock\nM  uv.lock\n?? go.sum\n M sub/Cargo.lock\n";
-        assert!(modified(status, "Cargo.lock"));
-        assert!(modified(status, "uv.lock"));
-        assert!(!modified(status, "go.sum"));
-        assert!(!modified("", "Cargo.lock"));
+        let status = Status::parse(
+            &[
+                changed(".M", "Cargo.lock"),
+                changed("M.", "uv.lock"),
+                "? go.sum".into(),
+                changed(".M", "sub/Cargo.lock"),
+                format!("2 R. N... 100644 100644 100644 {Z} {Z} R100 go.mod\told.mod"),
+            ]
+            .join("\n"),
+        );
+        assert!(modified(&status, "Cargo.lock"));
+        assert!(modified(&status, "uv.lock"));
+        assert!(modified(&status, "go.mod"), "renamed");
+        assert!(!modified(&status, "go.sum"));
+        assert!(!modified(&Status::default(), "Cargo.lock"));
     }
 
     /// The oldest lock decides; an edited lock counts as now; a lock never
@@ -951,24 +1306,30 @@ mod tests {
                 .success();
             assert!(ok, "git {args:?}");
         };
-        let at = |status: &str| lock_changed_at(&Git::new(&dir), &dir, status);
+        let at = |changed: &[&str]| {
+            let lines: Vec<String> = changed
+                .iter()
+                .map(|p| super::tests::changed(".M", p))
+                .collect();
+            lock_changed_at(&Git::new(&dir), &dir, &Status::parse(&lines.join("\n")))
+        };
         sh(&["init", "-q"], "@0");
         std::fs::write(dir.join("uv.lock"), "").unwrap();
-        assert_eq!(at(""), None, "an uncommitted lock has no age");
+        assert_eq!(at(&[]), None, "an uncommitted lock has no age");
 
         sh(&["add", "uv.lock"], "@0");
         sh(&["commit", "-qm", "uv"], "@1000 +0000");
         std::fs::write(dir.join("Cargo.lock"), "").unwrap();
         sh(&["add", "Cargo.lock"], "@0");
         sh(&["commit", "-qm", "cargo"], "@2000 +0000");
-        assert_eq!(at(""), Some(1000));
+        assert_eq!(at(&[]), Some(1000));
 
         let now = crate::dates::now();
         assert!(
-            at(" M uv.lock\n").is_some_and(|t| t == 2000),
+            at(&["uv.lock"]).is_some_and(|t| t == 2000),
             "the edited lock counts as now"
         );
-        assert!(at(" M uv.lock\n M Cargo.lock\n").is_some_and(|t| t >= now));
+        assert!(at(&["uv.lock", "Cargo.lock"]).is_some_and(|t| t >= now));
         let _ = std::fs::remove_dir_all(dir);
     }
 

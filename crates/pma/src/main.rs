@@ -193,8 +193,9 @@ enum Command {
     /// Projects worst first, by what needs attention.
     ///
     /// Each tiered project is placed by the worst state it is in: failing CI,
-    /// broken TODO.md or scan, unpublished work, critical items, stale deps,
-    /// then idle. Tier breaks ties.
+    /// git settings changed, git unreadable, CI unknown, unpublished work,
+    /// unpublished unknown, critical items, TODO unreadable, TODO lint, stale
+    /// deps, scan partial, then idle. Tier breaks ties.
     Status {
         /// Limit to these projects.
         projects: Vec<String>,
@@ -217,7 +218,7 @@ enum Command {
     ///
     /// Each scan records every project's state and what changed since the
     /// scan before: items opened and closed, CI failing or passing again, a
-    /// project broken, mended, new or absent.
+    /// fault found or mended, a project new or absent.
     History {
         /// A scan's number, to list what it changed; the latest with `last`.
         scan: Option<String>,
@@ -1622,12 +1623,11 @@ fn run_scan(names: &[String], tags: &[String], offline: bool, deps: bool) -> Res
     });
     bar.finish();
     facts.extend(held);
-    for f in facts.iter().filter(|f| f.error.is_some()) {
-        eprintln!(
-            "warning: {}: {}",
-            f.name,
-            f.error.as_deref().unwrap_or_default()
-        );
+    // Lint errors are listed after the scan, under "needs attention".
+    for f in &facts {
+        for (fault, why) in f.faults.iter().filter(|(k, _)| *k != scan::Fault::TodoLint) {
+            eprintln!("warning: {}: {}: {why}", f.name, fault.name());
+        }
     }
     for name in store.save_scan(&facts, names.is_empty(), dates::now())? {
         eprintln!("absent: {name} is no longer under a root; its record is kept");
@@ -1668,7 +1668,7 @@ fn run_scan(names: &[String], tags: &[String], offline: bool, deps: bool) -> Res
 }
 
 /// After a scan: what changed since the scan before, and the projects with
-/// failing CI or broken, with how long CI has failed.
+/// failing CI or a fault, with how long CI has failed.
 fn scan_review(store: &Store, facts: &[scan::Facts]) -> Result<String> {
     let now = dates::now();
     let scans = store.scans(2)?;
@@ -1715,8 +1715,8 @@ fn scan_review(store: &Store, facts: &[scan::Facts]) -> Result<String> {
                 ]);
             }
         }
-        if let Some(why) = history::broken(row.lint_errors, row.scan_error.as_deref()) {
-            attention.push(vec![row.name.clone(), "broken".into(), why]);
+        for (fault, why) in &row.faults {
+            attention.push(vec![row.name.clone(), fault.name().into(), why.clone()]);
         }
     }
     if !attention.is_empty() {
@@ -1812,12 +1812,17 @@ fn show_history(scan: Option<&str>, count: usize) -> Result<()> {
         return Err(format!("no scan {id}; `pma history` lists them").into());
     };
     println!(
-        "scan {id}, {}, {}: {} projects, CI failing in {}, {} broken, {} open items",
+        "scan {id}, {}, {}: {} projects, CI failing in {}, {}{} open items",
         report::ago(now - s.at),
         if s.full { "full" } else { "partial" },
         s.projects,
         s.failing,
-        s.broken,
+        scan::Fault::ALL
+            .iter()
+            .zip(s.faults)
+            .filter(|(_, n)| *n > 0)
+            .map(|(f, n)| format!("{n} {}, ", f.name()))
+            .collect::<String>(),
         s.open
     );
     let changes = store.scan_changes(id)?;
@@ -3764,7 +3769,7 @@ fn render(view: View) -> String {
                     tiered: row.tier.is_some() || p.cfg.default_tier.is_some(),
                     has_todo: row.has_todo,
                     lint_errors: row.lint_errors,
-                    scan_error: row.scan_error.as_deref(),
+                    faults: &row.faults,
                 })
                 .collect();
             format!("{header}\n\n{}", report::status(&p.cfg, &rows, explain))
