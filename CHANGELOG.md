@@ -4,6 +4,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.8.0]
+
+Upgrading from 0.7:
+
+- The database moves from schema 35 to 40 on first open. 0.7 refuses it afterwards. Schema 40 drops the `scan_error` columns, so the move cannot be undone; copy `~/.config/pma/projects.db` first if you may go back.
+
+- `broken` is gone from `pma status`, the history and the views. Seven faults replace it; see Changed.
+
+- The first `pma run` of a workflow puts the bundled library in effect, unless you activated a revision of your own. Its worst case is $63 per project, over the default `workflow_budget` of $25, so it asks for `pma config workflow_budget 63` once.
+
 ### Added
 
 **Five more library workflows.** `security-review` and `test-gaps` are `find-issues` aimed at one class of fault, each with a confirm that must find the path or the missing test. `project-brief` writes one note per project: what it does, for whom, in what. `fix-findings` is `apply-fixes` without the lap and retry the runtime does not take, so it runs; `review-and-fix` composes it with `find-issues`, fixing the critical and high findings and printing the rest. All five are in `pma run`. A `brief` type joins the document's types. `docs/dev/workflows.md` 15.16 to 15.20.
