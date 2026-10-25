@@ -13,6 +13,8 @@ pma root add ~/projects        # git repos directly under it are projects
 pma project tier 1 myproject   # 1 is most important, 5 least
 pma scan                       # TODO.md, git state, CI
 pma                            # next: tasks for agents, and what waits on you
+pma run review myproject       # a review, confirmed, findings printed
+pma run fix-ci myproject       # fix failing CI; the edit lands unstaged
 pma dispatch myproject:31      # hand line 31 to an agent
 pma review 1                   # the diff, the test result, the cost
 pma stage 1                    # into your clone's index; `git diff --cached`

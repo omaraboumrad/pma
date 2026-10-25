@@ -6,6 +6,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+**`pma run`: a review, a CI fix or an upgrade, by name.** One command over `pma workflow run` and `pma dispatch`. A target is a project's name or its path. Reviews run to the end and print what they found and where the prose is. `fix-ci` and `deps-upgrade` write each edit that passes verify into the clone, unstaged; `--review` leaves it in `pma review`. With no revision of your own in effect, the bundled library is put in effect on first use, within `workflow_budget`. `docs/dev/run.md`.
+
+```sh
+pma run                                   # the names
+pma run review ~/projects/argdec          # claude, opus unless you configured otherwise
+pma run review -w claude:haiku a b        # another worker and model
+pma run fix-ci --all                      # the plan; `--yes` runs it
+```
+
+`pma dispatch --local` does the same for any target: it starts from the clone's working tree and lands each verified edit there unstaged, as `pma workflow run --local` does. A local `ci` pick reads its logs from the default branch rather than the branch checked out.
+
 **`pma stage` and `pma commit`.** Each runs the steps before it that the run has not done, in your clone:
 
 ```sh

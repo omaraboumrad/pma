@@ -9,6 +9,8 @@ use pma_core::{
 };
 use pma_tui::{choose, tui};
 
+mod run;
+
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
@@ -27,7 +29,7 @@ const GROUPS: [(&str, &[&str]); 6] = [
     (
         "The loop",
         &[
-            "next", "scan", "matrix", "dispatch", "review", "stage", "commit", "push", "pr",
+            "next", "run", "scan", "matrix", "dispatch", "review", "stage", "commit", "push", "pr",
         ],
     ),
     ("Tasks", &["lint", "prune", "stale", "sync", "note", "deps"]),
@@ -226,6 +228,43 @@ enum Command {
         #[arg(short = 'n', long, default_value_t = 20)]
         count: usize,
     },
+    /// Run a review, a CI fix or an upgrade over projects, by name.
+    ///
+    /// Bare, it lists the names. A review runs to the end and prints what it
+    /// found. `fix-ci` and `deps-upgrade` write each edit that passes verify
+    /// into the clone, unstaged. A target is a project's
+    /// name or its path. `--all` and `--tag` show the plan and run it only with
+    /// `--yes`. A review asks `claude` for its strongest model unless `-w`, a
+    /// route or a default preset names another.
+    Run {
+        /// What to run; omit to list the names.
+        name: Option<String>,
+        /// Projects, by name or path.
+        targets: Vec<String>,
+        /// Every scanned project; for `fix-ci` and `deps-upgrade`, every one
+        /// with the signal at the last scan.
+        #[arg(long)]
+        all: bool,
+        /// Every project carrying this tag; repeatable.
+        #[arg(long = "tag", value_name = "TAG")]
+        tags: Vec<String>,
+        /// The worker, and optionally its model: `claude` or `claude:haiku`.
+        #[arg(short = 'w', long, value_name = "AGENT[:MODEL]")]
+        worker: Option<String>,
+        /// Set a workflow parameter: `--set breadth=5`. Repeatable.
+        #[arg(long = "set", value_name = "NAME=VALUE")]
+        set: Vec<String>,
+        /// Show what would run and its worst case; run nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Run a bulk selection without stopping at its plan.
+        #[arg(long, conflicts_with = "dry_run")]
+        yes: bool,
+        /// For `fix-ci` and `deps-upgrade`: leave each edit in `pma review`
+        /// instead of writing it into the clone.
+        #[arg(long)]
+        review: bool,
+    },
     /// Run an agent on tasks, each in its own worktree.
     ///
     /// A target is `project:line`, a TODO.md line from the last scan,
@@ -259,6 +298,11 @@ enum Command {
         /// Clear the named target's consumed attempts and dispatch it again.
         #[arg(long, conflicts_with = "auto")]
         retry: bool,
+        /// Start from each clone's working tree, never the remote, and write
+        /// each edit that passes verify into the clone as unstaged changes;
+        /// one that fails is discarded, its patch kept.
+        #[arg(long)]
+        local: bool,
         /// Queue the command and return at once; `pma job` follows it.
         #[arg(long)]
         detach: bool,
@@ -870,6 +914,27 @@ fn main() -> ExitCode {
             html: None,
         } => show_status(&projects, &tags, explain, all),
         Command::History { scan, count } => show_history(scan.as_deref(), count),
+        Command::Run {
+            name,
+            targets,
+            all,
+            tags,
+            worker,
+            set,
+            dry_run,
+            yes,
+            review,
+        } => run::run(run::Request {
+            name,
+            targets,
+            all,
+            tags,
+            worker,
+            set,
+            dry_run,
+            yes,
+            review,
+        }),
         Command::Dispatch { detach: true, .. } => {
             Store::open_default().and_then(|store| jobs::enqueue(&store))
         }
@@ -882,9 +947,10 @@ fn main() -> ExitCode {
             auto,
             count,
             retry,
+            local,
             detach: false,
         } => overrides(agent, model, preset)
-            .and_then(|over| run_dispatch(&targets, &tags, auto, count, retry, &over)),
+            .and_then(|over| run_dispatch(&targets, &tags, auto, count, retry, local, &over)),
         Command::Review {
             ids,
             approve,
@@ -1847,6 +1913,7 @@ fn run_dispatch(
     auto: bool,
     count: Option<usize>,
     retry: bool,
+    local: bool,
     over: &dispatch::Overrides,
 ) -> Result<()> {
     let store = Store::open_default()?;
@@ -2093,6 +2160,9 @@ fn run_dispatch(
         }
         return Err("nothing to dispatch: every task named was passed over".into());
     }
+    for pick in &mut picks {
+        pick.local = local;
+    }
     run_picks(&store, &home, &p.cfg, over, &picks, wanted, retry).map(|_| ())
 }
 
@@ -2241,9 +2311,27 @@ fn run_picks(
     if queued.is_empty() {
         return Err("no run started".into());
     }
-    let finished = dispatch::execute(store, home, cfg, over, queued, retry, |run| {
+    let mut finished = dispatch::execute(store, home, cfg, over, queued, retry, |run| {
         println!("{}", report::run_line(run));
     })?;
+    if picks.iter().any(|p| p.local) {
+        let mut applied = 0;
+        for run in &mut finished {
+            match publish::land_local(store, home, run) {
+                Ok((landed, said)) => {
+                    applied += (landed == publish::Landed::Applied) as usize;
+                    println!("#{} {}: {said}", run.id, run.project);
+                }
+                Err(e) => println!("#{} {}: left in `pma review`: {e}", run.id, run.project),
+            }
+        }
+        let spent = finished.iter().filter_map(|r| r.cost_usd).sum::<f64>();
+        println!(
+            "{applied} applied unstaged, {} not, ${spent:.2} spent; `git diff` in each clone",
+            finished.len() - applied
+        );
+        return Ok(finished);
+    }
     let ready = finished
         .iter()
         .filter(|r| r.state == RunState::Ready)

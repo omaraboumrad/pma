@@ -557,7 +557,13 @@ pub fn prepare(
             else {
                 return refuse("CI was not failing at the last scan".into());
             };
-            match failed_ci_logs(repo, &default_branch, &workflows)? {
+            // CI failed on the default branch, whatever a local clone has
+            // checked out.
+            let branch = match pick.local {
+                true => scan::default_branch(repo).ok_or(scan::DEFAULT_BRANCH_UNKNOWN)?,
+                false => default_branch.clone(),
+            };
+            match failed_ci_logs(repo, &branch, &workflows)? {
                 Ok(logs) => (logs, Vec::new()),
                 Err(why) => return refuse(why),
             }

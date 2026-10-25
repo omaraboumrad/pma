@@ -637,6 +637,38 @@ fn dispatch_env(s: &Scratch, scripts: &[(&str, &str)]) -> (Env, PathBuf, PathBuf
     (env, origin, alpha)
 }
 
+/// `--local` starts from the clone and writes an edit that passes verify
+/// into it, unstaged; one that fails verify is discarded and the clone keeps
+/// none of it.
+#[test]
+fn a_local_dispatch_lands_verified_edits_unstaged() {
+    let s = Scratch::new("dispatchlocal");
+    let (env, _, alpha) = dispatch_env(&s, &[("claude", FAKE_CLAUDE)]);
+    // Both start from the same tree, which lacks hello.txt, so the second
+    // task's verify fails.
+    let out = env.ok(&["dispatch", "alpha:5", "alpha:7", "--local"]);
+    assert!(out.contains("#1 alpha: applied to"), "{out}");
+    assert!(out.contains("#2 alpha: discarded: verify failed"), "{out}");
+    assert!(out.contains("1 applied unstaged, 1 not"), "{out}");
+    assert_eq!(fs::read_to_string(alpha.join("hello.txt")).unwrap(), "hi\n");
+    assert!(!alpha.join("second.txt").exists());
+    let staged = command("git")
+        .args([
+            "-C",
+            alpha.to_str().unwrap(),
+            "diff",
+            "--cached",
+            "--name-only",
+        ])
+        .output()
+        .unwrap();
+    assert!(staged.stdout.is_empty(), "nothing is staged");
+    assert_eq!(
+        fs::read_to_string(&env.push_log).unwrap(),
+        "blocked\nblocked\n"
+    );
+}
+
 #[test]
 fn dispatch_review_rework_and_push() {
     let s = Scratch::new("stage3");
@@ -5311,6 +5343,99 @@ elif prompt.startswith("Confirm"):
 print(json.dumps({"type": "result", "subtype": "success", "is_error": False,
                   "result": "ok", "total_cost_usd": 0.1}))
 "#;
+
+/// A stand-in for `claude -p` that plays the library's `find-issues`: its
+/// review writes one high finding, and its confirm keeps each unit it reads
+/// with a `reason`. Every invocation is logged.
+const LIBRARY_CLAUDE: &str = r#"#!/usr/bin/env python3
+import json, os, re, sys
+home = os.path.dirname(os.environ["PMA_HOME"])
+prompt = sys.argv[2]
+with open(os.path.join(home, "worker.log"), "a") as f:
+    f.write(" ".join(sys.argv[1:]) + "\n")
+out = re.search(r"(\S*out\.json)", prompt).group(1)
+if prompt.startswith("Review"):
+    open(re.search(r"(\S*REVIEW\.md)", prompt).group(1), "w").write("prose\n")
+    json.dump([{"severity": "high", "title": "a real bug"}], open(out, "w"))
+else:
+    units = json.load(open(re.search(r"(\S*in\.json)", prompt).group(1)))
+    json.dump([{"@id": u["@id"], "reason": "proved"} for u in units], open(out, "w"))
+print(json.dumps({"type": "result", "subtype": "success", "is_error": False,
+                  "result": "ok", "total_cost_usd": 0.1}))
+"#;
+
+/// `pma run`: the names, the bundled library put in effect within
+/// `workflow_budget`, a path as a target, the review's default model and
+/// `-w` over it, a bulk run that stops at its plan, and the dispatch names.
+#[test]
+fn pma_run_reviews_a_path_with_the_bundled_library() {
+    let s = Scratch::new("pmarun");
+    let (env, _, alpha) = dispatch_env(&s, &[("claude", LIBRARY_CLAUDE)]);
+    let log = s.0.join("worker.log");
+    let list = env.ok(&["run"]);
+    assert!(list.contains("review") && list.contains("fix-ci"), "{list}");
+    assert!(
+        list.contains("settle") && list.contains("portfolio-sweep"),
+        "every workflow of the library is listed: {list}"
+    );
+    assert!(
+        list.contains("not runnable from here") && list.contains("record (reads finding)"),
+        "{list}"
+    );
+
+    let (_, err, success) = env.run(&["run", "review", "alpha"]);
+    assert!(
+        !success && err.contains("`pma config workflow_budget 63`"),
+        "the library is held to the budget: {err}"
+    );
+    env.ok(&["config", "workflow_budget", "63"]);
+
+    let out = env.ok(&["run", "review", "--all"]);
+    assert!(out.contains("revision 1: the bundled workflows"), "{out}");
+    assert!(out.contains("rerun with `--yes`"), "{out}");
+    assert!(!log.exists(), "a bulk run without --yes ran an agent");
+
+    let out = env.ok(&["run", "review", alpha.to_str().unwrap()]);
+    assert!(out.contains("REVIEW.md"), "the prose is pointed to: {out}");
+    assert!(out.contains("model opus"), "{out}");
+    assert!(out.contains("high  alpha  a real bug"), "{out}");
+    assert!(out.contains("proved"), "{out}");
+    assert!(fs::read_to_string(&log).unwrap().contains("opus"));
+
+    fs::remove_file(&log).unwrap();
+    let out = env.ok(&["run", "review", "alpha", "-w", "claude:haiku"]);
+    assert!(
+        !out.contains("revision 2"),
+        "the library in effect is kept: {out}"
+    );
+    assert!(!out.contains("model opus"), "{out}");
+    let worker = fs::read_to_string(&log).unwrap();
+    assert!(
+        worker.contains("haiku") && !worker.contains("opus"),
+        "{worker}"
+    );
+
+    // The dispatch names: a target of another signal is refused, and
+    // nothing to fix is a quiet result.
+    let (_, err, success) = env.run(&["run", "fix-ci", "alpha:deps"]);
+    assert!(
+        !success && err.contains("`project:ci` targets only"),
+        "{err}"
+    );
+    let out = env.ok(&["run", "fix-ci", "--all"]);
+    assert!(out.contains("no project has failing CI"), "{out}");
+    let out = env.ok(&["run", "fix-ci", "alpha", "--dry-run"]);
+    assert!(
+        out.contains("would dispatch 1, each edit that passes verify written into its clone"),
+        "{out}"
+    );
+    let out = env.ok(&["run", "fix-ci", "alpha", "--dry-run", "--review"]);
+    assert!(out.contains("each edit left in `pma review`"), "{out}");
+    let out = env.ok(&["run", "deps-upgrade", "alpha", "--dry-run"]);
+    assert!(out.contains("written into its clone"), "{out}");
+    let (_, err, success) = env.run(&["run", "review", "/nowhere/at/all"]);
+    assert!(!success && err.contains("/nowhere/at/all"), "{err}");
+}
 
 /// A review, then a confirm that keeps what it can prove, then a note.
 const REVIEW_CONFIRM: &str = r#"
