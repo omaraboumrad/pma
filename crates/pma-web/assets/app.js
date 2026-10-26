@@ -633,16 +633,43 @@ async function start() {
   document.addEventListener("keydown", onKey);
   await Promise.all([load(), loadProjects()]);
   const events = new EventSource("/api/events");
-  events.addEventListener("tick", (e) => {
-    let busy = false;
-    try { busy = JSON.parse(e.data).busy; } catch (_) { /* keep false */ }
-    setBusy(busy ? "Agents working" : "Idle", busy ? "working" : "");
-    if (!$("dialog").open && !(S.drawer && S.drawer.mode === "detail")) {
-      load();
-      loadProjects();
-    }
-  });
+  const heard = (e) => {
+    let d = {};
+    try { d = JSON.parse(e.data); } catch (_) { /* keep the defaults */ }
+    setBusy(d.busy ? "Agents working" : "Idle", d.busy ? "working" : "");
+    for (const t of d.transitions || []) toast(transitionText(t), transitionTone(t));
+    refresh();
+  };
+  events.addEventListener("tick", heard);
+  events.addEventListener("change", heard);
   events.addEventListener("error", () => setBusy("Disconnected", "lost"));
+}
+
+// Reloads what is on screen: the tab, the project list, and a detail drawer
+// showing a run or a job, whose state may have moved. Not under a dialog,
+// which holds a question the reload would pull from under the user.
+async function refresh() {
+  if ($("dialog").open) return;
+  const detail = S.drawer && S.drawer.mode === "detail" ? currentPick() : null;
+  await Promise.all([load(), loadProjects()]);
+  if (detail && (detail.kind === "run" || detail.kind === "job") && S.drawer && S.drawer.mode === "detail") {
+    try {
+      S.drawer = { mode: "detail", screen: await api("/api/open", { pick: detail }) };
+      draw();
+    } catch (_) { /* the row may be gone; the drawer keeps what it showed */ }
+  }
+}
+
+function transitionText(t) {
+  const who = t.kind === "run" ? `#${t.id} ${t.project}` : `job ${t.id}`;
+  const what = t.kind === "run" && t.state === "ready" ? "ready for review" : t.state;
+  return `${who}: ${what}. ${t.text}`;
+}
+
+function transitionTone(t) {
+  if (t.state === "failed" || t.state === "stopped") return "bad";
+  if (t.state === "pushed" || t.state === "merged" || t.state === "applied" || t.state === "done") return "good";
+  return "accent";
 }
 
 start();

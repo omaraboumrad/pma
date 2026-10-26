@@ -4,6 +4,39 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+Upgrading from 0.8:
+
+- The database moves from schema 40 to 41 on first open. 0.8 refuses it afterwards; copy `~/.config/pma/projects.db` first if you may go back.
+
+- Runs edit your clone by default. `pma config workspace worktree` restores the previous behaviour for every run, `--worktree` for one.
+
+- Verify runs unconfined unless `pma config projects.<name>.sandbox on` says otherwise.
+
+### Added
+
+**Runs that edit the clone.** `workspace`, `clone` by default, puts the agent in the user's clone, from its working tree as it is. The change waits there for review: `git diff` shows it, `pma review` approves it, `pma push` commits and pushes it, and a rejection reverts it from the working tree. Verify runs in the clone, so the project's build is reused rather than rebuilt per run. One clone run per project at a time; a second is refused until the first is decided. `--worktree` on `pma dispatch`, `pma run` and `pma workflow run` gives one run the worktree of before. Chosen over keeping the worktree as the default because reviewing in place, with the project's own tools and caches, was what the worktree got in the way of. `docs/dev/clone-runs.md`.
+
+```sh
+pma run fix-ci spore          # edits ~/projects/spore; `pma review 1` shows the diff
+pma review 1 --approve && pma push 1
+pma review 1 --reject         # reverts it instead
+pma run fix-ci spore --push   # approve and push when the gates are clean
+```
+
+**`--push`** on `pma dispatch` and `pma run`: approve each run whose recorded gates are clean and push it; the rest wait in `pma review`.
+
+**Front ends notice changes.** Both read the store's data version once a second and reload within a second of any other process committing; the web shows a toast when a run reaches review, fails or is pushed, and when a job ends or waits for approval. Before, a view refreshed on a 30 s timer when idle, not at all behind an open detail, and said nothing about what changed.
+
+**`run` from the TUI and the web.** `z` on a project, or on a row naming one, runs a `pma run` name over it, with `--review`, `--worktree`, `--push` and `--worker=agent:model` as typed.
+
+### Changed
+
+- The verify sandbox is off unless `projects.<name>.sandbox` is `on`. A test suite that names `/tmp` itself, which the policy did not grant, failed every verify of a project under it; `/tmp` is granted now too.
+
+- A discarded or rejected run keeps its patch in `runs/<id>/change.patch`, as the `--local` help said and the code did not; `pma review <id>` shows a run's diff after its worktree is gone, from the tree it recorded.
+
+- The project view's `for` column says `named` for a task an agent takes only when dispatched by name, such as a signal of an untiered project, rather than `you`.
+
 ## [0.8.0]
 
 Upgrading from 0.7:

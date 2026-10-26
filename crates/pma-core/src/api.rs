@@ -6,6 +6,7 @@
 //! An action that runs agents or waits on the network is queued as a job
 //! running the same CLI command, so no front end blocks on it.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::config::Config;
@@ -242,6 +243,15 @@ pub enum Action {
         id: i64,
         feedback: String,
     },
+    /// `pma run <name> <project>`: a named job over one project.
+    Run {
+        name: String,
+        project: String,
+        review: bool,
+        worktree: bool,
+        push: bool,
+        worker: WorkerChoice,
+    },
     Publish {
         ids: Vec<i64>,
         all_approved: bool,
@@ -408,6 +418,7 @@ pub fn portfolio(store: &Store, of: &Selection, all: bool) -> Result<Portfolio> 
             tagged_urgent: t.tags.iter().any(|g| g == "urgent"),
             signal_urgent: false,
             eligible: t.tags.iter().any(|g| g == "agent") && !t.tags.iter().any(|g| g == "manual"),
+            manual: t.tags.iter().any(|g| g == "manual"),
             age_days:
                 (today - dates::day(t.added_at.unwrap_or(t.first_seen).min(t.first_seen))).max(0),
         }));
@@ -495,6 +506,110 @@ pub fn busy(store: &Store) -> Result<bool> {
         .iter()
         .any(|j| matches!(j.state.as_str(), "queued" | "running"))
         || store.runs()?.iter().any(|r| r.state == RunState::Running))
+}
+
+/// A run or job that reached a state worth telling the user about.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Transition {
+    /// `run` or `job`.
+    pub kind: &'static str,
+    pub id: i64,
+    /// Empty for a job.
+    pub project: String,
+    pub text: String,
+    pub state: String,
+}
+
+/// What a front end watches between loads: the store's data version, and
+/// the state of every run and job, so a change can be named rather than
+/// found by reloading everything on a timer.
+#[derive(Debug)]
+pub struct Watch {
+    version: i64,
+    runs: BTreeMap<i64, String>,
+    jobs: BTreeMap<i64, String>,
+    /// Whether a job or a run is under way, as `busy` says.
+    pub busy: bool,
+}
+
+impl Watch {
+    pub fn new(store: &Store) -> Result<Watch> {
+        let mut w = Watch {
+            version: store.data_version()?,
+            runs: BTreeMap::new(),
+            jobs: BTreeMap::new(),
+            busy: false,
+        };
+        w.take(store)?;
+        Ok(w)
+    }
+
+    /// `None` when nothing was committed since the last look; otherwise the
+    /// transitions worth a notice, which may be none.
+    pub fn poll(&mut self, store: &Store) -> Result<Option<Vec<Transition>>> {
+        let version = store.data_version()?;
+        if version == self.version {
+            return Ok(None);
+        }
+        self.version = version;
+        Ok(Some(self.take(store)?))
+    }
+
+    fn take(&mut self, store: &Store) -> Result<Vec<Transition>> {
+        let mut out = Vec::new();
+        let runs = store.runs()?;
+        let jobs = store.jobs(50)?;
+        self.busy = jobs
+            .iter()
+            .any(|j| matches!(j.state.as_str(), "queued" | "running"))
+            || runs.iter().any(|r| r.state == RunState::Running);
+        let mut seen = BTreeMap::new();
+        for r in &runs {
+            let state = r.state.name().to_string();
+            let moved = self.runs.get(&r.id) != Some(&state);
+            // Reaching review, or leaving it, is the news; starting is not.
+            let told = matches!(
+                r.state,
+                RunState::Ready
+                    | RunState::Failed
+                    | RunState::Pushed
+                    | RunState::Merged
+                    | RunState::Applied
+                    | RunState::PrOpen
+            );
+            if moved && told && !self.runs.is_empty() {
+                out.push(Transition {
+                    kind: "run",
+                    id: r.id,
+                    project: r.project.clone(),
+                    text: r.text.clone(),
+                    state: state.clone(),
+                });
+            }
+            seen.insert(r.id, state);
+        }
+        self.runs = seen;
+        let mut seen = BTreeMap::new();
+        for j in &jobs {
+            let moved = self.jobs.get(&j.id) != Some(&j.state);
+            let told = matches!(
+                j.state.as_str(),
+                "done" | "failed" | "awaiting-approval" | "stopped"
+            );
+            if moved && told && !self.jobs.is_empty() {
+                out.push(Transition {
+                    kind: "job",
+                    id: j.id,
+                    project: String::new(),
+                    text: format!("pma {}", j.args.join(" ")),
+                    state: j.state.clone(),
+                });
+            }
+            seen.insert(j.id, j.state.clone());
+        }
+        self.jobs = seen;
+        Ok(out)
+    }
 }
 
 /// Marks runs whose session died `failed`, when no session holds the lock.
@@ -885,6 +1000,26 @@ pub fn command_line(a: &Action) -> Option<Vec<String>> {
             }
             worker(&mut v, w);
         }
+        Action::Run {
+            name,
+            project,
+            review,
+            worktree,
+            push,
+            worker: w,
+        } => {
+            v.extend(["run".to_string(), name.clone(), project.clone()]);
+            flag(&mut v, *review, "--review");
+            flag(&mut v, *worktree, "--worktree");
+            flag(&mut v, *push, "--push");
+            if let Some(agent) = &w.agent {
+                let model = w
+                    .model
+                    .as_deref()
+                    .map_or(String::new(), |m| format!(":{m}"));
+                v.push(format!("--worker={agent}{model}"));
+            }
+        }
         Action::ReworkRun { id, feedback } => {
             v.extend([
                 "review".to_string(),
@@ -946,6 +1081,28 @@ mod tests {
             preset: None,
         };
         assert_eq!(
+            line(Action::Run {
+                name: "fix-ci".into(),
+                project: "spore".into(),
+                review: false,
+                worktree: true,
+                push: true,
+                worker: WorkerChoice {
+                    agent: Some("claude".into()),
+                    model: Some("opus".into()),
+                    preset: None,
+                },
+            }),
+            [
+                "run",
+                "fix-ci",
+                "spore",
+                "--worktree",
+                "--push",
+                "--worker=claude:opus"
+            ]
+        );
+        assert_eq!(
             line(Action::WorkflowRun {
                 name: "review-fix".into(),
                 projects: vec!["argdec".into()],
@@ -995,5 +1152,57 @@ mod tests {
             }),
             ["pr", "4"]
         );
+    }
+
+    /// A watch sees a commit by another connection, and names the runs that
+    /// reached review or left it; what it saw first is not news.
+    #[test]
+    fn a_watch_names_runs_that_reach_review() {
+        let dir = std::env::temp_dir().join(format!("pma-watch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("p.db");
+        let writer = Store::open(&path).unwrap();
+        let mut run = Run {
+            project: "p".into(),
+            task_key: "k".into(),
+            text: "Fix it".into(),
+            agent: "claude".into(),
+            repo: PathBuf::from("/r"),
+            worktree: PathBuf::from("/w"),
+            state: RunState::Running,
+            ..Run::default()
+        };
+        writer.insert_run(&mut run).unwrap();
+
+        let reader = Store::open(&path).unwrap();
+        let mut watch = Watch::new(&reader).unwrap();
+        assert!(watch.busy);
+        assert_eq!(
+            watch.poll(&reader).unwrap(),
+            None,
+            "nothing committed since"
+        );
+
+        run.state = RunState::Ready;
+        writer.update_run(&run).unwrap();
+        let moved = watch.poll(&reader).unwrap().expect("a commit was seen");
+        assert_eq!(moved.len(), 1);
+        assert_eq!(
+            (moved[0].kind, moved[0].id, moved[0].state.as_str()),
+            ("run", 1, "ready")
+        );
+        assert_eq!(moved[0].project, "p");
+        assert!(!watch.busy);
+
+        // A new run starting is a change, but not a notice.
+        let mut second = Run {
+            state: RunState::Running,
+            ..run.clone()
+        };
+        writer.insert_run(&mut second).unwrap();
+        assert_eq!(watch.poll(&reader).unwrap(), Some(Vec::new()));
+        assert!(watch.busy);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

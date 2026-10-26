@@ -48,7 +48,39 @@ pub struct Config {
     /// A shell command run when a detached job ends, with `PMA_JOB_ID`,
     /// `PMA_JOB_STATE` and `PMA_JOB_SUMMARY` set.
     pub notify: Option<String>,
+    /// Where an agent edits: the clone itself, or a worktree of it.
+    pub workspace: Workspace,
     pub projects: BTreeMap<String, ProjectSettings>,
+}
+
+/// Where a run's agent edits. See docs/dev/clone-runs.md. The derived
+/// default is the worktree, for a `Run` built without one; the setting
+/// defaults to the clone in `Config::default`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Workspace {
+    /// The user's clone, from its working tree as it is. One run per
+    /// project at a time; the edit waits there for review.
+    Clone,
+    /// A worktree of the remote default branch under pma's state directory.
+    #[default]
+    Worktree,
+}
+
+impl Workspace {
+    pub fn name(self) -> &'static str {
+        match self {
+            Workspace::Clone => "clone",
+            Workspace::Worktree => "worktree",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Workspace> {
+        match s {
+            "clone" => Some(Workspace::Clone),
+            "worktree" => Some(Workspace::Worktree),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,21 +89,14 @@ pub enum Attribution {
     CoAuthor,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct ProjectSettings {
     /// Shell command that checks an agent's work; `None` detects one.
     pub verify: Option<String>,
-    /// Whether verify's writes are confined to the worktree.
+    /// Whether verify's writes are confined to the worktree. Off unless set:
+    /// a test suite that writes outside `$TMPDIR` fails under it for no fault
+    /// of the agent's.
     pub sandbox: bool,
-}
-
-impl Default for ProjectSettings {
-    fn default() -> Self {
-        ProjectSettings {
-            verify: None,
-            sandbox: true,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -111,6 +136,7 @@ impl Default for Config {
             workflow_budget: 25.0,
             timeout: 30,
             notify: None,
+            workspace: Workspace::Clone,
             projects: BTreeMap::new(),
         }
     }
@@ -127,6 +153,7 @@ enum Slot<'a> {
     Priority(&'a mut Priority),
     List(&'a mut Vec<String>),
     Attribution(&'a mut Attribution),
+    Workspace(&'a mut Workspace),
     /// Empty text is `None`.
     OptText(&'a mut Option<String>),
     /// Text that may not be empty.
@@ -235,6 +262,7 @@ impl Config {
                 "workflow_budget",
                 "timeout",
                 "notify",
+                "workspace",
             ]
             .map(String::from),
         );
@@ -267,7 +295,11 @@ impl Config {
             Slot::Tier(_) => "tier",
             Slot::List(_) => "list",
             Slot::Switch(_) => "switch",
-            Slot::Priority(_) | Slot::Attribution(_) | Slot::OptText(_) | Slot::Text(_) => "text",
+            Slot::Priority(_)
+            | Slot::Attribution(_)
+            | Slot::Workspace(_)
+            | Slot::OptText(_)
+            | Slot::Text(_) => "text",
         })
     }
 
@@ -283,6 +315,7 @@ impl Config {
                 Attribution::User => "user".into(),
                 Attribution::CoAuthor => "co-author".into(),
             },
+            Slot::Workspace(w) => w.name().into(),
             Slot::OptText(v) => v.clone().unwrap_or_default(),
             Slot::Text(v) => v.clone(),
             Slot::Switch(v) => if *v { "on" } else { "off" }.into(),
@@ -348,6 +381,9 @@ impl Config {
                     _ => return Err("expected user or co-author".into()),
                 }
             }
+            Slot::Workspace(w) => {
+                *w = Workspace::parse(value).ok_or("expected clone or worktree")?;
+            }
             Slot::OptText(v) => *v = (!value.is_empty()).then(|| value.to_string()),
             Slot::Text(v) => {
                 if value.is_empty() {
@@ -390,6 +426,7 @@ impl Config {
                 // value meant as seconds is refused.
                 "timeout" => Slot::Count(&mut self.timeout, 1, 240),
                 "notify" => Slot::OptText(&mut self.notify),
+                "workspace" => Slot::Workspace(&mut self.workspace),
                 _ => return None,
             },
             Some(("tiers", t)) => Slot::Number(&mut self.tiers[tier(t)?], 0.0),
@@ -448,7 +485,7 @@ mod tests {
     #[test]
     fn every_key_reads_and_round_trips() {
         let keys = Config::keys();
-        assert_eq!(keys.len(), 33);
+        assert_eq!(keys.len(), 34);
         let defaults = Config::default();
         let mut copy = Config::default();
         for key in &keys {
@@ -488,12 +525,17 @@ mod tests {
         assert_eq!(cfg.attribution, Attribution::CoAuthor);
         assert_eq!(cfg.project("cyllama").verify.as_deref(), Some("make check"));
         assert!(
-            cfg.project("cyllama").sandbox,
-            "verify is confined by default"
+            !cfg.project("cyllama").sandbox,
+            "verify runs unconfined unless asked"
         );
-        cfg.set("projects.cyllama.sandbox", "off").unwrap();
-        assert!(!cfg.project("cyllama").sandbox);
-        assert_eq!(cfg.get("projects.cyllama.sandbox").as_deref(), Some("off"));
+        cfg.set("projects.cyllama.sandbox", "on").unwrap();
+        assert!(cfg.project("cyllama").sandbox);
+        assert_eq!(cfg.get("projects.cyllama.sandbox").as_deref(), Some("on"));
+        assert_eq!(cfg.workspace, Workspace::Clone);
+        cfg.set("workspace", "worktree").unwrap();
+        assert_eq!(cfg.workspace, Workspace::Worktree);
+        assert_eq!(cfg.get("workspace").as_deref(), Some("worktree"));
+        assert!(cfg.set("workspace", "branch").is_err());
         // Where a run goes is the command now, so both settings are retired.
         for key in ["publish", "projects.cyllama.publish"] {
             let e = cfg.set(key, "pr").unwrap_err();

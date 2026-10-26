@@ -304,16 +304,56 @@ fn answer(ctx: &Ctx, f: impl FnOnce(&Store) -> Result<Value>) -> Response {
     }
 }
 
-/// A `tick` every 2 seconds while a job or a run is under way, every 30
-/// otherwise, until the page goes away. The page reloads its tab on each.
+/// A `change` whenever anything was committed to the store, read once a
+/// second from its data version and carrying each run or job that reached a
+/// state worth a notice; and a `tick` every 2 seconds while a job or a run is
+/// under way, every 30 otherwise, until the page goes away. The page reloads
+/// on either. Without a store to watch, the ticks alone.
 fn events(stream: &mut TcpStream, ctx: &Ctx) -> std::io::Result<()> {
     http::start_events(stream)?;
+    let store = (ctx.open)().ok();
+    let mut watch = store.as_ref().and_then(|s| api::Watch::new(s).ok());
+    let mut busy = match &watch {
+        Some(w) => w.busy,
+        None => (ctx.open)().and_then(|s| api::busy(&s)).unwrap_or(false),
+    };
+    // The first tick at once, so the page shows whether agents are working
+    // before any cadence has passed.
+    write!(stream, "event: tick\ndata: {{\"busy\":{busy}}}\n\n")?;
+    stream.flush()?;
+    let mut since_tick = std::time::Instant::now();
     loop {
-        let busy = (ctx.open)().and_then(|s| api::busy(&s)).unwrap_or(false);
-        write!(stream, "event: tick\ndata: {{\"busy\":{busy}}}\n\n")?;
-        stream.flush()?;
-        std::thread::sleep(Duration::from_secs(if busy { 2 } else { 30 }));
+        if let (Some(store), Some(w)) = (&store, watch.as_mut())
+            && let Ok(Some(moved)) = w.poll(store)
+        {
+            busy = w.busy;
+            write!(
+                stream,
+                "event: change\ndata: {}\n\n",
+                json!({ "busy": busy, "transitions": moved.iter().map(transition_json).collect::<Vec<_>>() })
+            )?;
+            stream.flush()?;
+        }
+        if since_tick.elapsed() >= Duration::from_secs(if busy { 2 } else { 30 }) {
+            if watch.is_none() {
+                busy = (ctx.open)().and_then(|s| api::busy(&s)).unwrap_or(false);
+            }
+            write!(stream, "event: tick\ndata: {{\"busy\":{busy}}}\n\n")?;
+            stream.flush()?;
+            since_tick = std::time::Instant::now();
+        }
+        std::thread::sleep(Duration::from_secs(1));
     }
+}
+
+fn transition_json(t: &api::Transition) -> Value {
+    json!({
+        "kind": t.kind,
+        "id": t.id,
+        "project": t.project,
+        "text": t.text,
+        "state": t.state,
+    })
 }
 
 fn tab_named(name: &str) -> Option<Tab> {

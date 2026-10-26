@@ -53,6 +53,9 @@ struct Ctx<'a> {
     /// The instance works from each clone's `HEAD` and writes a verified edit
     /// into the clone, unstaged. Recorded on the instance as `@local`.
     local: bool,
+    /// Where each edit node's agent edits: the setting, or a worktree when
+    /// the instance was started with `--worktree`, recorded as `@worktree`.
+    workspace: crate::config::Workspace,
     /// What happened to each edit written to, or discarded from, a clone.
     landed: RefCell<Vec<String>>,
 }
@@ -974,6 +977,10 @@ fn advance_inner(
         deferred: RefCell::new(BTreeSet::new()),
         bases: RefCell::new(BTreeMap::new()),
         local: given.args.get("@local").and_then(Value::as_bool) == Some(true),
+        workspace: match given.args.get("@worktree").and_then(Value::as_bool) == Some(true) {
+            true => crate::config::Workspace::Worktree,
+            false => cfg.workspace,
+        },
         landed: RefCell::new(Vec::new()),
     };
     let mut approve = given.approve.map(String::from);
@@ -2786,6 +2793,7 @@ fn run_edit(ctx: &Ctx<'_>, node: &Node, units: &[WorkflowUnit], known: &Known) -
                 details: Some(task),
                 quadrant: None,
                 local: ctx.local,
+                workspace: ctx.workspace,
             };
             match crate::dispatch::prepare(ctx.store, ctx.home, ctx.cfg, ctx.over, &pick)? {
                 crate::dispatch::Prepared::Refused(why) => {
@@ -2823,11 +2831,14 @@ fn run_edit(ctx: &Ctx<'_>, node: &Node, units: &[WorkflowUnit], known: &Known) -
                 .as_deref()
                 .is_some_and(|e| e.starts_with(crate::dispatch::NOT_STARTED))
             {
-                let _ = crate::dispatch::remove_worktree(&run.repo, &run.worktree, &run.branch);
+                if run.workspace == crate::config::Workspace::Worktree {
+                    let _ = crate::dispatch::remove_worktree(&run.repo, &run.worktree, &run.branch);
+                }
                 continue;
             }
             known.runs.insert(unit.id.clone(), run.id);
-            if ctx.local {
+            // A clone run already sits in its clone; it waits there for review.
+            if ctx.local && run.workspace == crate::config::Workspace::Worktree {
                 let (line, conflict) =
                     match crate::publish::land_local(ctx.store, ctx.home, &mut run) {
                         Ok((landed, said)) => (

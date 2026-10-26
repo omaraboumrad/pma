@@ -117,6 +117,10 @@ pub struct Request {
     pub yes: bool,
     /// Leave each edit in `pma review` rather than in the clone.
     pub review: bool,
+    /// Edit in a worktree, whatever the setting says.
+    pub worktree: bool,
+    /// Approve and push each run whose gates are clean.
+    pub push: bool,
 }
 
 pub fn run(req: Request) -> Result<()> {
@@ -196,10 +200,16 @@ pub fn run(req: Request) -> Result<()> {
                 return Ok(());
             }
             let local = !req.review;
+            let in_clone = !req.worktree && cfg.workspace == pma_core::config::Workspace::Clone;
             if req.dry_run || (bulk && !req.yes) {
-                let goes = match local {
-                    true => "each edit that passes verify written into its clone, unstaged",
-                    false => "each edit left in `pma review`",
+                let goes = match (in_clone, req.push, local) {
+                    (true, true, _) => "each edit made in its clone and pushed when clean",
+                    (true, false, _) => "each edit made in its clone, waiting for review",
+                    (false, true, _) => "each edit pushed when clean",
+                    (false, false, true) => {
+                        "each edit that passes verify written into its clone, unstaged"
+                    }
+                    (false, false, false) => "each edit left in `pma review`",
                 };
                 println!("would dispatch {}, {goes}:", targets.len());
                 for t in &targets {
@@ -215,7 +225,15 @@ pub fn run(req: Request) -> Result<()> {
                 model,
                 preset: None,
             };
-            run_dispatch(&targets, &[], false, None, false, local, &over)
+            run_dispatch(
+                &targets,
+                &[],
+                false,
+                None,
+                false,
+                super::dispatch_flags(local && !req.push, req.worktree, req.push),
+                &over,
+            )
         }
         Runs::Workflow(workflow_name) => {
             let revision = effective_revision(&store, &cfg)?;
@@ -264,6 +282,7 @@ pub fn run(req: Request) -> Result<()> {
                 approve: None,
                 unattended: !(req.dry_run || gated),
                 local: false,
+                worktree: req.worktree,
                 detach: false,
                 cap: Vec::new(),
                 agent,

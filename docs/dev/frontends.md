@@ -102,7 +102,7 @@ One installed binary. The split stops UI code leaking into the core: `pma-core` 
 
 ### Live data
 
-Both front ends poll the core every 2 s while any job or run is active, and every 30 s otherwise: the same cadence as `pma watch`. The web server pushes each changed view to the browser by server-sent events (SSE). Agent progress comes from the existing log reading in `crates/pma-core/src/watch.rs`.
+Both front ends read SQLite's `data_version` once a second (`api::Watch`); it moves when any other connection commits, so a run reaching review in another process is seen within a second without reading the tables. On a change the web server sends a `change` event, naming each run or job that reached a state worth a notice, and the page reloads its tab, the project list and an open run or job detail, and shows one toast per transition. The TUI reloads its view the same way. A `tick` every 2 s while any job or run is active, and every 30 s otherwise, is the fallback cadence, and what a front end's own writes refresh under, since a connection's own commits do not move its data version. Agent progress comes from the existing log reading in `crates/pma-core/src/watch.rs`.
 
 ### Web security
 

@@ -11,7 +11,7 @@ use std::time::Duration;
 use crate::agent;
 use crate::class::Class;
 use crate::complexity::{self, Features};
-use crate::config::Config;
+use crate::config::{Config, Workspace};
 use crate::rank::Quadrant;
 use crate::route::{Policy, Subject};
 use crate::scan;
@@ -41,6 +41,9 @@ pub struct Pick {
     /// Start from the clone's `HEAD` rather than the fetched default branch.
     /// A local run never reaches the remote.
     pub local: bool,
+    /// Where the agent edits. `Clone` ignores `local`: a clone run always
+    /// starts from the working tree, and waits there for review.
+    pub workspace: Workspace,
 }
 
 /// Which workflow unit a dispatch serves.
@@ -236,7 +239,7 @@ const GIT_CHANGED: &str = "the repository's hooks or git settings changed since 
 pub fn unchanged_git(run: &Run) -> Result<()> {
     let gone = !run.worktree.exists();
     let Some(then) = &run.git_snapshot else {
-        return match gone {
+        return match gone || run.workspace == Workspace::Clone {
             true => Ok(()),
             false => own_gitdir(run),
         };
@@ -365,6 +368,9 @@ pub fn own_gitdir(run: &Run) -> Result<()> {
 /// a `.pre-commit-config.yaml`, run what the reviewer approved in the diff.
 /// Global and system settings are the user's, so they are left out.
 pub fn git_snapshot(run: &Run) -> Result<String> {
+    if run.workspace == Workspace::Clone {
+        return snapshot_in(&run.repo, &run.repo);
+    }
     own_gitdir(run)?;
     snapshot_in(&run.repo, &run.worktree)
 }
@@ -532,7 +538,24 @@ pub fn prepare(
     let repo = &pick.repo;
     // Before the fetch, which reads `url.*` and `core.sshCommand`.
     clone_unchanged(store, repo)?;
-    let (default_branch, base) = if pick.local {
+    let in_clone = pick.workspace == Workspace::Clone;
+    if in_clone && let Some(held) = clone_busy(&store.runs()?, repo) {
+        return Ok(Prepared::Refused(format!(
+            "{}: its clone holds run #{held} ({}); approve or reject it first, or \
+             dispatch with --worktree",
+            pick.project,
+            store.run(held)?.state.name()
+        )));
+    }
+    // A clone run's `base` is `HEAD`, which publishing requires unmoved; its
+    // `start` is the working tree, which may differ.
+    let start = in_clone.then(|| working_tree_commit(repo)).transpose()?;
+    let (default_branch, base) = if in_clone {
+        (
+            git(repo, &["rev-parse", "--abbrev-ref", "HEAD"])?,
+            git(repo, &["rev-parse", "HEAD"])?,
+        )
+    } else if pick.local {
         (
             git(repo, &["rev-parse", "--abbrev-ref", "HEAD"])?,
             working_tree_commit(repo)?,
@@ -559,7 +582,7 @@ pub fn prepare(
             };
             // CI failed on the default branch, whatever a local clone has
             // checked out.
-            let branch = match pick.local {
+            let branch = match pick.local || in_clone {
                 true => scan::default_branch(repo).ok_or(scan::DEFAULT_BRANCH_UNKNOWN)?,
                 false => default_branch.clone(),
             };
@@ -593,7 +616,9 @@ pub fn prepare(
             (pick.details.clone().unwrap_or_default(), Vec::new())
         }
         _ => {
-            let file = git(repo, &["show", &format!("{base}:TODO.md")]).ok();
+            // The tree the agent starts from: the working tree for a clone run.
+            let from = start.as_deref().unwrap_or(&base);
+            let file = git(repo, &["show", &format!("{from}:TODO.md")]).ok();
             match on_origin(file.as_deref(), &pick.key, &pick.text) {
                 OnOrigin::Open(description, tags) => (description, tags),
                 OnOrigin::Done => {
@@ -621,6 +646,25 @@ pub fn prepare(
             pick.text,
             class.name()
         ));
+    }
+
+    if in_clone {
+        // The run's `worktree` is the clone; `branch` is what it has checked
+        // out, which is where a push goes.
+        return queue(
+            store,
+            home,
+            cfg,
+            over,
+            pick,
+            repo,
+            &default_branch.clone(),
+            class,
+            default_branch,
+            base,
+            start,
+            details,
+        );
     }
 
     let parent = home.join("worktrees").join(&pick.project);
@@ -670,6 +714,7 @@ pub fn prepare(
         class,
         default_branch,
         base,
+        None,
         details,
     );
     if !matches!(prepared, Ok(Prepared::Queued(_))) {
@@ -678,12 +723,22 @@ pub fn prepare(
     prepared
 }
 
+/// The clone run that holds `repo`, if one does: one that is queued, under
+/// way, or waiting in review or in its clone's index. A failed one too, since
+/// its agent may have left edits that only a reject reverts.
+pub fn clone_busy(runs: &[Run], repo: &Path) -> Option<i64> {
+    runs.iter()
+        .filter(|r| r.repo == repo && r.workspace == Workspace::Clone && !r.state.is_final())
+        .map(|r| r.id)
+        .next()
+}
+
 /// A commit of the clone's working tree, untracked files included and ignored
 /// ones not, on top of `HEAD`. A local edit starts from it, so it sees the
 /// developer's uncommitted work and the edits applied before it, and its patch
 /// applies to the tree it was made from. Built in a temporary index, so the
 /// clone's index, refs and files are untouched; `HEAD` when nothing differs.
-fn working_tree_commit(repo: &Path) -> Result<String> {
+pub fn working_tree_commit(repo: &Path) -> Result<String> {
     let head = git(repo, &["rev-parse", "HEAD"])?;
     let index = std::env::temp_dir().join(format!(
         "pma-index-{}-{}",
@@ -739,6 +794,7 @@ fn queue(
     class: Class,
     default_branch: String,
     base: String,
+    start: Option<String>,
     details: String,
 ) -> Result<Prepared> {
     let repo = &pick.repo;
@@ -748,14 +804,19 @@ fn queue(
     let git_snapshot = git_snapshot(&Run {
         repo: repo.clone(),
         worktree: worktree.to_path_buf(),
+        workspace: pick.workspace,
         ..Run::default()
     })?;
     let verify = verify_command(cfg, &pick.project, worktree);
     // The worktree is a clean checkout of the base, so this is the base
-    // tree. One verify at the head alone cannot tell a regression from a
-    // repository that was already failing.
+    // tree; a clone run's is its working tree, keyed by `start`. One verify
+    // at the head alone cannot tell a regression from a repository that was
+    // already failing.
     let (verify_base_ok, verify_base_seconds) = match &verify {
-        Some(v) => base_verify(store, home, cfg, &pick.project, &base, v, worktree)?,
+        Some(v) => {
+            let at = start.as_deref().unwrap_or(&base);
+            base_verify(store, home, cfg, &pick.project, at, v, worktree)?
+        }
         None => (None, None),
     };
     let mut features = Features::of(&pick.text, &details);
@@ -868,6 +929,8 @@ fn queue(
         git_snapshot: Some(git_snapshot),
         reviewed_tree: None,
         infra: false,
+        workspace: pick.workspace,
+        start,
     };
     run.prompt = prompt(&run, &details, verify.as_deref());
     store.insert_run(&mut run)?;
@@ -966,8 +1029,14 @@ pub fn changelog_draft(home: &Path, id: i64) -> PathBuf {
 }
 
 fn prompt(run: &Run, details: &str, verify: Option<&str>) -> String {
+    let where_ = match run.workspace {
+        Workspace::Clone => {
+            "in the developer's own clone. Files you did not change are theirs; leave them as they are."
+        }
+        Workspace::Worktree => "in a git worktree of it.",
+    };
     let mut p = format!(
-        "You are working on the project `{}`, in a git worktree of it.\n\nTask: {}\n",
+        "You are working on the project `{}`, {where_}\n\nTask: {}\n",
         run.project, run.text
     );
     if !details.trim().is_empty() {
@@ -1417,7 +1486,10 @@ pub fn verify_once(
 
 /// The verify sandbox for `worktree`, checked by running one confined command.
 fn confine(worktree: &Path) -> std::io::Result<sanduk_sandbox::Policy> {
-    let policy = sanduk_sandbox::Policy::new(worktree)?;
+    // `/tmp` as well as `$TMPDIR`, which on macOS is under `/var/folders`: a
+    // test suite that names `/tmp` itself, for a short Unix socket path,
+    // fails under the policy otherwise.
+    let policy = sanduk_sandbox::Policy::new(worktree)?.writable("/tmp")?;
     policy.preflight().map_err(|e| {
         std::io::Error::other(format!(
             "the verify sandbox did not start ({e}); \
@@ -1572,9 +1644,50 @@ fn fail(run: &mut Run, a: &mut Attempt, error: String) {
 
 /// The last line of `git diff --stat` against the base, untracked files
 /// included.
+/// What the run's change is read against: `start` for a clone run, else the
+/// base.
+pub fn from(run: &Run) -> &str {
+    run.start.as_deref().unwrap_or(&run.base)
+}
+
+/// The side of the diff the reviewer sees. In a worktree, the working tree
+/// itself, after `git add --intent-to-add` has made untracked files visible
+/// to `git diff`. In a clone, a commit of the working tree built in a
+/// temporary index, so the clone's own index is never touched: `git diff`
+/// then takes it as any other revision. For a run whose tree is gone, the
+/// tree the reviewer was last shown, which is also what a rejected or
+/// published run shows.
+fn to(run: &Run) -> Result<Option<String>> {
+    let reviewable = matches!(
+        run.state,
+        RunState::Running | RunState::Ready | RunState::Approved | RunState::Failed
+    );
+    if !reviewable || !run.worktree.is_dir() {
+        return Ok(run.reviewed_tree.clone());
+    }
+    match run.workspace {
+        Workspace::Clone => Ok(Some(working_tree_commit(&run.repo)?)),
+        Workspace::Worktree => {
+            wt_git(run, &["add", "--all", "--intent-to-add"])?;
+            Ok(None)
+        }
+    }
+}
+
+/// `git diff` arguments for the run's change: `from` against `to`, or
+/// against the working tree when `to` is `None`.
+fn range(run: &Run, to: Option<&str>) -> Vec<String> {
+    let mut v = vec![from(run).to_string()];
+    v.extend(to.map(str::to_string));
+    v
+}
+
 fn diffstat(run: &Run) -> Option<String> {
-    wt_git(run, &["add", "--all", "--intent-to-add"]).ok()?;
-    let stat = wt_git(run, &["diff", "--stat", &run.base]).ok()?;
+    let to = to(run).ok()?;
+    let mut args = vec!["diff".to_string(), "--stat".into()];
+    args.extend(range(run, to.as_deref()));
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let stat = wt_git(run, &args).ok()?;
     Some(
         stat.lines()
             .last()
@@ -1589,11 +1702,16 @@ fn diffstat(run: &Run) -> Option<String> {
 /// newline, and `--name-status` rather than `--name-only`, because a rename
 /// names two paths and only the status says so.
 fn changed_paths(run: &Run) -> Result<Vec<String>> {
-    wt_git(run, &["add", "--all", "--intent-to-add"])?;
-    let out = wt_git(
-        run,
-        &["diff", "--name-status", "-z", "--find-renames", &run.base],
-    )?;
+    let to = to(run)?;
+    let mut args = vec![
+        "diff".to_string(),
+        "--name-status".into(),
+        "-z".into(),
+        "--find-renames".into(),
+    ];
+    args.extend(range(run, to.as_deref()));
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = wt_git(run, &args)?;
     let mut fields = out.split('\0').filter(|f| !f.is_empty());
     let mut paths = Vec::new();
     while let Some(status) = fields.next() {
@@ -1613,16 +1731,40 @@ fn changed_paths(run: &Run) -> Result<Vec<String>> {
     Ok(paths)
 }
 
-/// `git diff` of the worktree against the run's base.
+/// `git diff` of the run's change: the worktree against the base, or a
+/// clone's working tree against `start`.
 pub fn diff(run: &Run) -> Result<String> {
-    wt_git(run, &["add", "--all", "--intent-to-add"])?;
-    wt_git(run, &["diff", &run.base])
+    let to = to(run)?;
+    if to.is_none() && !run.worktree.is_dir() {
+        return Err(format!(
+            "{} no longer exists and no tree was recorded",
+            run.worktree.display()
+        )
+        .into());
+    }
+    let mut args = vec!["diff".to_string()];
+    args.extend(range(run, to.as_deref()));
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    // Two objects diff anywhere in the repository, so a run whose worktree
+    // is gone still reads.
+    unchanged_git(run)?;
+    let dir = match run.worktree.is_dir() {
+        true => &run.worktree,
+        false => &run.repo,
+    };
+    git(dir, &args)
 }
 
 /// The worktree's content as one object id: `git add --all`, which stages
 /// without committing, then `git write-tree`. The same call when publishing
-/// says whether anything changed since.
+/// says whether anything changed since. A clone's content is read through a
+/// temporary index, so nothing is staged in the user's.
 pub fn tree(run: &Run) -> Result<String> {
+    if run.workspace == Workspace::Clone {
+        unchanged_git(run)?;
+        let commit = working_tree_commit(&run.repo)?;
+        return git(&run.repo, &["rev-parse", &format!("{commit}^{{tree}}")]);
+    }
     wt_git(run, &["add", "--all"])?;
     wt_git(run, &["write-tree"])
 }
@@ -1733,12 +1875,71 @@ pub fn discard(store: &Store, run: &mut Run, keep: bool) -> Result<()> {
         )
         .into());
     }
+    // The patch stays in the run's log directory either way.
+    let patch = keep_patch(run);
+    if run.workspace == Workspace::Clone {
+        revert(run, patch.as_deref())?;
+        run.enter(RunState::Rejected);
+        return store.update_run_from(run, read);
+    }
     // Written first, and only over the state that was read: a run another
     // front end approved meanwhile is refused with its worktree intact.
     run.enter(RunState::Rejected);
     store.update_run_from(run, read)?;
     remove_worktree(&run.repo, &run.worktree, &run.branch)
         .map_err(|e| format!("run #{} is rejected, but its worktree stays: {e}", run.id).into())
+}
+
+/// Writes the run's change to `runs/<id>/change.patch`, best effort: a run
+/// that never ran has nothing to keep.
+fn keep_patch(run: &Run) -> Option<PathBuf> {
+    let home = crate::store::state_home().ok()?;
+    // A worktree's `to` is the working tree itself; the patch needs an
+    // object, so it is written from the tree.
+    let to = match to(run).ok()? {
+        Some(to) => to,
+        None => tree(run).ok()?,
+    };
+    crate::publish::write_patch(&home, run, &to).ok()
+}
+
+/// Takes a clone run's change out of the working tree: the patch in reverse,
+/// which refuses when the files moved on since. Only the working tree: the
+/// index is the user's. Nothing to revert is fine.
+fn revert(run: &Run, patch: Option<&Path>) -> Result<()> {
+    let Some(patch) = patch else {
+        return Ok(());
+    };
+    if std::fs::metadata(patch).map_or(0, |m| m.len()) == 0 {
+        return Ok(());
+    }
+    git(
+        &run.repo,
+        &[
+            "apply",
+            "--reverse",
+            "--binary",
+            "--check",
+            path_arg(patch)?,
+        ],
+    )
+    .and_then(|_| {
+        git(
+            &run.repo,
+            &["apply", "--reverse", "--binary", path_arg(patch)?],
+        )
+    })
+    .map(|_| ())
+    .map_err(|e| {
+        format!(
+            "run #{}'s change no longer reverts cleanly from {}: {e}\n\
+             Take it out yourself, then reject again. The patch: {}",
+            run.id,
+            run.repo.display(),
+            patch.display()
+        )
+        .into()
+    })
 }
 
 /// Runs the agent again in the same worktree with the reviewer's feedback.
@@ -1785,6 +1986,14 @@ pub fn rework(
 
 /// Removes the worktree and its branch. Either may already be gone.
 pub fn remove_worktree(repo: &Path, worktree: &Path, branch: &str) -> Result<()> {
+    // A clone run's `worktree` is the repository itself.
+    let same = || match (worktree.canonicalize(), repo.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => worktree == repo,
+    };
+    if same() {
+        return Err(format!("{} is the repository, not a worktree", worktree.display()).into());
+    }
     let gitfile = std::fs::symlink_metadata(worktree.join(".git")).is_ok_and(|m| m.is_file());
     if worktree.exists() && gitfile {
         git(
@@ -1937,6 +2146,8 @@ mod tests {
             git_snapshot: None,
             reviewed_tree: None,
             infra: false,
+            workspace: Workspace::Worktree,
+            start: None,
         };
         let p = prompt(&run, "for all classes\n", Some("make test"));
         assert!(p.contains("`cynn`"));

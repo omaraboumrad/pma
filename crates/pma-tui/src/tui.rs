@@ -1076,18 +1076,30 @@ pub fn run(store: &Store) -> Result<()> {
     let result = (|| -> Result<()> {
         let first = Request::Load(app.query());
         execute(store, &mut app, first);
+        // The store's data version, read once a second, says when another
+        // process committed; the cadence below is the fallback, and what
+        // this process's own writes refresh under.
+        let mut watch = api::Watch::new(store).ok();
+        let mut loaded = std::time::Instant::now();
         loop {
-            let busy = api::busy(store).unwrap_or(false);
+            let busy = match &watch {
+                Some(w) => w.busy,
+                None => api::busy(store).unwrap_or(false),
+            };
             app.set_busy(busy);
             terminal.draw(|f| app.render(f))?;
-            let wait = match busy {
+            let cadence = match busy {
                 true => Duration::from_secs(2),
                 false => Duration::from_secs(30),
             };
-            if !event::poll(wait)? {
-                if app.idle() {
+            if !event::poll(Duration::from_secs(1))? {
+                let changed = watch
+                    .as_mut()
+                    .is_some_and(|w| matches!(w.poll(store), Ok(Some(_))));
+                if (changed || loaded.elapsed() >= cadence) && app.idle() {
                     let again = Request::Load(app.query());
                     execute(store, &mut app, again);
+                    loaded = std::time::Instant::now();
                 }
                 continue;
             }

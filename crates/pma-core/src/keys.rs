@@ -118,10 +118,13 @@ pub enum Act {
     RunCampaign,
     Sync,
     Verify,
+    /// `pma run <name>` over the project in view or the selected row's,
+    /// from a typed `<name> [--review] [--worktree] [--push]`.
+    Run,
 }
 
 impl Act {
-    pub const ALL: [Act; 24] = [
+    pub const ALL: [Act; 25] = [
         Act::ApproveRun,
         Act::ApproveRuns,
         Act::RejectRun,
@@ -146,6 +149,7 @@ impl Act {
         Act::RunCampaign,
         Act::Sync,
         Act::Verify,
+        Act::Run,
     ];
 
     pub fn name(self) -> String {
@@ -164,6 +168,7 @@ impl Act {
                 | Act::SettlePrs
                 | Act::ApproveRuns
                 | Act::StartWorkflow
+                | Act::Run
         )
     }
 
@@ -198,6 +203,7 @@ impl Act {
             Action::Dispatch { .. } => &[Act::Dispatch],
             Action::WorkflowRun { .. } => &[Act::ResumeWorkflow, Act::StartWorkflow],
             Action::ReworkRun { .. } => &[Act::ReworkRun],
+            Action::Run { .. } => &[Act::Run],
             Action::Publish { .. } => &[Act::Stage, Act::Commit, Act::Pr, Act::Push],
             Action::RunCampaign { .. } => &[Act::RunCampaign],
             Action::Sync { .. } => &[Act::Sync],
@@ -342,6 +348,14 @@ pub const BINDINGS: &[Binding] = &[
         Act::ScanProject,
         Ask::Nothing,
         "rescan project",
+    ),
+    // A project: the one in view, or the selected row's.
+    on(
+        "z",
+        &[Tab::Project, Tab::Status, Tab::Next, Tab::Matrix],
+        Act::Run,
+        Ask::Text("name [--review] [--worktree] [--push]"),
+        "run",
     ),
     // A task.
     on("d", TASKS, Act::Dispatch, Ask::Confirm, "dispatch"),

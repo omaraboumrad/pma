@@ -2,11 +2,11 @@
 
 Maintain many repositories from one place.
 
-If you keep dozens of small projects, the work is not hard, it is scattered. Each repository has a `TODO.md`, failing CI, outdated dependencies and a dirty working tree, and finding out means opening all of them. `pma` reads them all in one pass, ranks every task across every project in one list, and can hand a task to a coding agent in a throwaway worktree. You read the diff, and `pma` commits it and opens a pull request or pushes.
+If you keep dozens of small projects, the work is not hard, it is scattered. Each repository has a `TODO.md`, failing CI, outdated dependencies and a dirty working tree, and finding out means opening all of them. `pma` reads them all in one pass, ranks every task across every project in one list, and can hand a task to a coding agent in your clone, or in a throwaway worktree. You read the diff, and `pma` commits it and opens a pull request or pushes.
 
 Scanning 95 repositories takes about 15 seconds.
 
-Nothing is published without you. An agent runs with no push credentials in its environment, `pma` runs the project's tests itself rather than trusting the agent's report, and every change waits in a worktree until you approve it.
+Nothing is published without you. An agent runs with no push credentials in its environment, `pma` runs the project's tests itself rather than trusting the agent's report, and every change waits unstaged until you approve it.
 
 ```sh
 pma root add ~/projects        # git repos directly under it are projects
@@ -14,7 +14,7 @@ pma project tier 1 myproject   # 1 is most important, 5 least
 pma scan                       # TODO.md, git state, CI
 pma                            # next: tasks for agents, and what waits on you
 pma run review myproject       # a review, confirmed, findings printed
-pma run fix-ci myproject       # fix failing CI; the edit lands unstaged
+pma run fix-ci myproject       # fix failing CI in the clone; the edit waits for review
 pma dispatch myproject:31      # hand line 31 to an agent
 pma review 1                   # the diff, the test result, the cost
 pma stage 1                    # into your clone's index; `git diff --cached`
@@ -55,11 +55,11 @@ pma push 1                     # commit and push it; or `pma pr 1` after --appro
 
 - `sanduk` is the same agent in a disposable container: the key stays on the host, the worktree is mounted at its own path, and the box is the bound. Needs [sanduk](https://github.com/shakfu/sanduk-rs) (`cargo install sanduk`) and a container engine; `pma agent show sanduk` prints what it runs.
 
-- Each run gets its own worktree of the remote default branch, so your dirty checkout is never touched.
+- By default an agent edits your clone, from the working tree as it is, and its change waits there unstaged: `git diff` shows it, `pma review` approves it, and a rejection reverts it. Your own files are left alone. One run per project at a time. `pma config workspace worktree`, or `--worktree` on one command, gives each run a worktree of the remote default branch instead, so your checkout is never touched and runs can share a project.
 
 - The agent's environment holds no push credentials: tokens, the SSH agent and askpass helpers are removed, and git's pushes are redirected. Credentials on disk, such as `~/.ssh` keys or `~/.git-credentials`, stay readable; this stops an accidental push, not a determined one. `pma` runs the project's test command itself, before and after, and reports both ends.
 
-- That test command runs on the host, able to write only to the worktree, the temp directory and the toolchain caches: Landlock on Linux 6.2 and later, Seatbelt on macOS. Reads and the network stay open.
+- With `pma config projects.<name>.sandbox on`, that test command runs able to write only to the worktree, the temp directories and the toolchain caches: Landlock on Linux 6.2 and later, Seatbelt on macOS. Reads and the network stay open. Off by default: a suite that writes elsewhere fails under it for no fault of the agent's.
 
 - A hook or git setting added to the repository during a run fails the run, and `pma` runs no git in that repository until it is restored, or until `pma review <id> --reject --keep-git-changes` accepts it as yours.
 
@@ -242,7 +242,7 @@ pma report --by project         # also class or agent
 
 A target naming one task fails if that task cannot run. A target naming many passes over each with its reason, and dispatches the rest.
 
-Each run gets a worktree of the remote default branch under `~/.local/state/pma/worktrees`, on a `pma/` branch. The item must be open in the remote `TODO.md`, so commit and push before dispatching. Set the test command with `pma config projects.myproject.verify "make check"`, or let it be detected. A check that must write elsewhere needs `pma config projects.myproject.sandbox off`.
+A run edits the clone, or with `pma config workspace worktree` a worktree of the remote default branch under `~/.local/state/pma/worktrees`, on a `pma/` branch; in a worktree, the item must be open in the remote `TODO.md`, so commit and push before dispatching. Set the test command with `pma config projects.myproject.verify "make check"`, or let it be detected. `pma config projects.myproject.sandbox on` confines what the check may write. `docs/dev/clone-runs.md` has the clone run's rules.
 
 In a project with a `CHANGELOG.md`, the agent leaves that file alone and drafts one entry per separable change. `pma review <id>` shows the entries, or says none was drafted.
 

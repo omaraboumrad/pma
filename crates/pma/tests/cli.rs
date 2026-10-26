@@ -633,6 +633,9 @@ fn dispatch_env(s: &Scratch, scripts: &[(&str, &str)]) -> (Env, PathBuf, PathBuf
 
     env.ok(&["root", "add", root.to_str().unwrap()]);
     env.ok(&["project", "tier", "1", "alpha"]);
+    // The tests on this env were written for worktree runs, several of
+    // which share one clone; clone runs have their own tests.
+    env.ok(&["config", "workspace", "worktree"]);
     env.ok(&["scan", "--offline"]);
     (env, origin, alpha)
 }
@@ -667,6 +670,130 @@ fn a_local_dispatch_lands_verified_edits_unstaged() {
         fs::read_to_string(&env.push_log).unwrap(),
         "blocked\nblocked\n"
     );
+    // The discarded edit keeps its patch, and its review still shows it.
+    let patch = env.home.join("state/runs/2/change.patch");
+    assert!(
+        fs::read_to_string(&patch).unwrap().contains("+two"),
+        "{patch:?}"
+    );
+    let detail = env.ok(&["review", "2"]);
+    assert!(
+        detail.contains("rejected") && detail.contains("+two"),
+        "{detail}"
+    );
+}
+
+/// A clone run edits the clone itself, from its working tree as it is, and
+/// waits there for review: nothing staged, the user's own files untouched. A
+/// second run on the clone is refused until the first is decided. Approval
+/// stages exactly the reviewed change, task tick included, and `pma push`
+/// commits and pushes it; a rejection reverts the change from the working
+/// tree, keeps its patch, and the diff still reads.
+#[test]
+fn a_clone_run_edits_the_clone_and_waits_for_review() {
+    let s = Scratch::new("clonerun");
+    let (env, origin, alpha) = dispatch_env(&s, &[("claude", FAKE_CLAUDE)]);
+    env.ok(&["config", "workspace", "clone"]);
+    fs::write(alpha.join("mine.txt"), "my own work\n").unwrap();
+
+    let out = env.ok(&["dispatch", "alpha:5"]);
+    assert!(
+        out.contains("#1 alpha: edited") && out.contains("in place"),
+        "{out}"
+    );
+    assert_eq!(fs::read_to_string(alpha.join("hello.txt")).unwrap(), "hi\n");
+    assert!(git_out(&alpha, &["diff", "--cached", "--name-only"]).is_empty());
+    let status = git_out(&alpha, &["status", "--short"]);
+    assert_eq!(status, "?? hello.txt\n?? mine.txt\n", "{status}");
+    assert_eq!(fs::read_to_string(&env.push_log).unwrap(), "blocked\n");
+
+    let detail = env.ok(&["review", "1"]);
+    assert!(detail.contains("+hi"), "{detail}");
+    assert!(!detail.contains("my own work"), "{detail}");
+    assert!(
+        detail.contains("`make test`: base FAILED, head passed"),
+        "{detail}"
+    );
+    assert!(detail.contains("in clone"), "{detail}");
+
+    let (_, err, success) = env.run(&["dispatch", "alpha:7"]);
+    assert!(!success && err.contains("holds run #1"), "{err}");
+
+    env.ok(&["review", "1", "--approve"]);
+    let (out, err, success) = env.run(&["pr", "1"]);
+    assert!(!success && out.contains("--worktree"), "{out}{err}");
+    let out = env.ok(&["push", "1"]);
+    assert!(
+        out.contains("staged in") && out.contains("committed") && out.contains("pushed"),
+        "{out}"
+    );
+    let pushed = git_out(&origin, &["show", "main:hello.txt"]);
+    assert_eq!(pushed, "hi\n");
+    assert!(
+        git_out(&origin, &["show", "main:TODO.md"]).contains("- [x] add greeting"),
+        "the task is ticked in the commit"
+    );
+    assert_eq!(
+        git_out(&alpha, &["rev-parse", "HEAD"]),
+        git_out(&origin, &["rev-parse", "main"])
+    );
+    let status = git_out(&alpha, &["status", "--short"]);
+    assert_eq!(status, "?? mine.txt\n", "{status}");
+
+    // The clone is free again. This run passes verify, since hello.txt is
+    // there now, and is rejected anyway.
+    env.ok(&["scan", "--offline"]);
+    let out = env.ok(&["dispatch", "alpha:7"]);
+    assert!(out.contains("#2 alpha: edited"), "{out}");
+    assert_eq!(
+        fs::read_to_string(alpha.join("second.txt")).unwrap(),
+        "two\n"
+    );
+    env.ok(&["review", "2", "--reject"]);
+    assert!(
+        !alpha.join("second.txt").exists(),
+        "the rejection reverts it"
+    );
+    let status = git_out(&alpha, &["status", "--short"]);
+    assert_eq!(status, "?? mine.txt\n", "{status}");
+    let patch = env.home.join("state/runs/2/change.patch");
+    assert!(
+        fs::read_to_string(&patch).unwrap().contains("+two"),
+        "the patch stays"
+    );
+    let detail = env.ok(&["review", "2"]);
+    assert!(
+        detail.contains("rejected") && detail.contains("+two"),
+        "{detail}"
+    );
+}
+
+/// `--push` approves and pushes a run whose gates are clean, from the clone,
+/// and leaves one that is not in review.
+#[test]
+fn push_approves_and_pushes_clean_runs() {
+    let s = Scratch::new("clonepush");
+    let (env, origin, alpha) = dispatch_env(&s, &[("claude", FAKE_CLAUDE)]);
+    env.ok(&["config", "workspace", "clone"]);
+
+    let out = env.ok(&["dispatch", "alpha:5", "--push"]);
+    assert!(out.contains("pushed"), "{out}");
+    assert_eq!(git_out(&origin, &["show", "main:hello.txt"]), "hi\n");
+    assert!(git_out(&alpha, &["status", "--short"]).is_empty());
+
+    // Green at the base and green at the head proves nothing for specified
+    // work, so this one waits.
+    env.ok(&["scan", "--offline"]);
+    let out = env.ok(&["dispatch", "alpha:7", "--push"]);
+    assert!(
+        out.contains("waits in `pma review`") && out.contains("base already passed"),
+        "{out}"
+    );
+    assert_eq!(
+        fs::read_to_string(alpha.join("second.txt")).unwrap(),
+        "two\n"
+    );
+    assert!(env.ok(&["review"]).contains("#2  ready"));
 }
 
 #[test]
@@ -5284,10 +5411,12 @@ fn verify_runs_the_check_where_a_dispatch_would() {
     assert!(!success && err.contains("name a project"), "{err}");
 }
 
-/// Verify runs confined to its worktree. A check that writes elsewhere fails
-/// and leaves nothing on disk; one that writes the tree and the temp directory
-/// and reads git passes. The escape target is under `CARGO_TARGET_TMPDIR`
-/// because the sandbox grants the temp directory, which holds the scratch.
+/// With `sandbox on`, verify runs confined to its worktree. A check that
+/// writes elsewhere fails and leaves nothing on disk; one that writes the
+/// tree and the temp directory and reads git passes. The escape target is
+/// under `CARGO_TARGET_TMPDIR` because the sandbox grants the temp
+/// directory, which holds the scratch. Off, the default, the same check
+/// writes it.
 #[test]
 fn verify_cannot_write_outside_its_worktree() {
     let s = Scratch::new("sandbox");
@@ -5298,6 +5427,11 @@ fn verify_cannot_write_outside_its_worktree() {
     let escape = format!("touch '{}'", outside.display());
 
     env.ok(&["config", "projects.alpha.verify", &escape]);
+    env.ok(&["verify", "alpha"]);
+    assert!(outside.exists(), "verify runs unconfined unless asked");
+    fs::remove_file(&outside).unwrap();
+
+    env.ok(&["config", "projects.alpha.sandbox", "on"]);
     let (out, _, success) = env.run(&["verify", "alpha"]);
     assert!(!success && out.contains("FAILED"), "{out}");
     assert!(

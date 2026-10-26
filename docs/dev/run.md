@@ -24,9 +24,11 @@ Any other workflow in the revision in effect runs by its own name. Bare `pma run
 
 ## Where a fix lands
 
-`fix-ci` and `deps-upgrade` dispatch with `--local`: each run starts from the clone's working tree, and an edit that passes verify is written into the clone unstaged. One that fails verify, changes nothing, or has no verify command is discarded; its patch stays in the run's log directory. `--review` leaves each edit in `pma review` instead.
+With `workspace = clone`, the default, `fix-ci` and `deps-upgrade` edit the clone itself and the change waits there for review, whatever the verify result: `pma review <id>` shows the diff, `--approve` then `pma push` commits and pushes it, `--reject` reverts it. `--push` approves and pushes each run whose gates are clean and leaves the rest in review. `docs/dev/clone-runs.md`.
 
-A local `ci` pick reads its logs from the default branch, where CI failed, not from the branch the clone has checked out. The edit still applies to the working tree as it is.
+With `workspace = worktree`, or `--worktree`, they dispatch with `--local`: each run starts from the clone's working tree in a worktree, and an edit that passes verify is written into the clone unstaged. One that fails verify, changes nothing, or has no verify command is discarded; its patch stays in the run's log directory. `--review` leaves each edit in `pma review` instead.
+
+A `ci` pick in the clone, or local, reads its logs from the default branch, where CI failed, not from the branch the clone has checked out. The edit still applies to the working tree as it is.
 
 ## Model
 

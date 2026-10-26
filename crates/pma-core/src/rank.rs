@@ -114,6 +114,8 @@ pub struct Task {
     /// with its own tier, and items tagged `#agent`. Importance orders the
     /// queue; this decides what is dispatched from it.
     pub eligible: bool,
+    /// Tagged `#manual`: no agent may take it, named or not.
+    pub manual: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -197,12 +199,14 @@ pub fn signal_tasks(cfg: &Config, p: &Project) -> Vec<Task> {
         signal_urgent: urgent,
         age_days,
         eligible: false,
+        manual: false,
     };
     let mut tasks = Vec::new();
     if let Ci::Failing(workflows) = &p.ci {
         tasks.push(Task {
             key: Some("ci".into()),
             eligible: true,
+            manual: false,
             ..task(
                 cfg.signals.ci,
                 format!("fix CI: {}", workflows.join(", ")),
@@ -215,6 +219,7 @@ pub fn signal_tasks(cfg: &Config, p: &Project) -> Vec<Task> {
         tasks.push(Task {
             key: Some("deps".into()),
             eligible: true,
+            manual: false,
             ..task(
                 cfg.signals.deps,
                 format!("update dependencies: {n} outdated"),
@@ -432,6 +437,7 @@ mod tests {
             signal_urgent: false,
             age_days: 0,
             eligible: false,
+            manual: false,
         }
     }
 

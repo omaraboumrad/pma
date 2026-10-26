@@ -264,6 +264,14 @@ enum Command {
         /// instead of writing it into the clone.
         #[arg(long)]
         review: bool,
+        /// Edit in a worktree of the remote default branch rather than in
+        /// the clone, whatever `pma config workspace` says.
+        #[arg(long)]
+        worktree: bool,
+        /// Approve each run whose recorded gates are clean and push it; the
+        /// rest wait in `pma review`.
+        #[arg(long)]
+        push: bool,
     },
     /// Run an agent on tasks, each in its own worktree.
     ///
@@ -300,9 +308,18 @@ enum Command {
         retry: bool,
         /// Start from each clone's working tree, never the remote, and write
         /// each edit that passes verify into the clone as unstaged changes;
-        /// one that fails is discarded, its patch kept.
+        /// one that fails is discarded, its patch kept. Worktree runs only:
+        /// a clone run already edits the clone, and waits there for review.
         #[arg(long)]
         local: bool,
+        /// Edit in a worktree of the remote default branch rather than in
+        /// the clone, whatever `pma config workspace` says.
+        #[arg(long)]
+        worktree: bool,
+        /// Approve each run whose recorded gates are clean and push it; the
+        /// rest wait in `pma review`.
+        #[arg(long, conflicts_with = "local")]
+        push: bool,
         /// Queue the command and return at once; `pma job` follows it.
         #[arg(long)]
         detach: bool,
@@ -796,9 +813,15 @@ enum WorkflowAction {
         unattended: bool,
         /// Work from each clone's `HEAD`, never the remote, and write each
         /// edit that passes verify into the clone as unstaged changes; one
-        /// that fails is discarded. Recorded on the instance.
+        /// that fails is discarded. Recorded on the instance. Worktree runs
+        /// only: a clone run edits the clone and waits there for review.
         #[arg(long, conflicts_with = "instance")]
         local: bool,
+        /// Edit nodes run in worktrees of the remote default branch rather
+        /// than in the clone, whatever `pma config workspace` says. Recorded
+        /// on the instance.
+        #[arg(long, conflicts_with = "instance")]
+        worktree: bool,
         /// Queue the command and return at once; `pma job` follows it.
         #[arg(long, conflicts_with = "dry_run")]
         detach: bool,
@@ -924,6 +947,8 @@ fn main() -> ExitCode {
             dry_run,
             yes,
             review,
+            worktree,
+            push,
         } => run::run(run::Request {
             name,
             targets,
@@ -934,6 +959,8 @@ fn main() -> ExitCode {
             dry_run,
             yes,
             review,
+            worktree,
+            push,
         }),
         Command::Dispatch { detach: true, .. } => {
             Store::open_default().and_then(|store| jobs::enqueue(&store))
@@ -948,9 +975,20 @@ fn main() -> ExitCode {
             count,
             retry,
             local,
+            worktree,
+            push,
             detach: false,
-        } => overrides(agent, model, preset)
-            .and_then(|over| run_dispatch(&targets, &tags, auto, count, retry, local, &over)),
+        } => overrides(agent, model, preset).and_then(|over| {
+            run_dispatch(
+                &targets,
+                &tags,
+                auto,
+                count,
+                retry,
+                dispatch_flags(local, worktree, push),
+                &over,
+            )
+        }),
         Command::Review {
             ids,
             approve,
@@ -1907,13 +1945,34 @@ fn show_status(names: &[String], tags: &[String], explain: bool, all: bool) -> R
     })
 }
 
-fn run_dispatch(
+/// The flags of a dispatch that say where it edits and what becomes of the
+/// edit.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DispatchFlags {
+    /// Worktree runs only: start from the working tree and land a verified
+    /// edit unstaged.
+    pub local: bool,
+    /// A worktree whatever the setting says.
+    pub worktree: bool,
+    /// Approve and push each run whose gates are clean.
+    pub push: bool,
+}
+
+pub fn dispatch_flags(local: bool, worktree: bool, push: bool) -> DispatchFlags {
+    DispatchFlags {
+        local,
+        worktree,
+        push,
+    }
+}
+
+pub fn run_dispatch(
     targets: &[String],
     tags: &[String],
     auto: bool,
     count: Option<usize>,
     retry: bool,
-    local: bool,
+    flags: DispatchFlags,
     over: &dispatch::Overrides,
 ) -> Result<()> {
     let store = Store::open_default()?;
@@ -2003,6 +2062,7 @@ fn run_dispatch(
                 details: None,
                 quadrant: Some(format!("{:?}", x.quadrant)),
                 local: false,
+                workspace: config::Workspace::Worktree,
             });
         }
         let tasks = store.tasks()?;
@@ -2140,6 +2200,7 @@ fn run_dispatch(
                     text,
                     gh,
                     local: false,
+                    workspace: config::Workspace::Worktree,
                 });
             }
         }
@@ -2160,10 +2221,56 @@ fn run_dispatch(
         }
         return Err("nothing to dispatch: every task named was passed over".into());
     }
+    let workspace = match flags.worktree {
+        true => config::Workspace::Worktree,
+        false => p.cfg.workspace,
+    };
     for pick in &mut picks {
-        pick.local = local;
+        pick.local = flags.local;
+        pick.workspace = workspace;
     }
-    run_picks(&store, &home, &p.cfg, over, &picks, wanted, retry).map(|_| ())
+    let finished = run_picks(&store, &home, &p.cfg, over, &picks, wanted, retry)?;
+    if flags.push {
+        push_clean(&store, &home, &p.cfg, finished)?;
+    }
+    Ok(())
+}
+
+/// Approves and pushes each finished run whose recorded gates are clean;
+/// names why each other one waits in `pma review`.
+fn push_clean(
+    store: &Store,
+    home: &std::path::Path,
+    cfg: &config::Config,
+    finished: Vec<store::Run>,
+) -> Result<()> {
+    let by = api::whoami();
+    let mut approved = Vec::new();
+    for mut run in finished {
+        let reasons = pma_core::accept::review_reasons(&run);
+        if !reasons.is_empty() {
+            println!(
+                "#{} {}: waits in `pma review`: {}",
+                run.id,
+                run.project,
+                reasons.join("; ")
+            );
+            continue;
+        }
+        dispatch::approve(store, &mut run, &by)?;
+        approved.push(run);
+    }
+    publish::publish(
+        store,
+        home,
+        cfg,
+        approved,
+        publish::Target::Push,
+        |run, outcome| match outcome {
+            Ok(said) => println!("#{} {}: {said}", run.id, run.project),
+            Err(e) => println!("#{} {}: not pushed: {e}", run.id, run.project),
+        },
+    )
 }
 
 /// The project's open items from the last scan, one priority or all of them.
@@ -2275,6 +2382,23 @@ fn chosen(project: &str, rows: Vec<choose::Row>) -> Result<Option<Vec<choose::Ro
     Ok(choose::run(&mut app)?)
 }
 
+/// Where a finished clone run's change is, and what to do with it.
+fn clone_outcome(run: &store::Run) -> String {
+    match run.state {
+        RunState::Ready => format!(
+            "edited {} in place; `git diff` shows it, `pma review {}` approves or reverts it",
+            run.repo.display(),
+            run.id
+        ),
+        _ => format!(
+            "{}; `pma review {} --reject` reverts what it left in {}",
+            run.state.name(),
+            run.id,
+            run.repo.display()
+        ),
+    }
+}
+
 /// Prepares up to `wanted` picks and runs them, reporting each. Returns the
 /// finished runs, so a caller that owns a set of tasks can record them.
 fn run_picks(
@@ -2317,6 +2441,11 @@ fn run_picks(
     if picks.iter().any(|p| p.local) {
         let mut applied = 0;
         for run in &mut finished {
+            // A clone run already edited its clone; it waits there.
+            if run.workspace == config::Workspace::Clone {
+                println!("#{} {}: {}", run.id, run.project, clone_outcome(run));
+                continue;
+            }
             match publish::land_local(store, home, run) {
                 Ok((landed, said)) => {
                     applied += (landed == publish::Landed::Applied) as usize;
@@ -2331,6 +2460,12 @@ fn run_picks(
             finished.len() - applied
         );
         return Ok(finished);
+    }
+    for run in finished
+        .iter()
+        .filter(|r| r.workspace == config::Workspace::Clone)
+    {
+        println!("#{} {}: {}", run.id, run.project, clone_outcome(run));
     }
     let ready = finished
         .iter()
@@ -2510,6 +2645,7 @@ fn run_campaign(name: &str, count: Option<usize>) -> Result<()> {
                 .then(|| format!("{}\n", campaign.description.trim_end())),
             quadrant: None,
             local: false,
+            workspace: cfg.workspace,
         });
     }
     if picks.is_empty() {
@@ -2897,6 +3033,7 @@ fn workflow_command(action: Option<WorkflowAction>) -> Result<()> {
             approve,
             unattended,
             local,
+            worktree,
             detach,
             cap,
             agent,
@@ -3004,6 +3141,9 @@ fn workflow_command(action: Option<WorkflowAction>) -> Result<()> {
                     let mut args = serde_json::to_value(w.bind(&set)?)?;
                     if local {
                         args["@local"] = serde_json::Value::Bool(true);
+                    }
+                    if worktree {
+                        args["@worktree"] = serde_json::Value::Bool(true);
                     }
                     // Guards hold against unit data alone, so the arguments
                     // go into them here, before any unit enters the graph.

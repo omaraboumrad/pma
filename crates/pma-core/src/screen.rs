@@ -1270,9 +1270,13 @@ pub fn screen(view: View) -> Screen {
                             }),
                             cell(priority, priority_tone(priority)),
                             cell(when.clone(), when_tone(&when)),
-                            match p.task.eligible {
-                                true => cell("agent", Tone::Accent),
-                                false => muted("you"),
+                            // `agent`: `--auto` takes it. `named`: an agent
+                            // takes it when dispatched by name. `you`: no
+                            // agent may.
+                            match (p.task.eligible, p.task.manual, p.task.key.is_some()) {
+                                (true, _, _) => cell("agent", Tone::Accent),
+                                (false, false, true) => muted("named"),
+                                _ => muted("you"),
                             },
                             plain(p.task.text.clone()),
                         ],
@@ -1435,6 +1439,46 @@ pub fn action_in(
         },
         (Act::AddNote, _) => Action::AddNote { text: input.into() },
         (Act::SettlePrs, _) => Action::SettlePrs,
+        (Act::Run, pick) => {
+            let project = match pick.project() {
+                Some(p) => p.to_string(),
+                None if !project.is_empty() => project.to_string(),
+                None => return Err("open a project, or select a row that names one".into()),
+            };
+            let mut words = input.split_whitespace();
+            let name = words
+                .next()
+                .ok_or("type what to run, such as `review` or `fix-ci`; `pma run` lists them")?
+                .to_string();
+            let (mut review, mut worktree, mut push, mut agent, mut model) =
+                (false, false, false, None, None);
+            for w in words {
+                match w {
+                    "--review" => review = true,
+                    "--worktree" => worktree = true,
+                    "--push" => push = true,
+                    _ if w.starts_with("--worker=") || w.starts_with("-w=") => {
+                        let v = w.split_once('=').map_or("", |(_, v)| v);
+                        let (a, m) = v.split_once(':').map_or((v, None), |(a, m)| (a, Some(m)));
+                        agent = Some(a.to_string());
+                        model = m.map(str::to_string);
+                    }
+                    _ => return Err(format!("unknown flag `{w}`")),
+                }
+            }
+            Action::Run {
+                name,
+                project,
+                review,
+                worktree,
+                push,
+                worker: WorkerChoice {
+                    agent,
+                    model,
+                    preset: None,
+                },
+            }
+        }
         (Act::StartWorkflow, _) => {
             let mut words = input.split_whitespace();
             let name = words
@@ -1754,6 +1798,39 @@ mod tests {
         assert_eq!(worker.model.as_deref(), Some("haiku"));
         assert_eq!(set, ["breadth=5"]);
         assert!(action(Act::StartWorkflow, &Pick::Nothing, &[], "w a --nope").is_err());
+    }
+
+    /// `run` takes its project from the row, or from the view when the row
+    /// names none, and reads the flags `pma run` takes.
+    #[test]
+    fn a_typed_run_names_its_project_and_flags() {
+        let row = Pick::Manual {
+            project: "spore".into(),
+        };
+        let Ok(Action::Run {
+            name,
+            project,
+            review,
+            worktree,
+            push,
+            worker,
+        }) = action(Act::Run, &row, &[], "fix-ci --push --worker=claude:haiku")
+        else {
+            panic!("a run");
+        };
+        assert_eq!((name.as_str(), project.as_str()), ("fix-ci", "spore"));
+        assert!(push && !review && !worktree);
+        assert_eq!(worker.agent.as_deref(), Some("claude"));
+        assert_eq!(worker.model.as_deref(), Some("haiku"));
+        let Ok(Action::Run { project, .. }) =
+            action_in(Act::Run, &Pick::Nothing, &[], "review", "argdec")
+        else {
+            panic!("a run on the project in view");
+        };
+        assert_eq!(project, "argdec");
+        assert!(action(Act::Run, &Pick::Nothing, &[], "review").is_err());
+        assert!(action(Act::Run, &row, &[], "").is_err());
+        assert!(action(Act::Run, &row, &[], "review --nope").is_err());
     }
 
     #[test]

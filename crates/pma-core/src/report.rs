@@ -436,10 +436,16 @@ pub fn run_fields(run: &Run) -> Vec<Vec<String>> {
                 duration(run.seconds)
             ),
         ],
-        vec![
-            "branch".into(),
-            format!("{} in {}", run.branch, run.worktree.display()),
-        ],
+        match run.workspace {
+            crate::config::Workspace::Clone => vec![
+                "edited".into(),
+                format!("in clone {} on {}", run.repo.display(), run.branch),
+            ],
+            crate::config::Workspace::Worktree => vec![
+                "branch".into(),
+                format!("{} in {}", run.branch, run.worktree.display()),
+            ],
+        },
         vec![
             "verify".into(),
             match &run.verify {
@@ -679,6 +685,7 @@ mod tests {
                 tagged_urgent: false,
                 signal_urgent: false,
                 eligible: false,
+                manual: false,
                 age_days: 12,
             },
             importance: 0.5,

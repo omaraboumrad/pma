@@ -239,6 +239,7 @@ mod tests {
                 tagged_urgent: false,
                 signal_urgent: line.is_none(),
                 eligible,
+                manual: false,
                 age_days: 3,
             },
             importance: 0.5,

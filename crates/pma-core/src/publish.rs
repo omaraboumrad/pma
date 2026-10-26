@@ -8,7 +8,7 @@
 
 use std::process::Command;
 
-use crate::config::{Attribution, Config};
+use crate::config::{Attribution, Config, Workspace};
 use crate::dispatch::{git, remove_worktree, wt_git};
 use crate::store::{Result, Run, RunState, Store};
 use crate::todo;
@@ -89,6 +89,14 @@ pub fn publish(
 }
 
 fn open_pr(store: &Store, cfg: &Config, run: &mut Run) -> Result<String> {
+    if run.workspace == Workspace::Clone {
+        return Err(format!(
+            "run #{} edited its clone on `{}`; `pma push {}` publishes it there. \
+             A pull request needs a worktree run: dispatch with --worktree.",
+            run.id, run.branch, run.id
+        )
+        .into());
+    }
     let outcome = publish_one(cfg, run)?;
     run.enter(RunState::PrOpen);
     run.outcome = Some(outcome.clone());
@@ -119,7 +127,10 @@ fn to_clone(
 ) -> Result<String> {
     crate::dispatch::clone_unchanged(store, &run.repo)?;
     let mut said = Vec::new();
-    if matches!(run.state, RunState::Staged | RunState::Committed) && run.worktree.exists() {
+    if matches!(run.state, RunState::Staged | RunState::Committed)
+        && run.workspace == Workspace::Worktree
+        && run.worktree.exists()
+    {
         // Staging removed it, or warned that it could not.
         remove_worktree(&run.repo, &run.worktree, &run.branch)?;
     }
@@ -214,8 +225,12 @@ fn stage(home: &std::path::Path, run: &mut Run) -> Result<String> {
         .into());
     }
     // Before the tick, which alone is not a change.
-    if tree == wt_git(run, &["rev-parse", &format!("{}^{{tree}}", run.base)])? {
+    let from = crate::dispatch::from(run).to_string();
+    if tree == wt_git(run, &["rev-parse", &format!("{from}^{{tree}}")])? {
         return Err("nothing to stage: no changes".into());
+    }
+    if run.workspace == Workspace::Clone {
+        return stage_in_clone(home, run, &tree);
     }
     let tree = tick(home, run, &tree)?;
     at_base(run)?;
@@ -249,6 +264,62 @@ fn stage(home: &std::path::Path, run: &mut Run) -> Result<String> {
     }
     if let Err(e) = remove_worktree(&run.repo, &run.worktree, &run.branch) {
         outcome.push_str(&format!("; warning: worktree not removed: {e}"));
+    }
+    Ok(outcome)
+}
+
+/// A clone run's change is already in the working tree, so staging is the
+/// patch applied to the index alone, from `start` to the reviewed tree. The
+/// tick goes into the working tree and the index together, since the file
+/// the user sees is the one that will be committed.
+fn stage_in_clone(home: &std::path::Path, run: &mut Run, tree: &str) -> Result<String> {
+    at_base(run)?;
+    if git(&run.repo, &["diff", "--cached", "--quiet"]).is_err() {
+        return Err(format!(
+            "the index of {} holds staged changes; commit or unstage them first",
+            run.repo.display()
+        )
+        .into());
+    }
+    let file = write_patch(home, run, tree)?;
+    git(
+        &run.repo,
+        &[
+            "apply",
+            "--cached",
+            "--binary",
+            crate::dispatch::path_arg(&file)?,
+        ],
+    )
+    .map_err(|e| {
+        format!(
+            "{NO_APPLY}{e}; the index differs from the tree the run started from. \
+             Stage it yourself with `git add`; the patch: {}",
+            file.display()
+        )
+    })?;
+    if !crate::dispatch::without_item(&run.task_key) {
+        let path = run.repo.join("TODO.md");
+        if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(format!("{}: is a symlink; pma edits only a file", path.display()).into());
+        }
+        let text =
+            std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        if let Some(edited) = todo::mark_done(&text, &run.task_key, &run.text) {
+            todo::save(&path, &edited).map_err(|e| format!("{}: {e}", path.display()))?;
+            git(&run.repo, &["add", "--", "TODO.md"])?;
+        }
+    }
+    let staged = git(&run.repo, &["write-tree"])?;
+    let record = staged_tree_file(home, run.id);
+    std::fs::write(&record, &staged).map_err(|e| format!("{}: {e}", record.display()))?;
+    let mut outcome = format!(
+        "staged in {}; `git diff --cached` shows it",
+        run.repo.display()
+    );
+    let draft = crate::dispatch::changelog_draft(home, run.id);
+    if draft.is_file() {
+        outcome.push_str(&format!("; changelog entries in {}", draft.display()));
     }
     Ok(outcome)
 }
@@ -345,8 +416,9 @@ fn push(home: &std::path::Path, run: &Run) -> Result<String> {
     ))
 }
 
-/// The diff from the run's base to `tree`, in the run's log directory.
-fn write_patch(home: &std::path::Path, run: &Run, tree: &str) -> Result<std::path::PathBuf> {
+/// The diff from what the run started from to `tree`, in the run's log
+/// directory.
+pub fn write_patch(home: &std::path::Path, run: &Run, tree: &str) -> Result<std::path::PathBuf> {
     let dir = home.join("runs").join(run.id.to_string());
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let file = dir.join("change.patch");
@@ -365,7 +437,7 @@ fn write_patch(home: &std::path::Path, run: &Run, tree: &str) -> Result<std::pat
             "--src-prefix=a/",
             "--dst-prefix=b/",
             &output,
-            &run.base,
+            crate::dispatch::from(run),
             tree,
         ],
     )?;
@@ -382,6 +454,13 @@ pub fn land_local(
     home: &std::path::Path,
     run: &mut Run,
 ) -> Result<(Landed, String)> {
+    if run.workspace == Workspace::Clone {
+        return Err(format!(
+            "run #{} edited its clone directly and waits there for review",
+            run.id
+        )
+        .into());
+    }
     let passed = run.state == RunState::Ready && run.verify_ok == Some(true) && run.error.is_none();
     let refused = if !passed {
         Some(match (&run.verify, run.verify_ok) {

@@ -16,6 +16,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::class::Class;
 use crate::complexity::Features;
+use crate::config::Workspace;
 use crate::route::{Approval, Policy};
 use crate::scan::{Ci, Facts, Fault};
 use crate::todo::Priority;
@@ -23,7 +24,7 @@ use crate::worker::{Parser, Worker};
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
-const VERSION: i64 = 40;
+const VERSION: i64 = 41;
 
 const SCHEMA: &str = "
 CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -373,6 +374,16 @@ DELETE FROM scan_changes WHERE kind = 'mended' AND detail = '';
 DROP VIEW fault_kind;
 ALTER TABLE projects DROP COLUMN scan_error;
 ALTER TABLE scan_projects DROP COLUMN scan_error;
+";
+
+/// Version 41. Where the agent edited: `clone`, the user's repository from
+/// its working tree, or `worktree`. `start` is the commit of that working
+/// tree at dispatch, which a clone run's diff, scope and revert read
+/// against; `base` stays `HEAD`, which publishing requires unmoved. Rows from
+/// before are worktree runs.
+const WORKSPACE: &str = "
+ALTER TABLE runs ADD COLUMN workspace TEXT NOT NULL DEFAULT 'worktree';
+ALTER TABLE runs ADD COLUMN start TEXT;
 ";
 
 /// Version 39. Seeds `refresh`, the worker that runs `pma deps refresh`.
@@ -979,6 +990,7 @@ impl Store {
                     PROJECT_DEPS,
                     REFRESH_WORKER,
                     SCAN_FAULTS,
+                    WORKSPACE,
                 ];
                 let tx = conn.unchecked_transaction()?;
                 for step in &steps[version as usize..] {
@@ -1921,10 +1933,10 @@ impl Store {
                                complexity, features, estimator,
                                route_revision, route, approval,
                                workflow_instance, node, unit, lap, preset, extra_args,
-                               git_snapshot)
+                               git_snapshot, workspace, start)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
                      ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30,
-                     ?31, ?32, ?33, ?34, ?35, ?36, ?37)",
+                     ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39)",
             params![
                 run.project,
                 run.task_key,
@@ -1963,6 +1975,8 @@ impl Store {
                 run.preset,
                 serde_json::to_string(&run.extra_args).unwrap_or_else(|_| "[]".into()),
                 run.git_snapshot,
+                run.workspace.name(),
+                run.start,
             ],
         )?;
         run.id = self.conn.last_insert_rowid();
@@ -2046,6 +2060,15 @@ impl Store {
 
     /// Records the tree `pma review <id>` showed. One column, so a reading
     /// command does not write back a copy of the whole run.
+    /// SQLite's data version: it moves whenever another connection commits.
+    /// A front end polls it to learn that anything changed, without reading
+    /// the tables to find out.
+    pub fn data_version(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .pragma_query_value(None, "data_version", |r| r.get(0))?)
+    }
+
     pub fn set_reviewed_tree(&self, id: i64, tree: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE runs SET reviewed_tree = ?2 WHERE id = ?1",
@@ -2065,7 +2088,7 @@ impl Store {
                     complexity, features, estimator, route_revision, route, approval,
                     approved_tree, approved_head, approved_by,
                     workflow_instance, node, unit, lap, preset, extra_args, git_snapshot,
-                    reviewed_tree, infra
+                    reviewed_tree, infra, workspace, start
              FROM runs ORDER BY id",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -2149,6 +2172,8 @@ impl Store {
                 git_snapshot: r.get(55)?,
                 reviewed_tree: r.get(56)?,
                 infra: r.get(57)?,
+                workspace: Workspace::parse(&r.get::<_, String>(58)?).unwrap_or_default(),
+                start: r.get(59)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -3149,6 +3174,12 @@ pub struct Run {
     pub reviewed_tree: Option<String>,
     /// Rejected for a fault of the check or the machine, not the agent.
     pub infra: bool,
+    /// Where the agent edited. A worktree run's `worktree` is its own
+    /// directory; a clone run's is `repo`.
+    pub workspace: Workspace,
+    /// A clone run's working tree at dispatch, as a commit; `HEAD` itself
+    /// when nothing differed. What its diff and its revert read against.
+    pub start: Option<String>,
 }
 
 impl Run {
@@ -3214,6 +3245,8 @@ impl Run {
             git_snapshot: None,
             reviewed_tree: None,
             infra: false,
+            workspace: Workspace::Worktree,
+            start: None,
         }
     }
 
@@ -3771,7 +3804,11 @@ mod tests {
     }
 
     /// The columns version 40 drops, for a test that replays it.
+    /// Undoes versions 40 and 41, for a test that rewinds the schema past
+    /// them.
     const BEFORE_SCAN_FAULTS: &str = "
+        ALTER TABLE runs DROP COLUMN workspace;
+        ALTER TABLE runs DROP COLUMN start;
         ALTER TABLE projects ADD COLUMN scan_error TEXT;
         ALTER TABLE scan_projects ADD COLUMN scan_error TEXT;
     ";
@@ -4261,6 +4298,8 @@ mod tests {
             git_snapshot: Some("hook pre-commit abc executable".into()),
             reviewed_tree: None,
             infra: false,
+            workspace: Workspace::Worktree,
+            start: None,
         };
         store.insert_run(&mut run).unwrap();
         assert_eq!(store.run(run.id).unwrap(), run);
