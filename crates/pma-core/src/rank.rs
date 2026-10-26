@@ -116,6 +116,8 @@ pub struct Task {
     pub eligible: bool,
     /// Tagged `#manual`: no agent may take it, named or not.
     pub manual: bool,
+    /// The GitHub issue it tracks, `gh:N`.
+    pub gh: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -200,6 +202,7 @@ pub fn signal_tasks(cfg: &Config, p: &Project) -> Vec<Task> {
         age_days,
         eligible: false,
         manual: false,
+        gh: None,
     };
     let mut tasks = Vec::new();
     if let Ci::Failing(workflows) = &p.ci {
@@ -207,6 +210,7 @@ pub fn signal_tasks(cfg: &Config, p: &Project) -> Vec<Task> {
             key: Some("ci".into()),
             eligible: true,
             manual: false,
+            gh: None,
             ..task(
                 cfg.signals.ci,
                 format!("fix CI: {}", workflows.join(", ")),
@@ -220,6 +224,7 @@ pub fn signal_tasks(cfg: &Config, p: &Project) -> Vec<Task> {
             key: Some("deps".into()),
             eligible: true,
             manual: false,
+            gh: None,
             ..task(
                 cfg.signals.deps,
                 format!("update dependencies: {n} outdated"),
@@ -438,6 +443,7 @@ mod tests {
             age_days: 0,
             eligible: false,
             manual: false,
+            gh: None,
         }
     }
 

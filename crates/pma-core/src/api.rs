@@ -127,6 +127,8 @@ pub enum View {
         header: String,
         lists: next::Next,
         limit: Option<usize>,
+        /// Each project's GitHub page, for issue links.
+        repos: BTreeMap<String, String>,
     },
     Matrix {
         header: String,
@@ -134,6 +136,7 @@ pub enum View {
         limit: Option<usize>,
         quadrant: Option<rank::Quadrant>,
         today: i64,
+        repos: BTreeMap<String, String>,
     },
     Status {
         header: String,
@@ -164,6 +167,7 @@ pub enum View {
         jobs: Vec<Job>,
         runs: Vec<Run>,
         now: i64,
+        repos: BTreeMap<String, String>,
     },
     Activity {
         state: PathBuf,
@@ -186,6 +190,8 @@ pub enum View {
         /// Set when the tree moved while it was read, so no approval may
         /// rest on what was shown.
         moved: bool,
+        /// The project's GitHub page, for the issue link.
+        repo: Option<String>,
     },
     Agents {
         state: PathBuf,
@@ -234,6 +240,8 @@ pub enum View {
         /// What `pma lint` and `pma prune` would say of its TODO.md; `None`
         /// when it has none.
         todo: Option<Vec<TodoNote>>,
+        /// Its GitHub page, for issue links.
+        repo: Option<String>,
     },
     Settings {
         /// Each setting: key, value, and `set`, `default` or `unknown`.
@@ -497,6 +505,11 @@ pub enum Action {
     RefreshDeps {
         project: String,
     },
+    /// Rewrites the mechanical errors in the project's TODO.md, as
+    /// `pma lint --fix --apply` does.
+    FixTodo {
+        project: String,
+    },
 }
 
 /// What an action did. `said` goes to standard output, `warnings` to
@@ -648,6 +661,7 @@ pub fn portfolio(store: &Store, of: &Selection, all: bool) -> Result<Portfolio> 
             signal_urgent: false,
             eligible: t.tags.iter().any(|g| g == "agent") && !t.tags.iter().any(|g| g == "manual"),
             manual: t.tags.iter().any(|g| g == "manual"),
+            gh: t.gh,
             age_days:
                 (today - dates::day(t.added_at.unwrap_or(t.first_seen).min(t.first_seen))).max(0),
         }));
@@ -926,6 +940,23 @@ pub fn choices(store: &Store, act: Act) -> Result<Choices> {
                 },
             ],
         }),
+        Act::Prune => {
+            let choice = |name: &str, about: &str| crate::catalog::Choice {
+                name: name.into(),
+                reads: "project".into(),
+                about: about.into(),
+            };
+            Ok(Choices {
+                options: vec![
+                    choice("prune", "Remove finished items and `## Done` sections"),
+                    choice(
+                        "fix",
+                        "Rewrite mechanical errors: the title, section headings, plain bullets, odd checkboxes",
+                    ),
+                ],
+                flags: Vec::new(),
+            })
+        }
         Act::ScanProject => {
             let choice = |name: &str, about: &str| crate::catalog::Choice {
                 name: name.into(),
@@ -957,6 +988,20 @@ pub fn settle_interrupted(store: &Store) -> Result<()> {
     Ok(())
 }
 
+/// Each project's GitHub page, by name, for issue links.
+fn repos(store: &Store) -> Result<BTreeMap<String, String>> {
+    Ok(store
+        .projects()?
+        .into_iter()
+        .filter_map(|r| {
+            r.slug
+                .as_deref()
+                .and_then(crate::scan::github_url)
+                .map(|url| (r.name, url))
+        })
+        .collect())
+}
+
 pub fn query(store: &Store, q: Query) -> Result<View> {
     Ok(match q {
         Query::Next { of, all } => {
@@ -965,6 +1010,7 @@ pub fn query(store: &Store, q: Query) -> Result<View> {
                 header: p.header(),
                 lists: next_lists(store, &p)?,
                 limit: (!all).then_some(p.cfg.quadrant_limit as usize),
+                repos: repos(store)?,
             }
         }
         Query::Matrix { of, quadrant, all } => {
@@ -975,6 +1021,7 @@ pub fn query(store: &Store, q: Query) -> Result<View> {
                 today: p.today,
                 placed: rank::place(&p.cfg, p.tasks, p.today),
                 quadrant,
+                repos: repos(store)?,
             }
         }
         Query::Status { of, explain, all } => {
@@ -1028,6 +1075,7 @@ pub fn query(store: &Store, q: Query) -> Result<View> {
             View::Inbox {
                 header,
                 lists,
+                repos: repos(store)?,
                 state: store::state_home()?,
                 jobs: store.jobs(50)?,
                 runs: store.runs()?,
@@ -1081,6 +1129,11 @@ pub fn query(store: &Store, q: Query) -> Result<View> {
             View::Run {
                 attempts: store.attempts(Some(run.id))?,
                 changelog: changelog(&home, &run),
+                repo: store
+                    .project(&run.project)?
+                    .and_then(|r| r.slug)
+                    .as_deref()
+                    .and_then(crate::scan::github_url),
                 run: Box::new(run),
                 diff,
                 moved,
@@ -1204,6 +1257,7 @@ pub fn query(store: &Store, q: Query) -> Result<View> {
             View::Project {
                 jobs,
                 todo,
+                repo: row.slug.as_deref().and_then(crate::scan::github_url),
                 state: store::state_home()?,
                 scanned_at: row.scanned_at,
                 path: row.path,
@@ -1614,6 +1668,24 @@ pub fn act(store: &Store, a: Action) -> Result<Outcome> {
                 file.display()
             ))
         }
+        Action::FixTodo { project } => {
+            let row = store
+                .project(&project)?
+                .ok_or_else(|| format!("unknown project `{project}`"))?;
+            let file = row.path.join("TODO.md");
+            let text =
+                std::fs::read_to_string(&file).map_err(|e| format!("{}: {e}", file.display()))?;
+            let fixed = todo::fix(&text);
+            if fixed.fixes.is_empty() {
+                return Ok(Outcome::said("nothing to fix"));
+            }
+            todo::save(&file, &fixed.text).map_err(|e| format!("{}: {e}", file.display()))?;
+            Outcome::said(format!(
+                "{} lines rewritten in {}; the edit is uncommitted",
+                fixed.fixes.len(),
+                file.display()
+            ))
+        }
         Action::RefreshDeps { project } => {
             let row = store
                 .project(&project)?
@@ -1811,6 +1883,7 @@ pub fn command_line(a: &Action) -> Option<Vec<String>> {
         | Action::SetTier { .. }
         | Action::Tag { .. }
         | Action::Prune { .. }
+        | Action::FixTodo { .. }
         // Queued by `act` itself, with the project's path resolved.
         | Action::RefreshDeps { .. } => return None,
     }

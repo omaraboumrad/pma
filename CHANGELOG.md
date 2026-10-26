@@ -2,6 +2,20 @@
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- `pma task <project:line>` prints a task in full, as Enter on it does in the TUI and the web; `<project:ci>` prints the signal.
+
+- **`pma lint --fix`** lists the mechanical errors a rewrite settles, and `--apply` writes them: a byte-order mark, a missing or wrong `# TODO` title, a section heading not written `## Name`, a plain bullet where an item belongs, and a checkbox not written `- [ ]` or `- [x]`. Dates, issue numbers, duplicates and fences stay for a person. The parser stays strict: one broken file hid every item it held, and 46 of one project's errors were the same bullet. In the TUI and the web, `f` on a project now offers prune or fix.
+
+- Task rows in the inbox, the matrix and a project's view carry the issue a task tracks, as `#N`, linked to its page in the web when the scan recorded the repository. A run's detail shows it too, and `pma review <id>` prints the number.
+
+### Changed
+
+- The TUI footer queues transitions: three runs reaching review within a second name the first with "2 more", and each Enter opens the next. Before, only the last was named.
+
 ## [0.9.0]
 
 Upgrading from 0.8:

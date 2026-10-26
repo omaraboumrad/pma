@@ -142,7 +142,8 @@ pub enum Act {
     /// sandbox, from a typed `tier 3`, `tag +name`, `verify make test` or
     /// `sandbox on`.
     Configure,
-    /// Removes finished items from the project in view's TODO.md.
+    /// Tidies the project in view's TODO.md: prunes finished items, or
+    /// rewrites its mechanical errors, by choice.
     Prune,
 }
 
@@ -280,7 +281,7 @@ impl Act {
             Action::AddCampaign { .. } => &[Act::AddCampaign],
             Action::RemoveCampaign { .. } => &[Act::RemoveCampaign],
             Action::SetTier { .. } | Action::Tag { .. } => &[Act::Configure],
-            Action::Prune { .. } => &[Act::Prune],
+            Action::Prune { .. } | Action::FixTodo { .. } => &[Act::Prune],
             Action::RefreshDeps { .. } => &[Act::ScanProject],
         }
     }
@@ -446,8 +447,8 @@ pub const BINDINGS: &[Binding] = &[
         "f",
         &[Tab::Project],
         Act::Prune,
-        Ask::Confirm,
-        "prune done items",
+        Ask::Choose("tidy TODO.md"),
+        "tidy TODO.md",
     ),
     // A project: the one in view, or the selected row's.
     on(

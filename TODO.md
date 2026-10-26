@@ -19,7 +19,7 @@
 - [ ] Decide whether pma is the dashboard or the dispatch loop #manual
   The evidence supports `scan`/`status`/`history`; most of the code serves dispatch and workflows. pma is for other developers, one per install, so the adoption items below are in scope; multi-user use comes later. (REVIEW.md, Questions)
 
-- [ ] `pma lint --fix` for mechanical errors
+- [x] `pma lint --fix` for mechanical errors
   `nanosrv` has 46 errors, all "a list entry in this section must be a `- [ ]` item", and a broken file hides every item it holds. Rewrite `- text` to `- [ ] text` under a priority heading; keep the parser strict. (REVIEW.md U9)
 
 - [ ] npm or pnpm dependency signals, and a better Python verify fallback
@@ -59,7 +59,7 @@
 
 - [ ] `pma merge <id>...` merges a run's pull request and settles it #agent Today a `pr-open` run is merged on GitHub by hand, and the next `pma review` settles it. `pma merge` runs `gh pr merge <url> --squash --delete-branch` for each named `pr-open` run, then settles it to `merged` at once, as `publish::settle` does for a merge it observes. Refuse a run that is not `pr-open`. Refuse one whose pull request has failing or pending checks; allow one with no checks. Refuse one whose head is no longer the commit pma pushed, since that merges commits no one approved: record the pushed commit at `pma pr`, which today records only the URL. Tests in `tests/cli.rs` with the fake `gh` (`FAKE_GH_PR`): a merge, each refusal, and the run merged afterwards.
 
-- [ ] **Render `gh:N` as a link**: `report`, `rank`, `matrix` and `tui` print a bare issue number, and the project row now stores `owner/name` to resolve it against.
+- [x] **Render `gh:N` as a link**: the inbox, matrix and project rows and the run and task details link the issue to its page from the stored `owner/name`; `pma review` prints the number.
 
 - [ ] The process-group kill does not reach a child that calls `setsid` (`src/agent.rs:105-106`, `119`). `docs/dev/design.md:377` says no agent outlives the session. A survivor's writes to the worktree no longer reach an approval or a publish: an approval must match the tree last shown, and publishing starts from the approved tree. It still runs, reads what the user can, and writes outside the worktree. A cgroup or PID namespace would bound it; `sanduk` does. (REVIEW.md M10)
 
@@ -68,10 +68,10 @@
 
 ## Low
 
-- [ ] The TUI footer names only the last transition of a batch #agent
+- [x] The TUI footer names only the last transition of a batch #agent
   `App::noticed` keeps the last of what one `Watch::poll` returned. Three runs reaching review within a second name one. Queue them, or name the count.
 
-- [ ] A CLI command that opens a task in full #agent
+- [x] A CLI command that opens a task in full #agent
   `Query::Task` serves the TUI and the web only. `pma project show` lists tasks one line each. A `pma task <project:line>` would print what the detail shows.
 
 - [ ] Mark commands without a recorded pilot as experimental in `--help` and the README

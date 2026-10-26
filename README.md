@@ -45,7 +45,7 @@ pma push 1                     # commit and push it; or `pma pr 1` after --appro
 
 - A root `TODO.md` per repository is the only task file. Nothing to keep in step, and no lock-in: remove `pma` and the files still read.
 
-- `pma lint` checks the format. `pma prune` removes what is finished.
+- `pma lint` checks the format; `pma lint --fix --apply` rewrites the mechanical errors. `pma prune` removes what is finished.
 
 - `pma sync` mirrors `Critical` items to GitHub Issues and ticks items whose issue was closed.
 
@@ -194,6 +194,7 @@ pma status --all                # untiered projects too, when default_tier is ne
 pma status --all --html s.html  # the same, with the last scan's changes, as one HTML page
 pma history                     # past scans; `pma history last` for what the latest changed
 pma stale                       # open items by age, oldest first
+pma task myproject:12           # one task in full; Enter on it in the TUI and web
 pma tui                         # every view and action; 1-8 switch tabs, ? lists keys, q quits
 pma web                         # the same in a browser, on 127.0.0.1 behind a one-time token
 pma web --app                   # as an app window, in Chrome or Chromium

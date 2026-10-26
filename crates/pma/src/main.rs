@@ -32,7 +32,10 @@ const GROUPS: [(&str, &[&str]); 6] = [
             "next", "run", "scan", "matrix", "dispatch", "review", "stage", "commit", "push", "pr",
         ],
     ),
-    ("Tasks", &["lint", "prune", "stale", "sync", "note", "deps"]),
+    (
+        "Tasks",
+        &["task", "lint", "prune", "stale", "sync", "note", "deps"],
+    ),
     (
         "Reading",
         &["status", "history", "report", "tui", "web", "watch"],
@@ -107,8 +110,14 @@ enum Command {
         /// as `- [ ] text ^k3f9q`.
         #[arg(long)]
         ids: bool,
-        /// With --ids, write the ids. Edits stay uncommitted.
-        #[arg(long, requires = "ids")]
+        /// List the mechanical errors a rewrite settles: the title, a
+        /// section heading, a plain bullet or an odd checkbox where an item
+        /// belongs. With --apply, rewrite them. Dates, issue numbers,
+        /// duplicates and fences stay for you.
+        #[arg(long, conflicts_with = "ids")]
+        fix: bool,
+        /// With --ids or --fix, write the edits. They stay uncommitted.
+        #[arg(long)]
         apply: bool,
     },
     /// Remove finished items and `Done` sections.
@@ -351,6 +360,14 @@ enum Command {
         /// Minutes spent reviewing this run, added to the run's total.
         #[arg(long, requires = "ids", value_name = "N")]
         minutes: Option<u32>,
+    },
+    /// One task in full, as Enter opens it in the TUI and web.
+    ///
+    /// Its description, placement, who may take it, and the runs holding it.
+    /// `myproject:12` is TODO.md line 12; `myproject:ci` the CI signal.
+    Task {
+        /// `project:line` or `project:ci`, as `pma dispatch` names it.
+        target: String,
     },
     /// Open items by age, oldest first.
     Stale {
@@ -902,10 +919,20 @@ fn main() -> ExitCode {
             tags,
             all,
         } => show_next(&projects, &tags, all),
-        Command::Lint { paths, ids, apply } => {
-            return match ids {
-                true => add_ids(&paths, apply),
-                false => lint(&paths),
+        Command::Lint {
+            paths,
+            ids,
+            fix,
+            apply,
+        } => {
+            return match (ids, fix) {
+                (true, _) => add_ids(&paths, apply),
+                (_, true) => fix_todos(&paths, apply),
+                _ if apply => {
+                    eprintln!("pma: --apply needs --ids or --fix");
+                    ExitCode::FAILURE
+                }
+                _ => lint(&paths),
             };
         }
         Command::Prune { paths, apply } => return prune(&paths, apply),
@@ -1010,6 +1037,10 @@ fn main() -> ExitCode {
             rework.as_deref(),
             minutes,
         ),
+        Command::Task { target } => match target.rsplit_once(':') {
+            Some((project, _)) => show(Query::task(project, &target)),
+            None => Err("name a task as `project:line` or `project:ci`".into()),
+        },
         Command::Stale {
             projects,
             tags,
@@ -1080,6 +1111,49 @@ fn read_todo(file: &Path, from_dir: bool) -> std::io::Result<Option<String>> {
         Ok(text) => Ok(Some(text)),
         Err(e) if from_dir && e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
+    }
+}
+
+/// Lists each line `todo::fix` would rewrite, and with `apply` writes the
+/// files. A file lint cannot read is an error; one with nothing to fix is
+/// passed over in silence.
+fn fix_todos(paths: &[PathBuf], apply: bool) -> ExitCode {
+    let (mut count, mut failed) = (0, false);
+    for (file, from_dir) in todo_files(paths) {
+        let text = match read_todo(&file, from_dir) {
+            Ok(Some(text)) => text,
+            Ok(None) => {
+                println!("{}: skipped: no TODO.md", file.display());
+                continue;
+            }
+            Err(err) => {
+                println!("{}: error: {err}", file.display());
+                failed = true;
+                continue;
+            }
+        };
+        let fixed = todo::fix(&text);
+        for (line, was, now) in &fixed.fixes {
+            println!("{}:{line}: `{was}` -> `{now}`", file.display());
+        }
+        count += fixed.fixes.len();
+        if apply
+            && !fixed.fixes.is_empty()
+            && let Err(err) = todo::save(&file, &fixed.text)
+        {
+            println!("{}: error: {err}", file.display());
+            failed = true;
+        }
+    }
+    match (count, apply) {
+        (0, _) => println!("nothing to fix"),
+        (n, true) => println!("{n} lines rewritten; TODO.md edits are uncommitted"),
+        (n, false) => println!("{n} rewrites; run `pma lint --fix --apply` to make them"),
+    }
+    if failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
     }
 }
 
@@ -3925,6 +3999,7 @@ fn render(view: View) -> String {
             header,
             lists,
             limit,
+            ..
         } => format!("{header}\n\n{}", next::render(&lists, limit)),
         View::Matrix {
             header,
@@ -3932,6 +4007,7 @@ fn render(view: View) -> String {
             limit,
             quadrant,
             today,
+            ..
         } => format!(
             "{header}\n\n{}",
             report::matrix(&placed, limit, quadrant, today)
@@ -3987,12 +4063,14 @@ fn render(view: View) -> String {
             jobs,
             runs,
             now,
+            repos,
         } => format!(
             "{}\n{}",
             render(View::Next {
                 header,
                 lists,
-                limit: None
+                limit: None,
+                repos,
             }),
             watch::screen(&state, &jobs, &runs, now)
         ),

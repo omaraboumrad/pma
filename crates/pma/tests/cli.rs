@@ -4380,6 +4380,15 @@ fn a_task_opens_in_full_from_its_project() {
         "{body}"
     );
     drop(child);
+
+    // The CLI prints the same detail.
+    let out = env.ok(&["task", "alpha:5"]);
+    assert!(
+        out.contains("add greeting") && out.contains("TODO.md:5") && out.contains("say hello"),
+        "{out}"
+    );
+    let (_, err, success) = env.run(&["task", "alpha"]);
+    assert!(!success && err.contains("project:line"), "{err}");
 }
 
 /// Settings are edited from the web as the CLI edits them: a key, a
@@ -4451,6 +4460,49 @@ fn settings_are_edited_from_the_web() {
         "{library}"
     );
     drop(child);
+}
+
+/// `lint --fix` lists the mechanical rewrites and leaves the file; with
+/// `--apply` it writes them, and what it cannot fix is still reported.
+#[test]
+fn lint_fix_rewrites_what_a_machine_can() {
+    let s = Scratch::new("lintfix");
+    let env = Env {
+        home: s.0.join("home"),
+        bin: s.0.join("bin"),
+        push_log: s.0.join("push.log"),
+    };
+    let dir = s.0.join("proj");
+    fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("TODO.md");
+    let before = "# Todo\n\n##High\n\n- plain item\n* [ ] star item due:never\n";
+    fs::write(&file, before).unwrap();
+    let dir_s = dir.to_str().unwrap();
+    let out = env.ok(&["lint", "--fix", dir_s]);
+    assert!(
+        out.contains(":1: `# Todo` -> `# TODO`")
+            && out.contains(":5: `- plain item` -> `- [ ] plain item`")
+            && out.contains("4 rewrites; run `pma lint --fix --apply`"),
+        "{out}"
+    );
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        before,
+        "listed, not written"
+    );
+    let out = env.ok(&["lint", "--fix", "--apply", dir_s]);
+    assert!(out.contains("4 lines rewritten"), "{out}");
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        "# TODO\n\n## High\n\n- [ ] plain item\n- [ ] star item due:never\n"
+    );
+    let (out, _, success) = env.run(&["lint", dir_s]);
+    assert!(
+        !success && out.contains("is not a date"),
+        "the date is yours: {out}"
+    );
+    let (_, err, success) = env.run(&["lint", "--apply", dir_s]);
+    assert!(!success && err.contains("--apply needs"), "{err}");
 }
 
 /// Every act the key table binds is one the web server takes by name: asked

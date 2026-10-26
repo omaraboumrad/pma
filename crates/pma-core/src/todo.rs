@@ -236,7 +236,7 @@ pub fn parse(text: &str) -> Parsed {
                     "the file starts with a byte-order mark; save it as UTF-8 without one",
                 );
             } else if line != "# TODO" {
-                out.report(n, Severity::Error, "the file must start with `# TODO`");
+                out.report(n, Severity::Error, NO_TITLE);
             }
         }
 
@@ -331,7 +331,7 @@ pub fn parse(text: &str) -> Parsed {
         );
     }
     if first_content {
-        out.report(1, Severity::Error, "the file must start with `# TODO`");
+        out.report(1, Severity::Error, NO_TITLE);
     }
     // A file with priority sections has adopted the format, so bullets outside
     // them are deliberate: notes, declined work, ideas.
@@ -440,6 +440,12 @@ fn is_checkbox(line: &str) -> bool {
 }
 
 fn checkbox_mark(line: &str) -> Option<char> {
+    checkbox(line).map(|(mark, _)| mark)
+}
+
+/// A checkbox entry's mark and the text after its `]`, canonical or not:
+/// `* [ ] text`, `1. [X] text`.
+fn checkbox(line: &str) -> Option<(char, &str)> {
     let rest = line
         .strip_prefix(['-', '*', '+'])
         .or_else(|| {
@@ -450,7 +456,83 @@ fn checkbox_mark(line: &str) -> Option<char> {
         })?
         .trim_start();
     let mark = rest.strip_prefix('[')?.chars().next()?;
-    rest[1 + mark.len_utf8()..].starts_with(']').then_some(mark)
+    let after = &rest[1 + mark.len_utf8()..];
+    after.strip_prefix(']').map(|text| (mark, text))
+}
+
+/// The errors `fix` rewrites, by their messages.
+const NO_TITLE: &str = "the file must start with `# TODO`";
+const ODD_CHECKBOX: &str = "write items as `- [ ] text` or `- [x] text`";
+const PLAIN_BULLET: &str = "a list entry in this section must be a `- [ ]` item";
+
+/// What `fix` rewrote: each line's number in the text given, what it was
+/// and what it is now; and the text with the rewrites.
+#[derive(Debug, Default, PartialEq)]
+pub struct Fixed {
+    pub text: String,
+    pub fixes: Vec<(usize, String, String)>,
+}
+
+/// Rewrites the mechanical errors `parse` reports: a byte-order mark, a
+/// missing or wrong title, a section heading not written `## Name`, a plain
+/// bullet where an item belongs, and a checkbox not written `- [ ]` or
+/// `- [x]`. Every other error stays for a person: a date, an issue number,
+/// a duplicate, an unclosed fence. The parser stays strict; this is the one
+/// lenience, taken on request.
+pub fn fix(text: &str) -> Fixed {
+    let mut fixes = Vec::new();
+    let mut text = text.to_string();
+    if let Some(rest) = text.strip_prefix('\u{feff}') {
+        fixes.push((1, "a byte-order mark".to_string(), "removed".to_string()));
+        text = rest.to_string();
+    }
+    let parsed = parse(&text);
+    let mut lines: Vec<String> = text.split_inclusive('\n').map(String::from).collect();
+    let mut title = false;
+    for d in &parsed.diagnostics {
+        let Some(line) = lines.get(d.line.wrapping_sub(1)) else {
+            title |= d.message == NO_TITLE;
+            continue;
+        };
+        let body = line.trim_end_matches(['\r', '\n']);
+        let ending = line[body.len()..].to_string();
+        let new = if d.message == NO_TITLE {
+            match body.starts_with("# ") {
+                true => Some("# TODO".to_string()),
+                false => {
+                    title = true;
+                    None
+                }
+            }
+        } else if let Some(canonical) = d
+            .message
+            .strip_prefix("write the heading as `## ")
+            .and_then(|m| m.strip_suffix('`'))
+        {
+            Some(format!("## {canonical}"))
+        } else if d.message == PLAIN_BULLET {
+            Some(format!("- [ ] {}", body[2..].trim_start()))
+        } else if d.message == ODD_CHECKBOX {
+            checkbox(body).map(|(mark, rest)| {
+                let mark = if mark == ' ' { ' ' } else { 'x' };
+                format!("- [{mark}] {}", rest.trim_start())
+            })
+        } else {
+            None
+        };
+        if let Some(new) = new {
+            fixes.push((d.line, body.to_string(), new.clone()));
+            lines[d.line - 1] = format!("{new}{ending}");
+        }
+    }
+    if title {
+        fixes.insert(0, (1, String::new(), "# TODO".to_string()));
+        lines.insert(0, "# TODO\n\n".to_string());
+    }
+    Fixed {
+        text: lines.concat(),
+        fixes,
+    }
 }
 
 fn item_line(line: &str, n: usize, priority: Priority, out: &mut Parsed) -> Option<Item> {
@@ -462,17 +544,9 @@ fn item_line(line: &str, n: usize, priority: Priority, out: &mut Parsed) -> Opti
     let rest = &line[if canonical.is_some() { 5 } else { 0 }..];
     let Some(done) = canonical.filter(|_| rest.is_empty() || rest.starts_with(' ')) else {
         if is_checkbox(line) {
-            out.report(
-                n,
-                Severity::Error,
-                "write items as `- [ ] text` or `- [x] text`",
-            );
+            out.report(n, Severity::Error, ODD_CHECKBOX);
         } else if is_bullet(line) {
-            out.report(
-                n,
-                Severity::Error,
-                "a list entry in this section must be a `- [ ]` item",
-            );
+            out.report(n, Severity::Error, PLAIN_BULLET);
         } else {
             out.report(n, Severity::Warning, "text in this section is not an item");
         }
@@ -937,6 +1011,40 @@ mod tests {
         assert_eq!(parsed.items[0].gh, Some(42));
         assert_eq!(parsed.items[1].due.as_deref(), Some("2026-10-01"));
         assert_eq!(parsed.items[2].tags, ["urgent"]);
+    }
+
+    /// `fix` rewrites what a machine can and leaves the rest: the file
+    /// then parses, with its one real error still reported.
+    #[test]
+    fn fix_rewrites_mechanical_errors_only() {
+        let text = "\u{feff}# Todo\n\n##High\n\n- plain item\n* [ ] star item\n- [X] done item due:never\n\n## Low\n\n- [ ] fine\n";
+        let fixed = fix(text);
+        assert_eq!(
+            fixed.text,
+            "# TODO\n\n## High\n\n- [ ] plain item\n- [ ] star item\n- [x] done item due:never\n\n## Low\n\n- [ ] fine\n"
+        );
+        assert_eq!(fixed.fixes.len(), 6, "{:?}", fixed.fixes);
+        assert_eq!(fixed.fixes[1], (1, "# Todo".into(), "# TODO".into()));
+        let parsed = parse(&fixed.text);
+        let messages: Vec<&str> = parsed
+            .diagnostics
+            .iter()
+            .map(|d| d.message.as_str())
+            .collect();
+        assert_eq!(
+            messages,
+            ["`due:never` is not a date; write `due:YYYY-MM-DD`"]
+        );
+        assert_eq!(
+            parsed.items.len(),
+            4,
+            "the bad date is reported, its item kept"
+        );
+
+        let headless = fix("## High\n\n- [ ] a\n");
+        assert_eq!(headless.text, "# TODO\n\n## High\n\n- [ ] a\n");
+        assert_eq!(headless.fixes, vec![(1, String::new(), "# TODO".into())]);
+        assert_eq!(fix("# TODO\n\n## High\n\n- [ ] a\n").fixes, vec![]);
     }
 
     #[test]

@@ -128,8 +128,8 @@ pub struct App {
     selected: Vec<Vec<TableState>>,
     mode: Mode,
     status: Option<(String, Tone)>,
-    /// A run or a job the footer names, which Enter opens.
-    notice: Option<Pick>,
+    /// Runs and jobs the footer names, oldest first; Enter opens the first.
+    notices: Vec<api::Transition>,
     busy: bool,
     palette: Palette,
 }
@@ -157,7 +157,7 @@ impl App {
             selected: vec![Vec::new(); n],
             mode: Mode::Normal,
             status: None,
-            notice: None,
+            notices: Vec::new(),
             busy: false,
             palette: Palette::from_env(),
         }
@@ -181,13 +181,19 @@ impl App {
 
     fn say(&mut self, text: impl Into<String>, tone: Tone) {
         self.status = Some((text.into(), tone));
-        self.notice = None;
+        self.notices.clear();
     }
 
     /// Runs and jobs that reached a state worth telling, from the watch.
-    /// The footer names the last one, and Enter opens it.
+    /// The footer names the first, with how many more wait behind it, and
+    /// Enter opens it.
     pub fn noticed(&mut self, moved: &[api::Transition]) {
-        let Some(t) = moved.last() else {
+        self.notices.extend(moved.iter().cloned());
+        self.show_notice();
+    }
+
+    fn show_notice(&mut self) {
+        let Some(t) = self.notices.first() else {
             return;
         };
         let tone = match t.state.as_str() {
@@ -195,8 +201,11 @@ impl App {
             "pushed" | "merged" | "applied" | "done" => Tone::Good,
             _ => Tone::Warn,
         };
-        self.say(format!("{}  (Enter opens it)", t.line()), tone);
-        self.notice = Some(t.pick());
+        let more = match self.notices.len() {
+            1 => String::new(),
+            n => format!("; {} more", n - 1),
+        };
+        self.status = Some((format!("{}  (Enter opens it{more})", t.line()), tone));
     }
 
     fn panes(&self) -> &[Pane] {
@@ -419,15 +428,20 @@ impl App {
             }
             Mode::Normal => {}
         }
-        if let Some(pick) = self.notice.take()
-            && key == "Enter"
-        {
-            self.status = None;
-            return match pick {
-                Pick::Run { id, .. } => Some(Request::Load(Query::Run { id })),
-                Pick::Job { id, .. } => Some(Request::Load(Query::JobLog { id })),
-                _ => None,
-            };
+        if !self.notices.is_empty() {
+            if key != "Enter" {
+                self.notices.clear();
+            } else {
+                let pick = self.notices.remove(0).pick();
+                self.status = None;
+                // The next one waits in the footer for the next Enter.
+                self.show_notice();
+                return match pick {
+                    Pick::Run { id, .. } => Some(Request::Load(Query::Run { id })),
+                    Pick::Job { id, .. } => Some(Request::Load(Query::JobLog { id })),
+                    _ => None,
+                };
+            }
         }
         let binding = keys::lookup(key, self.tab, &self.pick().0)?;
         let t = index(self.tab);
@@ -1448,6 +1462,7 @@ mod tests {
             header: "last scan just now".into(),
             limit: None,
             lists: next_view_lists(),
+            repos: Default::default(),
         }
     }
 
@@ -1467,6 +1482,7 @@ mod tests {
                     target: "a:5".into(),
                     retry: false,
                 },
+                issue: None,
             }],
             runs: vec![NextRow {
                 cells: vec![
@@ -1482,6 +1498,7 @@ mod tests {
                     state: "ready".into(),
                     project: "b".into(),
                 },
+                issue: None,
             }],
             tasks: vec![],
         }
@@ -1637,6 +1654,7 @@ mod tests {
                     age_days: 0,
                     eligible: true,
                     manual: false,
+                    gh: None,
                 },
                 importance: 1.0,
                 urgency: None,
@@ -1647,6 +1665,7 @@ mod tests {
             jobs: vec![],
             state: std::env::temp_dir(),
             todo: None,
+            repo: None,
         }));
         assert_eq!(
             app.key("Enter"),
@@ -1927,6 +1946,7 @@ mod tests {
             changelog: None,
             diff: "+hi".into(),
             moved: false,
+            repo: None,
         }));
         let text = screen_text(&mut app);
         assert!(
@@ -1958,6 +1978,21 @@ mod tests {
             screen_text(&mut app).contains("#9 spore: ready for review: fix CI  (Enter opens it)")
         );
         assert_eq!(app.key("Enter"), Some(Request::Load(Query::Run { id: 9 })));
+        // A batch queues: each Enter opens the next one.
+        let run = |id: i64| api::Transition {
+            kind: "run",
+            id,
+            project: "p".into(),
+            text: "t".into(),
+            state: "ready".into(),
+        };
+        app.noticed(&[run(10), run(11)]);
+        assert!(
+            screen_text(&mut app).contains("#10 p: ready for review: t  (Enter opens it; 1 more)")
+        );
+        assert_eq!(app.key("Enter"), Some(Request::Load(Query::Run { id: 10 })));
+        assert!(screen_text(&mut app).contains("#11 p: ready for review: t  (Enter opens it)"));
+        assert_eq!(app.key("Enter"), Some(Request::Load(Query::Run { id: 11 })));
         app.noticed(&[api::Transition {
             kind: "job",
             id: 2,

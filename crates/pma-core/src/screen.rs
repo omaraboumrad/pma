@@ -5,6 +5,8 @@
 //! does to it, or what a state means. Each cell carries a `Tone`, so both
 //! colour a failed run or a critical task alike.
 
+use std::collections::BTreeMap;
+
 use crate::api::{Action, Selection, View, WorkerChoice};
 use crate::keys::{Act, Tab};
 use crate::store::{Job, Run, RunState};
@@ -387,14 +389,27 @@ fn task_cells(cells: &[String]) -> Vec<Cell> {
     ]
 }
 
-const TASK_COLUMNS: [Column; 6] = [
+const TASK_COLUMNS: [Column; 7] = [
     col("task", Kind::Text),
     col("tier", Kind::Text),
     col("priority", Kind::Badge),
     col("when", Kind::Text),
     col("why", Kind::Text),
     col("title", Kind::Wide),
+    col("issue", Kind::Text),
 ];
+
+/// A task's issue as `#N`, linked to it when the project's GitHub page is
+/// known; empty when the task has none.
+fn issue_cell(gh: Option<i64>, repo: Option<&String>) -> Cell {
+    match gh {
+        None => plain(""),
+        Some(n) => linked(
+            muted(format!("#{n}")),
+            repo.map(|r| format!("{r}/issues/{n}")).as_deref(),
+        ),
+    }
+}
 
 fn run_cells(r: &Run, now: i64) -> Vec<Cell> {
     vec![
@@ -425,11 +440,16 @@ fn run_detail(
     changelog: Option<String>,
     diff: String,
     moved: bool,
+    repo: Option<&str>,
 ) -> Detail {
     let fields = report::run_fields(run)
         .into_iter()
         .filter(|r| r[0] != "task")
-        .map(|r| (r[0].clone(), r[1].clone()))
+        .map(|r| match (r[0].as_str(), run.gh, repo) {
+            // The issue as its page, where the number alone would be.
+            ("issue", Some(n), Some(url)) => ("issue".to_string(), format!("{url}/issues/{n}")),
+            _ => (r[0].clone(), r[1].clone()),
+        })
         .collect();
     let mut sections = Vec::new();
     if let Some(s) = run.summary.as_deref().filter(|s| !s.trim().is_empty()) {
@@ -587,11 +607,32 @@ fn activity_pane(
 }
 
 /// `pma next`'s rows as items, each about what the row is about.
-fn next_items(rows: Vec<next::Row>, cells: fn(&[String]) -> Vec<Cell>) -> Vec<Item> {
+/// `pma next`'s task rows as items, each with its issue linked.
+fn next_items(rows: Vec<next::Row>, repos: &BTreeMap<String, String>) -> Vec<Item> {
+    rows.into_iter()
+        .map(|r| {
+            let mut cells = task_cells(&r.cells);
+            let project = match &r.subject {
+                next::Subject::Task { project, .. } | next::Subject::Manual { project } => {
+                    Some(project)
+                }
+                next::Subject::Run { .. } => None,
+            };
+            cells.push(issue_cell(r.issue, project.and_then(|p| repos.get(p))));
+            Item {
+                pick: next_pick(&r.subject),
+                cells,
+            }
+        })
+        .collect()
+}
+
+/// `pma next`'s waiting runs as items.
+fn run_items(rows: Vec<next::Row>) -> Vec<Item> {
     rows.into_iter()
         .map(|r| Item {
             pick: next_pick(&r.subject),
-            cells: cells(&r.cells),
+            cells: run_row(&r.cells),
         })
         .collect()
 }
@@ -1052,26 +1093,31 @@ pub fn screen(view: View) -> Screen {
     };
     let now = dates::now();
     match view {
-        View::Next { header, lists, .. } => panes(
+        View::Next {
+            header,
+            lists,
+            repos,
+            ..
+        } => panes(
             Tab::Inbox,
             Some(header),
             vec![
                 Pane {
                     title: "Ready for agents".into(),
                     columns: TASK_COLUMNS.to_vec(),
-                    items: next_items(lists.agents, task_cells),
+                    items: next_items(lists.agents, &repos),
                     empty: "Nothing an agent may take. Tag a TODO.md item #agent.",
                 },
                 Pane {
                     title: "Runs waiting on you".into(),
                     columns: WAITING_COLUMNS.to_vec(),
-                    items: next_items(lists.runs, run_row),
+                    items: run_items(lists.runs),
                     empty: "No run waits on you.",
                 },
                 Pane {
                     title: "Tasks for you".into(),
                     columns: TASK_COLUMNS.to_vec(),
-                    items: next_items(lists.tasks, task_cells),
+                    items: next_items(lists.tasks, &repos),
                     empty: "No critical or urgent task needs you.",
                 },
             ],
@@ -1083,9 +1129,10 @@ pub fn screen(view: View) -> Screen {
             jobs,
             runs,
             now: at,
+            repos,
         } => {
             // Runs waiting on a decision, then plans waiting for approval.
-            let mut waiting = next_items(lists.runs, run_row);
+            let mut waiting = run_items(lists.runs);
             waiting.extend(
                 jobs.iter()
                     .filter(|j| j.state == "awaiting-approval")
@@ -1128,8 +1175,8 @@ pub fn screen(view: View) -> Screen {
                     })
                     .collect()
             };
-            let mut tasks = for_cell("agent", next_items(lists.agents, task_cells));
-            tasks.extend(for_cell("you", next_items(lists.tasks, task_cells)));
+            let mut tasks = for_cell("agent", next_items(lists.agents, &repos));
+            tasks.extend(for_cell("you", next_items(lists.tasks, &repos)));
             let mut columns = TASK_COLUMNS.to_vec();
             columns.push(col("for", Kind::Badge));
             panes(
@@ -1156,6 +1203,7 @@ pub fn screen(view: View) -> Screen {
             header,
             placed,
             today,
+            repos,
             ..
         } => {
             let mut quadrants: Vec<Pane> = rank::Quadrant::ALL
@@ -1167,6 +1215,7 @@ pub fn screen(view: View) -> Screen {
                         col("priority", Kind::Badge),
                         col("when", Kind::Text),
                         col("title", Kind::Wide),
+                        col("issue", Kind::Text),
                     ],
                     items: Vec::new(),
                     empty: "Nothing here.",
@@ -1185,6 +1234,7 @@ pub fn screen(view: View) -> Screen {
                         cell(priority, priority_tone(priority)),
                         cell(when.clone(), when_tone(&when)),
                         plain(p.task.text.clone()),
+                        issue_cell(p.task.gh, repos.get(&p.task.project)),
                     ],
                     pick: task_pick(p),
                 });
@@ -1387,10 +1437,11 @@ pub fn screen(view: View) -> Screen {
             changelog,
             diff,
             moved,
+            repo,
         } => detail(
             None,
             Some(run.project.clone()),
-            run_detail(&run, &attempts, changelog, diff, moved),
+            run_detail(&run, &attempts, changelog, diff, moved, repo.as_deref()),
         ),
         View::Agents {
             state,
@@ -1503,6 +1554,7 @@ pub fn screen(view: View) -> Screen {
             jobs,
             state,
             todo,
+            repo,
         } => {
             let mut summary: Vec<(String, Cell)> = Vec::new();
             match &status {
@@ -1580,6 +1632,7 @@ pub fn screen(view: View) -> Screen {
                                 _ => muted("you"),
                             },
                             plain(p.task.text.clone()),
+                            issue_cell(p.task.gh, repo.as_ref()),
                         ],
                         pick: task_pick(p),
                     }
@@ -1598,6 +1651,7 @@ pub fn screen(view: View) -> Screen {
                             col("when", Kind::Text),
                             col("for", Kind::Badge),
                             col("title", Kind::Wide),
+                            col("issue", Kind::Text),
                         ],
                         items: tasks,
                         empty: "No open task in its TODO.md.",
@@ -2239,15 +2293,18 @@ pub fn action_in(
                 }
             }
         }
-        (Act::Prune, pick) => match pick.project() {
-            Some(p) => Action::Prune {
-                project: p.to_string(),
-            },
-            None if !project.is_empty() => Action::Prune {
-                project: project.to_string(),
-            },
-            None => return Err("open a project first".into()),
-        },
+        (Act::Prune, pick) => {
+            let project = match pick.project() {
+                Some(p) => p.to_string(),
+                None if !project.is_empty() => project.to_string(),
+                None => return Err("open a project first".into()),
+            };
+            match input {
+                "" | "prune" => Action::Prune { project },
+                "fix" => Action::FixTodo { project },
+                other => return Err(format!("unknown choice `{other}`")),
+            }
+        }
         (Act::EditSetting, Pick::Setting { key, .. }) => {
             if input.is_empty() {
                 return Err("type a value; `x` resets the setting".into());
@@ -2713,6 +2770,7 @@ mod tests {
         let view = View::Inbox {
             header: "h".into(),
             lists: next::Next::default(),
+            repos: BTreeMap::new(),
             state: std::env::temp_dir(),
             jobs: vec![
                 job(1, "awaiting-approval"),
@@ -2832,6 +2890,64 @@ mod tests {
             panic!("a scan");
         };
         assert!(deps);
+        assert_eq!(
+            action_in(Act::Prune, &none, &[], "fix", "argdec"),
+            Ok(Action::FixTodo {
+                project: "argdec".into()
+            })
+        );
+        assert_eq!(
+            action_in(Act::Prune, &none, &[], "", "argdec"),
+            Ok(Action::Prune {
+                project: "argdec".into()
+            })
+        );
+    }
+
+    /// A task's issue is a link to the project's GitHub page when the scan
+    /// recorded one, and a bare number otherwise.
+    #[test]
+    fn an_issue_links_to_its_page() {
+        let placed = |project: &str| rank::Placed {
+            task: rank::Task {
+                project: project.into(),
+                tier: 1,
+                priority: crate::todo::Priority::High,
+                text: "t".into(),
+                line: Some(3),
+                key: Some("k".into()),
+                group: None,
+                due: None,
+                tagged_urgent: false,
+                signal_urgent: false,
+                age_days: 0,
+                eligible: true,
+                manual: false,
+                gh: Some(7),
+            },
+            importance: 1.0,
+            urgency: None,
+            quadrant: rank::Quadrant::Q1,
+        };
+        let view = View::Matrix {
+            header: "h".into(),
+            placed: vec![placed("a"), placed("b")],
+            limit: None,
+            quadrant: None,
+            today: 0,
+            repos: BTreeMap::from([("a".to_string(), "https://github.com/o/a".to_string())]),
+        };
+        let Body::Panes(p) = screen(view).body else {
+            panic!("panes");
+        };
+        let issue = |i: usize| p[0].items[i].cells.last().unwrap().clone();
+        assert_eq!(issue(0).text, "#7");
+        assert_eq!(
+            issue(0).link.as_deref(),
+            Some("https://github.com/o/a/issues/7")
+        );
+        assert_eq!(issue(1).text, "#7");
+        assert_eq!(issue(1).link, None, "no page recorded for b");
     }
 
     #[test]

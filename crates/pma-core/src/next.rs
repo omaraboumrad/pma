@@ -31,6 +31,8 @@ pub struct Row {
     pub cells: Vec<String>,
     pub command: Option<String>,
     pub subject: Subject,
+    /// The GitHub issue the task or run tracks, for a front end to link.
+    pub issue: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -101,6 +103,7 @@ pub fn build(
                     target: at.clone(),
                     retry: false,
                 },
+                issue: t.gh,
             }),
             (true, Taken::Exhausted(n)) if needs_you => next.tasks.push(Row {
                 cells: cells(&format!("{n} attempts used")),
@@ -110,6 +113,7 @@ pub fn build(
                     target: at.clone(),
                     retry: true,
                 },
+                issue: t.gh,
             }),
             (false, _) if needs_you && t.line.is_some() => next.tasks.push(Row {
                 cells: cells("not for agents"),
@@ -117,6 +121,7 @@ pub fn build(
                 subject: Subject::Manual {
                     project: t.project.clone(),
                 },
+                issue: t.gh,
             }),
             _ => {}
         }
@@ -159,6 +164,7 @@ pub fn build(
                 report::truncate(&r.text, 80),
             ],
             command: Some(command),
+            issue: r.gh,
             subject: Subject::Run {
                 id: r.id,
                 state: r.state.name().into(),
@@ -206,6 +212,7 @@ pub fn render(next: &Next, limit: Option<usize>) -> String {
                 cells: r.cells.iter().cloned().chain(r.command.clone()).collect(),
                 command: None,
                 subject: r.subject.clone(),
+                issue: r.issue,
             })
             .collect();
         out.push_str(&section(&rows, "    "));
@@ -240,6 +247,7 @@ mod tests {
                 signal_urgent: line.is_none(),
                 eligible,
                 manual: false,
+                gh: None,
                 age_days: 3,
             },
             importance: 0.5,

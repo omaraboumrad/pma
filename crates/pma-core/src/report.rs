@@ -424,6 +424,10 @@ pub fn run_fields(run: &Run) -> Vec<Vec<String>> {
     let mut rows = vec![
         vec!["task".into(), run.text.clone()],
         vec![
+            "issue".into(),
+            run.gh.map_or("none".into(), |n| format!("#{n}")),
+        ],
+        vec![
             "agent".into(),
             format!(
                 "{}{}, {}, {}",
@@ -686,6 +690,7 @@ mod tests {
                 signal_urgent: false,
                 eligible: false,
                 manual: false,
+                gh: None,
                 age_days: 12,
             },
             importance: 0.5,
