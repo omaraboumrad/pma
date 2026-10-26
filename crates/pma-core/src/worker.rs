@@ -237,6 +237,101 @@ pub const FIELDS: [(&str, &str); 9] = [
     ),
 ];
 
+impl Worker {
+    /// A worker with nothing set, which `set_field` fills one field at a time.
+    pub fn blank(name: &str) -> Worker {
+        Worker {
+            name: name.to_string(),
+            command: String::new(),
+            args: Vec::new(),
+            allow: None,
+            parse: Parser::TextTail,
+            reports_cost: false,
+            enforces_budget: false,
+            sandbox: false,
+            resumes: false,
+            env: BTreeMap::new(),
+        }
+    }
+
+    /// Sets one of `FIELDS` from its text, as `pma agent set` reads it.
+    pub fn set_field(&mut self, field: &str, value: &str) -> Result<(), String> {
+        let flag = |v: &str| match v {
+            "true" | "yes" => Ok(true),
+            "false" | "no" => Ok(false),
+            _ => Err(format!("expected true or false, not `{v}`")),
+        };
+        match field {
+            "command" => self.command = value.to_string(),
+            "args" => {
+                self.args = serde_json::from_str(value)
+                    .map_err(|e| format!("args must be a JSON array of strings: {e}"))?;
+            }
+            "allow" => self.allow = (!value.is_empty()).then(|| value.to_string()),
+            "parse" => {
+                self.parse = Parser::parse(value).ok_or_else(|| {
+                    format!("unknown parser `{value}`; expected {}", Parser::names())
+                })?;
+            }
+            "reports-cost" => self.reports_cost = flag(value)?,
+            "enforces-budget" => self.enforces_budget = flag(value)?,
+            "sandbox" => self.sandbox = flag(value)?,
+            "resumes" => self.resumes = flag(value)?,
+            "model" => {
+                return Err(format!(
+                    "a worker no longer names a model: `pma preset set <name> {} {value}`",
+                    self.name
+                ));
+            }
+            "env" => {
+                self.env = serde_json::from_str(value)
+                    .map_err(|e| format!("env must be a JSON object of name to value: {e}"))?;
+            }
+            _ => {
+                let names: Vec<&str> = FIELDS.iter().map(|(n, _)| *n).collect();
+                return Err(format!(
+                    "unknown field `{field}`; expected {}",
+                    names.join(", ")
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Each field as `pma agent show` prints it, in `FIELDS` order.
+    pub fn fields(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("command", self.command.clone()),
+            (
+                "args",
+                serde_json::to_string(&self.args).unwrap_or_default(),
+            ),
+            ("allow", self.allow.clone().unwrap_or_else(|| "none".into())),
+            ("parse", self.parse.name()),
+            ("reports-cost", self.reports_cost.to_string()),
+            ("enforces-budget", self.enforces_budget.to_string()),
+            ("sandbox", self.sandbox.to_string()),
+            ("resumes", self.resumes.to_string()),
+            ("env", serde_json::to_string(&self.env).unwrap_or_default()),
+        ]
+    }
+
+    /// Its flags, as `pma agent` lists them: cost reported, budget
+    /// enforced, sandbox, allowlist and resume.
+    pub fn flags(&self) -> Vec<&'static str> {
+        [
+            (self.reports_cost, "cost"),
+            (self.enforces_budget, "budget"),
+            (self.sandbox, "sandbox"),
+            (self.allow.is_some(), "allowlist"),
+            (self.resumes, "resumes"),
+        ]
+        .into_iter()
+        .filter_map(|(on, name)| on.then_some(name))
+        .collect()
+    }
+}
+
 /// `template` with each `{name}` replaced in one pass, so a value is never
 /// read for placeholders: a task that mentions `{model}` reaches the agent as
 /// written. `None` when a placeholder it holds has no value. An unknown

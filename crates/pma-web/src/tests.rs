@@ -33,6 +33,15 @@ fn picks_round_trip_through_json() {
             text: "t".into(),
         },
         Pick::Campaign { name: "c".into() },
+        Pick::Worker {
+            name: "claude".into(),
+        },
+        Pick::Preset {
+            name: "claude-haiku".into(),
+            agent: "claude".into(),
+            model: "haiku".into(),
+            args: vec!["--effort".into(), "high".into()],
+        },
     ] {
         assert_eq!(pick_from(&pick_json(&p)), Some(p));
     }

@@ -11,6 +11,7 @@
 //! cyan under way, grey context. `NO_COLOR` turns it off; the selection is
 //! still reverse video and a `>` marker, so nothing depends on colour alone.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use ratatui::Frame;
@@ -26,7 +27,9 @@ use ratatui::widgets::{
 use pma_core::api::{self, Action, Outcome, Query, View};
 use pma_core::keys::{self, Act, Ask, Command, Tab};
 use pma_core::report_runs::By;
-use pma_core::screen::{self, Body, Detail, Item, Kind, Pane, Pick, Screen, Section, Tone};
+use pma_core::screen::{
+    self, Body, Detail, Item, Kind, Node, Pane, Pick, Screen, Section, Tone, Tree, Visible,
+};
 use pma_core::store::Store;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -57,6 +60,10 @@ enum Mode {
         label: &'static str,
         input: String,
         pick: Pick,
+        /// For a prompt of several fields: the ones answered, and the labels
+        /// still to ask.
+        answers: Vec<String>,
+        rest: Vec<&'static str>,
     },
 }
 
@@ -111,6 +118,13 @@ pub struct App {
     /// Per tab: the focused pane, and the selection in each pane.
     pane: Vec<usize>,
     selected: Vec<Vec<TableState>>,
+    /// The hub's tree: what the viewer opened or closed, by node id, the
+    /// selected row, and that row's id, which keeps the selection on the
+    /// same node when the tree is read again.
+    chosen: HashMap<String, bool>,
+    cursor: usize,
+    cursor_id: Option<String>,
+    tree_state: TableState,
     mode: Mode,
     status: Option<(String, Tone)>,
     busy: bool,
@@ -138,6 +152,10 @@ impl App {
             screens: vec![None; n],
             pane: vec![0; n],
             selected: vec![Vec::new(); n],
+            chosen: HashMap::new(),
+            cursor: 0,
+            cursor_id: None,
+            tree_state: TableState::default(),
             mode: Mode::Normal,
             status: None,
             busy: false,
@@ -175,8 +193,52 @@ impl App {
         }
     }
 
+    fn tree(&self) -> Option<&[Node]> {
+        match &self.screens[index(self.tab)] {
+            Some(Ok(Screen {
+                body: Body::Tree(tree),
+                ..
+            })) => Some(&tree.nodes),
+            _ => None,
+        }
+    }
+
+    fn rows(&self) -> Vec<Visible<'_>> {
+        self.tree()
+            .map_or_else(Vec::new, |nodes| screen::visible(nodes, &self.chosen))
+    }
+
+    /// Moves the tree's selection to row `at`, remembering its node.
+    fn select_row(&mut self, at: usize) {
+        let id = self.rows().get(at).map(|v| v.node.id.clone());
+        if id.is_some() {
+            self.cursor = at;
+            self.cursor_id = id;
+        }
+    }
+
+    /// Opens or closes the selected branch; `None` flips it.
+    fn fold(&mut self, open: Option<bool>) {
+        let Some(v) = self.rows().get(self.cursor).copied() else {
+            return;
+        };
+        if v.node.children.is_empty() {
+            return;
+        }
+        let id = v.node.id.clone();
+        let open = open.unwrap_or(!v.open);
+        self.chosen.insert(id, open);
+    }
+
     /// The selected row and the pane it is in.
     fn pick(&self) -> (Pick, Vec<Item>) {
+        if let Some(nodes) = self.tree() {
+            let pick = self
+                .rows()
+                .get(self.cursor)
+                .map_or(Pick::Nothing, |v| v.node.pick.clone());
+            return (pick, screen::tree_items(nodes));
+        }
         let t = index(self.tab);
         let Some(pane) = self.panes().get(self.pane[t]) else {
             return (Pick::Nothing, Vec::new());
@@ -210,6 +272,17 @@ impl App {
             return;
         };
         let t = index(tab);
+        if let Body::Tree(Tree { nodes, .. }) = &s.body {
+            // The same node stays selected, wherever it moved; one that went
+            // away leaves the selection at the same height.
+            let rows = screen::visible(nodes, &self.chosen);
+            let found = self
+                .cursor_id
+                .as_ref()
+                .and_then(|id| rows.iter().position(|v| &v.node.id == id));
+            self.cursor = found.unwrap_or(self.cursor.min(rows.len().saturating_sub(1)));
+            self.cursor_id = rows.get(self.cursor).map(|v| v.node.id.clone());
+        }
         if let Body::Panes(panes) = &s.body {
             // Keep each selection where it was, within the new length.
             let states = &mut self.selected[t];
@@ -293,14 +366,32 @@ impl App {
                         input.pop();
                     }
                     "Enter" => {
+                        if let Mode::Prompt {
+                            label,
+                            input,
+                            answers,
+                            rest,
+                            ..
+                        } = &mut self.mode
+                            && !rest.is_empty()
+                        {
+                            answers.push(std::mem::take(input));
+                            *label = rest.remove(0);
+                            return None;
+                        }
                         let Mode::Prompt {
-                            act, input, pick, ..
+                            act,
+                            input,
+                            pick,
+                            mut answers,
+                            ..
                         } = std::mem::replace(&mut self.mode, Mode::Normal)
                         else {
                             unreachable!("in a prompt");
                         };
+                        answers.push(input);
                         let (_, pane) = self.pick();
-                        return self.ask_done(act, &pick, &pane, &input);
+                        return self.ask_done(act, &pick, &pane, &answers.join("\n"));
                     }
                     k if k.chars().count() == 1 => input.push_str(k),
                     _ => {}
@@ -309,14 +400,46 @@ impl App {
             }
             Mode::Normal => {}
         }
-        let binding = keys::lookup(key, self.tab)?;
+        let binding = screen::lookup(key, self.tab, &self.pick().0)?;
         let t = index(self.tab);
+        let in_tree = self.tree().is_some();
         match binding.command {
             Command::Tab(tab) => {
                 self.tab = tab;
                 self.status = None;
                 return Some(Request::Load(self.query()));
             }
+            Command::Down | Command::Up | Command::First | Command::Last if in_tree => {
+                let len = self.rows().len();
+                if len > 0 {
+                    let at = self.cursor;
+                    self.select_row(match binding.command {
+                        Command::Down => (at + 1).min(len - 1),
+                        Command::Up => at.saturating_sub(1),
+                        Command::First => 0,
+                        _ => len - 1,
+                    });
+                }
+            }
+            Command::Expand => {
+                if let Some(v) = self.rows().get(self.cursor).copied() {
+                    match (v.node.children.is_empty(), v.open) {
+                        (true, _) => {}
+                        (false, false) => self.fold(Some(true)),
+                        (false, true) => self.select_row(self.cursor + 1),
+                    }
+                }
+            }
+            Command::Collapse => {
+                if let Some(v) = self.rows().get(self.cursor).copied() {
+                    match (v.open, v.parent) {
+                        (true, _) => self.fold(Some(false)),
+                        (false, Some(up)) => self.select_row(up),
+                        (false, None) => {}
+                    }
+                }
+            }
+            Command::Toggle => self.fold(None),
             Command::Down | Command::Up | Command::First | Command::Last => {
                 let len = self.panes().get(self.pane[t]).map_or(0, |p| p.items.len());
                 let p = self.pane[t];
@@ -343,6 +466,12 @@ impl App {
                 return match self.pick().0 {
                     Pick::Run { id, .. } => Some(Request::Load(Query::Run { id })),
                     Pick::Job { id, .. } => Some(Request::Load(Query::JobLog { id })),
+                    Pick::Worker { name } => Some(Request::Load(Query::Worker { name })),
+                    // A branch of the tree opens in place.
+                    _ if in_tree => {
+                        self.fold(None);
+                        None
+                    }
                     _ => None,
                 };
             }
@@ -380,6 +509,18 @@ impl App {
                             label,
                             input: screen::initial_input(act, &pick),
                             pick,
+                            answers: Vec::new(),
+                            rest: Vec::new(),
+                        };
+                    }
+                    Ask::Fields(labels) => {
+                        self.mode = Mode::Prompt {
+                            act,
+                            label: labels.first().copied().unwrap_or_default(),
+                            input: screen::initial_input(act, &pick),
+                            pick,
+                            answers: Vec::new(),
+                            rest: labels.iter().skip(1).copied().collect(),
                         };
                     }
                     Ask::Confirm => match screen::action_in(act, &pick, &pane, "", &self.project) {
@@ -441,8 +582,10 @@ impl App {
                         rest
                     }
                 };
-                if let Body::Panes(panes) = &s.body {
-                    self.render_body(frame, body, panes);
+                match &s.body {
+                    Body::Panes(panes) => self.render_body(frame, body, panes),
+                    Body::Tree(tree) => self.render_tree(frame, body, tree),
+                    Body::Detail(_) => {}
                 }
             }
         }
@@ -455,7 +598,20 @@ impl App {
                 }
             }
             Mode::Confirm { question, .. } => self.render_confirm(frame, &question),
-            Mode::Prompt { label, input, .. } => self.render_prompt(frame, label, &input),
+            Mode::Prompt {
+                label,
+                input,
+                answers,
+                rest,
+                ..
+            } => {
+                let title = match answers.len() + rest.len() {
+                    0 => label.to_string(),
+                    n => format!("{label} ({} of {})", answers.len() + 1, n + 1),
+                };
+                let last = rest.is_empty();
+                self.render_prompt(frame, &title, &input, last)
+            }
             Mode::Normal => {}
         }
     }
@@ -478,7 +634,7 @@ impl App {
                     },
                 ));
                 spans.push(Span::styled(
-                    format!(" {} ", tab.title()),
+                    format!(" {}", tab.title()),
                     match current {
                         true => p
                             .accent()
@@ -490,7 +646,7 @@ impl App {
         }
         if self.tab == Tab::Project {
             spans.push(Span::styled(
-                format!(" {} ", self.project),
+                format!("  {} ", self.project),
                 p.accent()
                     .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
             ));
@@ -512,6 +668,9 @@ impl App {
     fn footer(&self) -> Line<'static> {
         let p = self.palette;
         match &self.mode {
+            Mode::Prompt { rest, .. } if !rest.is_empty() => {
+                return hints(p, &[("Enter", "next field"), ("Esc", "cancel")]);
+            }
             Mode::Prompt { .. } => {
                 return hints(p, &[("Enter", "submit"), ("Esc", "cancel")]);
             }
@@ -534,7 +693,10 @@ impl App {
             .iter()
             .filter(|b| match b.command {
                 Command::Act(a) => a.on_row() && screen::fits(a, &pick),
-                Command::Open => matches!(pick, Pick::Run { .. } | Pick::Job { .. }),
+                Command::Open => matches!(
+                    pick,
+                    Pick::Run { .. } | Pick::Job { .. } | Pick::Worker { .. }
+                ),
                 Command::OpenProject => pick.project().is_some(),
                 _ => false,
             })
@@ -553,9 +715,9 @@ impl App {
         let [lists, preview] =
             Layout::vertical([Constraint::Min(4), Constraint::Length(3)]).areas(area);
         let t = index(self.tab);
-        let areas: Vec<Rect> = match panes.len() {
+        let areas: Vec<Rect> = match self.tab {
             // The matrix: urgent on the left, important on top.
-            4 => {
+            Tab::Matrix if panes.len() == 4 => {
                 let [upper, lower] =
                     Layout::vertical([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
                         .areas(lists);
@@ -598,6 +760,150 @@ impl App {
             }
         }
         self.render_preview(frame, preview, panes);
+    }
+
+    /// A tree on the left, each row a name, then its cells in the tree's
+    /// columns, and the selected row's fields on the right; the right side
+    /// goes when the terminal is too narrow for both.
+    fn render_tree(&mut self, frame: &mut Frame, area: Rect, tree: &Tree) {
+        let p = self.palette;
+        let (left, right) = match area.width >= 120 {
+            true => {
+                let [l, r] = Layout::horizontal([Constraint::Percentage(64), Constraint::Fill(1)])
+                    .areas(area);
+                (l, Some(r))
+            }
+            false => (area, None),
+        };
+        let rows = screen::visible(&tree.nodes, &self.chosen);
+        let block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(p.accent())
+            .title(Span::styled(
+                " Explorer ",
+                p.accent().add_modifier(Modifier::BOLD),
+            ));
+        // A column no visible row fills says nothing; it is left out.
+        let shown: Vec<usize> = (0..tree.columns.len())
+            .filter(|i| {
+                rows.iter()
+                    .any(|v| v.node.cells.get(*i).is_some_and(|c| !c.text.is_empty()))
+            })
+            .collect();
+        let mut widths = vec![Constraint::Fill(1)];
+        widths.extend(shown.iter().map(|i| {
+            let longest = rows
+                .iter()
+                .map(|v| v.node.cells.get(*i).map_or(0, |c| c.text.chars().count()))
+                .max()
+                .unwrap_or(0)
+                .max(tree.columns[*i].title.chars().count());
+            Constraint::Length(longest.min(24) as u16)
+        }));
+        let header = Row::new(
+            std::iter::once(TableCell::from("")).chain(shown.iter().map(|i| {
+                let c = &tree.columns[*i];
+                let title = c.title.to_uppercase();
+                TableCell::from(match c.kind {
+                    Kind::Number => Text::from(title).right_aligned(),
+                    _ => Text::from(title),
+                })
+            })),
+        )
+        .style(p.muted().add_modifier(Modifier::BOLD));
+        let body = rows.iter().map(|v| {
+            Row::new(
+                std::iter::once(TableCell::from(tree_line(p, v))).chain(shown.iter().map(|i| {
+                    let c = v
+                        .node
+                        .cells
+                        .get(*i)
+                        .cloned()
+                        .unwrap_or_else(|| screen::Cell {
+                            text: String::new(),
+                            tone: Tone::Plain,
+                            link: None,
+                        });
+                    let text = Text::from(Span::styled(c.text, p.tone(c.tone)));
+                    TableCell::from(match tree.columns[*i].kind {
+                        Kind::Number => text.right_aligned(),
+                        _ => text,
+                    })
+                })),
+            )
+        });
+        self.tree_state
+            .select((!rows.is_empty()).then_some(self.cursor));
+        frame.render_stateful_widget(
+            Table::new(body, widths)
+                .header(header)
+                .column_spacing(2)
+                .block(block)
+                .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED)),
+            left,
+            &mut self.tree_state,
+        );
+        let Some(right) = right else {
+            return;
+        };
+        let node = rows.get(self.cursor).map(|v| v.node);
+        let mut title = vec![Span::styled(
+            " Details ",
+            Style::new().add_modifier(Modifier::BOLD),
+        )];
+        let mut lines: Vec<Line> = Vec::new();
+        match node {
+            None => lines.push(Line::styled("Nothing selected.", p.muted())),
+            Some(n) => {
+                title.extend(
+                    prose_line(p, &n.label.text)
+                        .spans
+                        .into_iter()
+                        .map(|s| Span::styled(s.content, p.muted().patch(s.style))),
+                );
+                title.push(Span::raw(" "));
+                let width = n
+                    .fields
+                    .iter()
+                    .map(|(l, _)| l.chars().count())
+                    .max()
+                    .unwrap_or(0);
+                for (label, value) in &n.fields {
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("{label:<width$}  "), p.muted()),
+                        Span::styled(value.text.clone(), p.tone(value.tone)),
+                    ]));
+                }
+                if n.fields.is_empty() {
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            n.label.text.clone(),
+                            Style::new().add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw("  "),
+                    ]));
+                    lines.push(Line::from(fact_spans(p, &n.facts)));
+                }
+                for (heading, text) in &n.notes {
+                    lines.push(Line::raw(""));
+                    lines.push(Line::styled(
+                        heading.clone(),
+                        p.accent().add_modifier(Modifier::BOLD),
+                    ));
+                    lines.extend(text.lines().map(|l| prose_line(p, l)));
+                }
+            }
+        }
+        frame.render_widget(
+            Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+                Block::bordered()
+                    .border_type(BorderType::Rounded)
+                    .border_style(p.muted())
+                    .title(Line::from(title))
+                    .padding(Padding::horizontal(1)),
+            ),
+            right,
+        );
     }
 
     /// A project's facts, label and value, toned and wrapped.
@@ -884,7 +1190,7 @@ impl App {
         );
     }
 
-    fn render_prompt(&self, frame: &mut Frame, label: &str, input: &str) {
+    fn render_prompt(&self, frame: &mut Frame, label: &str, input: &str, last: bool) {
         let p = self.palette;
         let area = centered(frame.area(), 70.min(frame.area().width), 5);
         frame.render_widget(Clear, area);
@@ -895,13 +1201,61 @@ impl App {
                     Span::styled(" ", Style::new().add_modifier(Modifier::REVERSED)),
                 ]),
                 Line::raw(""),
-                Line::styled("Enter submits, Esc cancels", p.muted()),
+                Line::styled(
+                    match last {
+                        true => "Enter submits, Esc cancels",
+                        false => "Enter goes to the next field, Esc cancels",
+                    },
+                    p.muted(),
+                ),
             ])
             .wrap(Wrap { trim: false })
             .block(dialog(p, &format!(" {label} "), p.accent()).padding(Padding::horizontal(1))),
             area,
         );
     }
+}
+
+/// A tree row's first cell: its indent, an open or closed marker for a
+/// branch, its icon, its name in bold and its few words after it.
+fn tree_line(p: Palette, v: &Visible) -> Line<'static> {
+    let n = v.node;
+    let marker = match (n.children.is_empty(), v.open) {
+        (true, _) => "  ",
+        (false, true) => "▾ ",
+        (false, false) => "▸ ",
+    };
+    let mut spans = vec![
+        Span::raw("  ".repeat(v.depth)),
+        Span::styled(marker, p.muted()),
+        Span::styled(format!("{} ", n.icon.text), p.tone(n.icon.tone)),
+    ];
+    // A task's words are markdown: its markers go, its code keeps its colour.
+    let name = p.tone(n.label.tone).add_modifier(Modifier::BOLD);
+    spans.extend(
+        prose_line(p, &n.label.text)
+            .spans
+            .into_iter()
+            .map(|s| Span::styled(s.content, name.patch(s.style))),
+    );
+    spans.extend(fact_spans(p, &n.facts));
+    Line::from(spans)
+}
+
+/// Facts after a name, two spaces apart; a plain fact is drawn muted, so the
+/// name stands out and a toned one, such as a failed state, still shows.
+fn fact_spans(p: Palette, facts: &[screen::Cell]) -> Vec<Span<'static>> {
+    facts
+        .iter()
+        .filter(|c| !c.text.is_empty())
+        .flat_map(|c| {
+            let style = match c.tone {
+                Tone::Plain | Tone::Strong => p.muted(),
+                t => p.tone(t),
+            };
+            [Span::raw("  "), Span::styled(c.text.clone(), style)]
+        })
+        .collect()
 }
 
 /// Key hints: the key bold in the accent colour, its label plain.
@@ -993,8 +1347,10 @@ fn heights(panes: &[Pane], total: u16) -> Vec<u16> {
     let spare = total.saturating_sub(base);
     let weight: u16 = extra.iter().sum();
     if weight == 0 {
-        if let Some(first) = out.first_mut() {
-            *first += spare;
+        // To the first list with rows, so an empty one stays one line.
+        let i = panes.iter().position(|p| !p.items.is_empty()).unwrap_or(0);
+        if let Some(h) = out.get_mut(i) {
+            *h += spare;
         }
     } else {
         for (h, e) in out.iter_mut().zip(&extra) {
@@ -1128,7 +1484,11 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     fn screen_text(app: &mut App) -> String {
-        let mut terminal = Terminal::new(TestBackend::new(110, 30)).unwrap();
+        screen_text_at(app, 110, 30)
+    }
+
+    fn screen_text_at(app: &mut App, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(|f| app.render(f)).unwrap();
         let buffer = terminal.backend().buffer();
         (0..buffer.area.height)
@@ -1252,7 +1612,7 @@ mod tests {
         assert_eq!(targets, ["a:5"]);
 
         app.key("Tab");
-        assert_eq!(app.key("Enter"), None, "not a key on next");
+        assert_eq!(app.key("Enter"), Some(Request::Load(Query::Run { id: 4 })));
         assert_eq!(app.key("4"), Some(Request::Load(Query::Jobs)));
         app.loaded(Ok(View::Jobs(vec![
             job(7, "awaiting-approval"),
@@ -1328,6 +1688,110 @@ mod tests {
         };
         plain.loaded(Ok(next_view()));
         assert_eq!(colour_of(&mut plain, "critical"), Some(Color::Reset));
+    }
+
+    fn agents_view() -> View {
+        let mut claude = pma_core::worker::Worker::blank("claude");
+        claude.command = "claude".into();
+        View::Agents {
+            state: "/tmp".into(),
+            jobs: Vec::new(),
+            runs: Vec::new(),
+            now: 0,
+            workers: vec![claude],
+            presets: vec![pma_core::store::Preset {
+                name: "claude-haiku".into(),
+                agent: "claude".into(),
+                model: Some("haiku".into()),
+                args: Vec::new(),
+            }],
+            agent: "claude".into(),
+            preset: None,
+        }
+    }
+
+    fn typed(app: &mut App, text: &str) -> Option<Request> {
+        for c in text.chars() {
+            app.key(&c.to_string());
+        }
+        app.key("Enter")
+    }
+
+    /// The agents tab lists the workers and presets, and its keys set a
+    /// field, edit, add, make default and open, as the CLI would.
+    #[test]
+    fn workers_and_presets_are_configured_from_the_agents_tab() {
+        let mut app = App::new();
+        app.key("5");
+        app.loaded(Ok(agents_view()));
+        let text = screen_text(&mut app);
+        assert!(text.contains("Workers (* default)"), "{text}");
+        assert!(text.contains("* claude"), "{text}");
+        assert!(text.contains("claude-haiku"), "{text}");
+        // Nothing runs, so the workers list has the focus.
+        assert_eq!(
+            app.key("u"),
+            Some(Request::Act(Action::UseWorker {
+                name: "claude".into()
+            }))
+        );
+        assert_eq!(
+            app.key("Enter"),
+            Some(Request::Load(Query::Worker {
+                name: "claude".into()
+            }))
+        );
+        app.key("f");
+        assert_eq!(
+            typed(&mut app, "sandbox true"),
+            Some(Request::Act(Action::SetWorker {
+                name: "claude".into(),
+                field: "sandbox".into(),
+                value: "true".into(),
+            }))
+        );
+        app.acted(Ok(Default::default()));
+        app.key("l");
+        app.key("e");
+        assert!(
+            screen_text(&mut app).contains("claude haiku"),
+            "starts from the preset"
+        );
+        assert_eq!(
+            typed(&mut app, " --effort high"),
+            Some(Request::Act(Action::SetPreset(pma_core::store::Preset {
+                name: "claude-haiku".into(),
+                agent: "claude".into(),
+                model: Some("haiku".into()),
+                args: vec!["--effort".into(), "high".into()],
+            })))
+        );
+        app.acted(Ok(Default::default()));
+        app.key("+");
+        assert_eq!(
+            typed(&mut app, "plain claude"),
+            Some(Request::Act(Action::SetPreset(pma_core::store::Preset {
+                name: "plain".into(),
+                agent: "claude".into(),
+                model: None,
+                args: Vec::new(),
+            })))
+        );
+        app.acted(Ok(Default::default()));
+        app.key("a");
+        assert!(screen_text(&mut app).contains("worker name (1 of 2)"));
+        assert_eq!(typed(&mut app, "codex"), None, "asks for the program next");
+        assert!(screen_text(&mut app).contains("program to run (2 of 2)"));
+        assert_eq!(
+            typed(&mut app, "codex"),
+            Some(Request::Act(Action::AddWorker {
+                name: "codex".into(),
+                command: "codex".into(),
+            }))
+        );
+        app.acted(Ok(Default::default()));
+        app.key("x");
+        assert!(screen_text(&mut app).contains("remove preset claude-haiku?"));
     }
 
     /// A prompt reads text, starts from the note's own, and builds the action
@@ -1435,6 +1899,9 @@ mod tests {
                         | Command::PrevPane
                         | Command::Back
                         | Command::Open
+                        | Command::Expand
+                        | Command::Collapse
+                        | Command::Toggle
                 );
                 assert!(
                     out.is_some() || before != after || quiet,
@@ -1468,6 +1935,8 @@ mod tests {
                     label: "note",
                     input: "x".into(),
                     pick: Pick::Nothing,
+                    answers: Vec::new(),
+                    rest: Vec::new(),
                 },
             ];
             for mode in modes {
@@ -1478,6 +1947,139 @@ mod tests {
                     .unwrap_or_else(|e| panic!("{w}x{h} {mode:?}: {e}"));
             }
         }
+    }
+
+    fn node(id: &str, label: &str, pick: Pick, open: bool, children: Vec<Node>) -> Node {
+        Node {
+            id: id.into(),
+            icon: screen::Cell {
+                text: "●".into(),
+                tone: Tone::Warn,
+                link: None,
+            },
+            label: screen::Cell {
+                text: label.into(),
+                tone: Tone::Strong,
+                link: None,
+            },
+            facts: Vec::new(),
+            cells: vec![screen::Cell {
+                text: format!("state of {label}"),
+                tone: Tone::Warn,
+                link: None,
+            }],
+            pick,
+            open,
+            fields: vec![(
+                "kind".into(),
+                screen::Cell {
+                    text: format!("field of {label}"),
+                    tone: Tone::Plain,
+                    link: None,
+                },
+            )],
+            notes: Vec::new(),
+            children,
+        }
+    }
+
+    fn hub_app() -> App {
+        let run = Pick::Run {
+            id: 5,
+            clean: false,
+            state: "ready".into(),
+            project: "argdec".into(),
+        };
+        let job = Pick::Job {
+            id: 9,
+            awaiting: true,
+        };
+        let tree = vec![
+            node(
+                "pargdec",
+                "argdec",
+                Pick::Nothing,
+                true,
+                vec![node("pargdec/r5", "#5", run, false, vec![])],
+            ),
+            node(
+                "pportal",
+                "portal",
+                Pick::Nothing,
+                false,
+                vec![node("pportal/j9", "#9", job, false, vec![])],
+            ),
+        ];
+        let mut app = App::new();
+        assert_eq!(app.key("H"), Some(Request::Load(Query::Hub)));
+        app.screens[index(Tab::Hub)] = Some(Ok(Screen {
+            tab: Some(Tab::Hub),
+            header: Some("last scan just now".into()),
+            summary: Vec::new(),
+            body: Body::Tree(Tree {
+                columns: vec![screen::Column {
+                    title: "status",
+                    kind: Kind::Badge,
+                }],
+                nodes: tree,
+            }),
+        }));
+        app
+    }
+
+    /// The hub draws a tree and the selected row's details beside it; `l`,
+    /// `h` and space open and close branches, and a key's act follows the
+    /// row it is on.
+    #[test]
+    fn the_hub_is_a_tree_with_details() {
+        let mut app = hub_app();
+        let narrow = screen_text(&mut app);
+        assert!(
+            narrow.contains("Explorer") && !narrow.contains("Details"),
+            "a narrow terminal gives the tree all the width: {narrow}"
+        );
+        let out = screen_text_at(&mut app, 140, 30);
+        assert!(out.contains("Explorer") && out.contains("Details"), "{out}");
+        assert!(out.contains("▾ ● argdec"), "{out}");
+        assert!(out.contains("STATUS"), "a header names the column: {out}");
+        assert!(out.contains("state of #5"), "{out}");
+        assert!(out.contains("▸ ● portal"), "{out}");
+        assert!(!out.contains("#9"), "a closed branch hides its rows: {out}");
+        assert!(out.contains("field of argdec"), "{out}");
+
+        app.key("j");
+        assert!(screen_text_at(&mut app, 140, 30).contains("field of #5"));
+        assert_eq!(
+            app.key("a"),
+            Some(Request::Act(Action::ApproveRun {
+                id: 5,
+                seen: Some("ready".into())
+            }))
+        );
+        // Out to the parent, closed, then portal opened and stepped into.
+        app.key("h");
+        assert_eq!(app.cursor, 0);
+        app.key("h");
+        assert!(!screen_text_at(&mut app, 140, 30).contains("#5"));
+        app.key("j");
+        app.key("l");
+        app.key("l");
+        assert!(screen_text_at(&mut app, 140, 30).contains("field of #9"));
+        assert_eq!(
+            app.key("a"),
+            Some(Request::Act(Action::ApproveJob { id: 9 })),
+            "`a` on a job approves its plan"
+        );
+        assert_eq!(
+            app.key("Enter"),
+            Some(Request::Load(Query::JobLog { id: 9 }))
+        );
+
+        // The selection is held by node, not by row number.
+        app.key("g");
+        app.key(" ");
+        app.key("G");
+        assert_eq!(app.cursor_id.as_deref(), Some("pportal/j9"));
     }
 
     #[test]

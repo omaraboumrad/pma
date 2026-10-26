@@ -4,6 +4,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+**A hub tab: your projects, their tasks, and what works on each.** `H` in `pma tui`, and Hub in the web's Work group. Each project is a branch holding its open tasks in matrix order; under a task are the job dispatching it and the runs that worked on it, each run with the job publishing it, if any. Rows share columns: status, quadrant, priority, when, by and cost. A task's status is what is happening to it, such as `job #10 running` or `run #5 ready to review`; a project's is the worst of failing CI, runs that need you, running agents and jobs. A project's other live runs, its project-wide jobs and its finished runs follow its tasks. A job on no one project, such as a scan of them all, is named in the header. The selected row's fields show beside the tree, on a terminal at least 120 columns wide. `l` and `h` open and close a branch or step in and out, space folds it, and Enter opens a run's diff or a job's log. A branch holding a run that waits on you, a running agent or a live job starts open; what you open or close stays so across reloads. A project scanned over a day ago says so on its row. On the hub `a` and `s` act on runs and jobs alike, so the selected row decides: approve or stage a run, approve or stop a job (`screen::lookup`). Next, matrix, runs and jobs are unchanged.
+
 ## [0.8.0]
 
 Upgrading from 0.7:

@@ -243,6 +243,7 @@ fn route(req: &Request, ctx: &Ctx) -> Response {
             let q = match pick_from(&b["pick"]) {
                 Some(Pick::Run { id, .. }) => api::Query::Run { id },
                 Some(Pick::Job { id, .. }) => api::Query::JobLog { id },
+                Some(Pick::Worker { name }) => api::Query::Worker { name },
                 _ => return Response::status(400),
             };
             answer(ctx, |store| {
@@ -289,6 +290,7 @@ fn rows(store: &Store, tab: Tab, act: Act, body: &Value) -> Result<Vec<Item>> {
     Ok(
         match screen::screen(api::query(store, tab.query(By::Class, project))?).body {
             Body::Panes(panes) => panes.into_iter().flat_map(|p| p.items).collect(),
+            Body::Tree(tree) => screen::tree_items(&tree.nodes),
             Body::Detail(_) => Vec::new(),
         },
     )
@@ -343,6 +345,7 @@ fn keys_json() -> Value {
                 Ask::Nothing => json!({ "kind": "nothing" }),
                 Ask::Confirm => json!({ "kind": "confirm" }),
                 Ask::Text(label) => json!({ "kind": "text", "label": label }),
+                Ask::Fields(labels) => json!({ "kind": "fields", "labels": labels }),
             };
             json!({
                 "key": b.key,
@@ -381,19 +384,15 @@ fn screen_json(s: &Screen) -> Value {
                 "text": text,
             })).collect::<Vec<_>>(),
         }}),
+        Body::Tree(tree) => json!({
+            "columns": tree.columns.iter().map(column_json).collect::<Vec<_>>(),
+            "tree": tree.nodes.iter().map(node_json).collect::<Vec<_>>(),
+        }),
         Body::Panes(panes) => json!({
             "panes": panes.iter().map(|p| json!({
                 "title": p.title,
                 "empty": p.empty,
-                "columns": p.columns.iter().map(|c| json!({
-                    "title": c.title,
-                    "kind": match c.kind {
-                        screen::Kind::Text => "text",
-                        screen::Kind::Wide => "wide",
-                        screen::Kind::Number => "number",
-                        screen::Kind::Badge => "badge",
-                    },
-                })).collect::<Vec<_>>(),
+                "columns": p.columns.iter().map(column_json).collect::<Vec<_>>(),
                 "items": p.items.iter().map(|i| json!({
                     "cells": i.cells.iter().map(cell_json).collect::<Vec<_>>(),
                     "pick": pick_json(&i.pick),
@@ -411,6 +410,38 @@ fn screen_json(s: &Screen) -> Value {
         "header": s.header,
         "summary": s.summary.iter().map(|(l, c)| json!([l, cell_json(c)])).collect::<Vec<_>>(),
         "body": body,
+    })
+}
+
+fn column_json(c: &screen::Column) -> Value {
+    json!({
+        "title": c.title,
+        "kind": match c.kind {
+            screen::Kind::Text => "text",
+            screen::Kind::Wide => "wide",
+            screen::Kind::Number => "number",
+            screen::Kind::Badge => "badge",
+        },
+    })
+}
+
+fn node_json(n: &screen::Node) -> Value {
+    json!({
+        "id": n.id,
+        "icon": cell_json(&n.icon),
+        "label": cell_json(&n.label),
+        "facts": n.facts.iter().map(cell_json).collect::<Vec<_>>(),
+        "cells": n.cells.iter().map(cell_json).collect::<Vec<_>>(),
+        "pick": pick_json(&n.pick),
+        "acts": Act::ALL
+            .iter()
+            .filter(|a| a.on_row() && screen::fits(**a, &n.pick))
+            .map(|a| a.name())
+            .collect::<Vec<_>>(),
+        "open": n.open,
+        "fields": n.fields.iter().map(|(k, c)| json!([k, cell_json(c)])).collect::<Vec<_>>(),
+        "notes": n.notes,
+        "children": n.children.iter().map(node_json).collect::<Vec<_>>(),
     })
 }
 
@@ -437,6 +468,16 @@ fn pick_json(p: &Pick) -> Value {
         }
         Pick::Note { id, text } => json!({ "kind": "note", "id": id, "text": text }),
         Pick::Campaign { name } => json!({ "kind": "campaign", "name": name }),
+        Pick::Project { name } => json!({ "kind": "project", "name": name, "project": name }),
+        Pick::Worker { name } => json!({ "kind": "worker", "name": name }),
+        Pick::Preset {
+            name,
+            agent,
+            model,
+            args,
+        } => {
+            json!({ "kind": "preset", "name": name, "agent": agent, "model": model, "args": args })
+        }
     }
 }
 
@@ -476,6 +517,18 @@ fn pick_from(v: &Value) -> Option<Pick> {
             text: s("text")?,
         },
         "campaign" => Pick::Campaign { name: s("name")? },
+        "project" => Pick::Project { name: s("name")? },
+        "worker" => Pick::Worker { name: s("name")? },
+        "preset" => Pick::Preset {
+            name: s("name")?,
+            agent: s("agent")?,
+            model: s("model")?,
+            args: v["args"]
+                .as_array()?
+                .iter()
+                .map(|a| a.as_str().map(String::from))
+                .collect::<Option<_>>()?,
+        },
         _ => return None,
     })
 }

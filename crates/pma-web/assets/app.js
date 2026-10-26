@@ -6,6 +6,7 @@
 "use strict";
 
 const TABS = {
+  hub: { label: "Hub", group: "Work", about: "Every project's tasks, and under each task the runs and jobs working on it." },
   next: { label: "Next up", group: "Work", about: "What agents can take now, and what waits on you." },
   runs: { label: "Runs", group: "Work", about: "Agent runs waiting on a decision." },
   jobs: { label: "Jobs", group: "Work", about: "Background commands, and plans waiting for approval." },
@@ -32,6 +33,11 @@ const S = {
   previous: "next", // the view it was opened from
   projects: [], // every project, worst first: { name, tier, state, tone }
   filter: "",
+  // The hub's tree: what the viewer opened or closed by node id, the
+  // selected row, and its id, which keeps it selected across reloads.
+  chosen: {},
+  cursor: 0,
+  cursorId: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -88,11 +94,63 @@ async function api(path, body) {
   return data;
 }
 
-// The binding `key` has on the current tab; one for that tab alone wins over
-// one for every tab. As pma_core::keys::lookup.
+// The binding `key` has on the current tab for the selected row; one for
+// that tab alone wins over one for every tab, and of two acts on the tab the
+// one that fits the row wins. As pma_core::screen::lookup.
 function lookup(key) {
   const fit = S.keys.bindings.filter((b) => b.key === key);
-  return fit.find((b) => b.tabs.includes(S.tab)) || fit.find((b) => b.tabs.length === 0);
+  const own = fit.filter((b) => b.tabs.includes(S.tab));
+  const acts = selectedActs();
+  return own.find((b) => b.command.kind === "act" && acts.includes(b.command.act))
+    || own[0] || fit.find((b) => b.tabs.length === 0);
+}
+
+// The tree the tab shows, if it shows one.
+function tree() {
+  const s = S.screens[S.tab];
+  return s && s.body && s.body.tree ? s.body.tree : null;
+}
+
+// The rows a viewer sees, as pma_core::screen::visible: a branch's children
+// follow it while it is open.
+function visibleRows() {
+  const out = [];
+  const walk = (nodes, depth, parent) => {
+    for (const node of nodes) {
+      const open = node.children.length > 0 && (node.id in S.chosen ? S.chosen[node.id] : node.open);
+      out.push({ node, depth, open, parent });
+      if (open) walk(node.children, depth + 1, out.length - 1);
+    }
+  };
+  walk(tree() || [], 0, null);
+  return out;
+}
+
+function selectedNode() {
+  const r = visibleRows()[S.cursor];
+  return r ? r.node : null;
+}
+
+function selectedActs() {
+  if (tree()) {
+    const n = selectedNode();
+    return n ? n.acts : [];
+  }
+  const s = selected();
+  return s ? s.item.acts : [];
+}
+
+function selectRow(i) {
+  const r = visibleRows()[i];
+  if (!r) return;
+  S.cursor = i;
+  S.cursorId = r.node.id;
+}
+
+function fold(open) {
+  const r = visibleRows()[S.cursor];
+  if (!r || !r.node.children.length) return;
+  S.chosen[r.node.id] = open === undefined ? !r.open : open;
 }
 
 function onTab() {
@@ -121,6 +179,10 @@ function selected() {
 }
 
 function currentPick() {
+  if (tree()) {
+    const n = selectedNode();
+    return n ? n.pick : { kind: "nothing" };
+  }
   const s = selected();
   return s ? s.item.pick : { kind: "nothing" };
 }
@@ -134,6 +196,12 @@ async function load() {
     S.screens[S.tab] = await api(`/api/screen?tab=${S.tab}&by=${by}&project=${project}`);
   } catch (e) {
     S.screens[S.tab] = { error: e.message };
+  }
+  if (tree()) {
+    const rows = visibleRows();
+    const at = rows.findIndex((r) => r.node.id === S.cursorId);
+    S.cursor = at >= 0 ? at : Math.min(S.cursor, Math.max(rows.length - 1, 0));
+    S.cursorId = rows[S.cursor] ? rows[S.cursor].node.id : null;
   }
   const ps = panes();
   const sel = S.sel[S.tab] || [];
@@ -285,7 +353,10 @@ function draw() {
         el("div", { class: "stat" }, el("dt", {}, label(k)), el("dd", { class: `tone-${c.tone}` }, ...inline(c.text))))));
     }
     const ps = panes();
-    if (S.tab === "status" && ps.length > 1) {
+    if (tree()) {
+      content.className = "content split";
+      content.append(explorer(), details());
+    } else if (S.tab === "status" && ps.length > 1) {
       // One table a page: four side by side each scroll both ways.
       const at = S.pane[S.tab] || 0;
       content.className = "content paged";
@@ -351,6 +422,93 @@ function card(p, pi) {
     if (sel) requestAnimationFrame(() => tr.scrollIntoView({ block: "nearest" }));
   });
   box.append(el("div", { class: "table-wrap" }, el("table", {}, el("thead", {}, head), body, foot)));
+  return box;
+}
+
+// The hub's tree as a table: the first column holds each visible node's
+// marker, icon, name and its few words, indented by depth; its cells line up
+// under the tree's columns.
+function explorer() {
+  const rows = visibleRows();
+  const columns = S.screens[S.tab].body.columns || [];
+  // A column no visible row fills says nothing; it is left out.
+  const shown = columns.map((_, i) => i).filter((i) => rows.some((r) => r.node.cells[i] && r.node.cells[i].text));
+  const head = el("tr", {}, el("th", { scope: "col", class: "wide" }, el("span", { class: "visually-hidden" }, "Name")),
+    shown.map((i) => el("th", { scope: "col", class: columns[i].kind }, columns[i].title)));
+  const body = el("tbody");
+  rows.forEach((r, ri) => {
+    const n = r.node;
+    const sel = ri === S.cursor;
+    const branch = n.children.length > 0;
+    const name = el("div", { class: "tree-name" },
+      el("span", {
+        class: "marker",
+        "aria-hidden": "true",
+        onclick: (e) => { if (!branch) return; e.stopPropagation(); selectRow(ri); fold(); draw(); },
+      }, branch ? (r.open ? "▾" : "▸") : ""),
+      el("span", { class: `icon tone-${n.icon.tone}`, "aria-hidden": "true" }, n.icon.text),
+      el("span", { class: `name tone-${n.label.tone}`, title: n.label.text }, ...inline(n.label.text)),
+      n.facts.filter((f) => f.text).map((f) => el("span", { class: `fact tone-${f.tone}` }, ...inline(f.text))));
+    // Through the CSSOM: the page's policy refuses a style attribute.
+    name.style.paddingLeft = `${r.depth * 20}px`;
+    const tr = el("tr", {
+      role: "row",
+      "aria-level": String(r.depth + 1),
+      "aria-expanded": branch ? String(r.open) : null,
+      "aria-selected": String(sel),
+      onclick: () => { selectRow(ri); draw(); },
+      ondblclick: () => { selectRow(ri); run(lookup("Enter")); },
+    }, el("td", { class: "wide" }, name),
+    shown.map((i) => el("td", { class: columns[i].kind }, n.cells[i] ? shownNode(n.cells[i], columns[i]) : "")));
+    body.append(tr);
+    if (sel) requestAnimationFrame(() => tr.scrollIntoView({ block: "nearest" }));
+  });
+  const box = el("section", { class: "card focused explorer", "aria-labelledby": "explorer-head" },
+    el("header", { class: "card-head" }, el("h2", { id: "explorer-head" }, "Explorer")));
+  if (!rows.length) {
+    box.append(el("p", { class: "empty" }, "Nothing open."));
+    return box;
+  }
+  box.append(el("div", { class: "table-wrap" },
+    el("table", { class: "tree-table", role: "treegrid", "aria-labelledby": "explorer-head" }, el("thead", {}, head), body)));
+  return box;
+}
+
+// The selected node's fields, its notes, and the acts that fit it.
+function details() {
+  const n = selectedNode();
+  const box = el("section", { class: "card details", "aria-labelledby": "details-head" },
+    el("header", { class: "card-head" }, el("h2", { id: "details-head" }, "Details"),
+      n ? el("span", { class: "count" }, ...inline(n.label.text)) : null));
+  if (!n) {
+    box.append(el("p", { class: "empty" }, "Nothing selected."));
+    return box;
+  }
+  const body = el("div", { class: "drawer-body" });
+  if (n.fields.length) {
+    body.append(fieldList(n.fields.map(([k, c]) => [k, el("span", { class: `tone-${c.tone}` }, ...inline(c.text))])));
+  } else {
+    body.append(el("p", {}, el("strong", {}, n.label.text), " ",
+      n.facts.map((f) => el("span", { class: `fact tone-${f.tone}` }, " ", ...inline(f.text)))));
+  }
+  for (const [title, text] of n.notes) {
+    body.append(el("section", { class: "section" }, el("h3", {}, title),
+      el("div", { class: "prose" }, text.split("\n").flatMap((l, i) => (i ? ["\n", ...inline(l)] : inline(l))))));
+  }
+  box.append(body);
+  const actions = el("footer", { class: "drawer-actions" });
+  const proj = onTab().find((b) => b.command.kind === "OpenProject");
+  if (proj && n.pick.project) {
+    actions.append(el("button", { class: "button", type: "button", onclick: () => run(proj) },
+      `Open ${n.pick.project}`, el("kbd", {}, proj.key)));
+  }
+  if (n.pick.kind === "run" || n.pick.kind === "job") {
+    const open = onTab().find((b) => b.command.kind === "Open");
+    actions.append(el("button", { class: "button primary", type: "button", onclick: () => run(open) },
+      n.pick.kind === "run" ? "Review diff" : "View log", el("kbd", {}, "Enter")));
+  }
+  for (const b of acts(true)) if (n.acts.includes(b.command.act)) actions.append(button(b));
+  if (actions.children.length) box.append(actions);
   return box;
 }
 
@@ -427,13 +585,14 @@ function drawDrawer() {
         `Open ${named}`, el("kbd", {}, proj.key)));
     }
     const open = onTab().find((b) => b.command.kind === "Open");
-    if (open && (item.pick.kind === "run" || item.pick.kind === "job")) {
+    const opens = { run: "Review diff", job: "View log", worker: "Show worker" };
+    if (open && opens[item.pick.kind]) {
       actions.append(el("button", { class: "button primary", type: "button", onclick: () => run(open) },
-        item.pick.kind === "run" ? "Review diff" : "View log", el("kbd", {}, "Enter")));
+        opens[item.pick.kind], el("kbd", {}, "Enter")));
     }
   }
   // Only the acts the server says fit this row.
-  const fit = S.drawer.mode === "row" ? sel.item.acts : (sel ? sel.item.acts : []);
+  const fit = selectedActs();
   for (const b of acts(true)) if (fit.includes(b.command.act)) actions.append(button(b));
 }
 
@@ -517,6 +676,15 @@ async function act(b) {
           cancel: true,
         });
         if (!yes) return;
+      } else if (b.ask.kind === "fields") {
+        const answers = [];
+        for (const [i, f] of b.ask.labels.entries()) {
+          const last = i === b.ask.labels.length - 1;
+          const typed = await dialog({ title: label(b.label), field: label(f), input: i ? "" : asked.input, ok: last ? label(b.label) : "Next", cancel: true });
+          if (typed === null) return;
+          answers.push(typed);
+        }
+        input = answers.join("\n");
       } else {
         const typed = await dialog({ title: label(b.label), field: label(b.ask.label), input: asked.input, ok: label(b.label), cancel: true });
         if (typed === null) return;
@@ -542,6 +710,33 @@ async function run(b) {
   const sel = S.sel[t] || [];
   const len = (panes()[p] || { items: [] }).items.length;
   const move = (i) => { if (len) { sel[p] = i; if (S.drawer && S.drawer.mode === "row") S.drawer = { mode: "row" }; } };
+  if (tree()) {
+    const rows = visibleRows();
+    const r = rows[S.cursor];
+    const last = Math.max(rows.length - 1, 0);
+    const done = () => { draw(); return undefined; };
+    switch (b.command.kind) {
+      case "Down": selectRow(Math.min(S.cursor + 1, last)); return done();
+      case "Up": selectRow(Math.max(S.cursor - 1, 0)); return done();
+      case "First": selectRow(0); return done();
+      case "Last": selectRow(last); return done();
+      case "Expand":
+        if (r && r.node.children.length) {
+          if (r.open) selectRow(S.cursor + 1);
+          else fold(true);
+        }
+        return done();
+      case "Collapse":
+        if (r && r.open) fold(false);
+        else if (r && r.parent !== null) selectRow(r.parent);
+        return done();
+      case "Toggle": fold(); return done();
+      case "Open":
+        if (r && r.node.pick.kind !== "run" && r.node.pick.kind !== "job") { fold(); return done(); }
+        break;
+      default: break;
+    }
+  }
   switch (b.command.kind) {
     case "tab":
       S.tab = b.command.tab;
@@ -576,7 +771,7 @@ async function run(b) {
     case "Quit": toast("Close the browser tab to leave. pma web runs until Ctrl-C in its terminal.", "accent"); break;
     case "Open": {
       const pick = currentPick();
-      if (pick.kind !== "run" && pick.kind !== "job") break;
+      if (!["run", "job", "worker"].includes(pick.kind)) break;
       try {
         S.drawer = { mode: "detail", screen: await api("/api/open", { pick }) };
       } catch (e) {

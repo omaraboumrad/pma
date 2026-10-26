@@ -3964,6 +3964,9 @@ fn the_web_view_is_local_and_shares_the_store() {
         runs.contains("Runs not yet final") && runs.contains("\"items\":[]"),
         "{runs}"
     );
+    // The hub ranks work, so like `next` it needs a scan.
+    let hub = get("/api/screen?tab=hub", &host, &cookie);
+    assert!(hub.contains("nothing scanned yet"), "{hub}");
 
     let mut events = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
     events
@@ -4102,6 +4105,38 @@ fn front_ends_racing_on_one_run_act_only_on_what_they_were_shown() {
     let (child, port, cookie) = start_web(&env);
     let seen = first_pick(port, &cookie, "runs");
     assert_eq!(seen["state"], "ready", "{seen}");
+
+    // On the hub the run is under its task, under its project, and its
+    // pick acts on it as the runs tab's does.
+    let (status, hub) = web(port, &cookie, "/api/screen?tab=hub", None);
+    assert_eq!(status, 200, "{hub}");
+    let alpha = hub["body"]["tree"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["label"]["text"] == "alpha")
+        .unwrap_or_else(|| panic!("alpha at the top: {hub}"));
+    assert_eq!(alpha["open"], true, "a run waits on you in it: {hub}");
+    let held = alpha["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["children"].as_array().is_some_and(|c| !c.is_empty()))
+        .unwrap_or_else(|| panic!("a task holding the run: {hub}"));
+    let run = held["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["pick"]["kind"] == "run")
+        .unwrap_or_else(|| panic!("the run under its task: {hub}"));
+    assert_eq!(run["pick"], seen, "{hub}");
+    assert!(
+        run["acts"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("ApproveRun")),
+        "{hub}"
+    );
 
     env.ok(&["review", "1", "--approve"]);
     let reject = |pick: &serde_json::Value| {

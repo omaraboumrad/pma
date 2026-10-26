@@ -129,6 +129,45 @@ fn pane(p: &Pane) -> String {
     out
 }
 
+/// A tree as nested lists, every branch a `<details>` open as its node says,
+/// so a static page still opens and closes without a script.
+fn tree(nodes: &[pma_core::screen::Node], out: &mut String) {
+    out.push_str(r#"<ul class="tree-list">"#);
+    for n in nodes {
+        let mut line = format!(
+            r#"<span class="icon tone-{}">{}</span> <strong class="tone-{}">{}</strong>"#,
+            n.icon.tone.name(),
+            escape(&n.icon.text),
+            n.label.tone.name(),
+            inline(&n.label.text)
+        );
+        for f in n
+            .facts
+            .iter()
+            .chain(&n.cells)
+            .filter(|f| !f.text.is_empty())
+        {
+            line.push_str(&format!(
+                r#" <span class="fact tone-{}">{}</span>"#,
+                f.tone.name(),
+                inline(&f.text)
+            ));
+        }
+        match n.children.is_empty() {
+            true => out.push_str(&format!("<li>{line}</li>")),
+            false => {
+                out.push_str(&format!(
+                    "<li><details{}><summary>{line}</summary>",
+                    if n.open { " open" } else { "" }
+                ));
+                tree(&n.children, out);
+                out.push_str("</details></li>");
+            }
+        }
+    }
+    out.push_str("</ul>");
+}
+
 /// `screen` as a page titled `title`, stamped `generated`.
 pub fn page(screen: &Screen, title: &str, generated: &str) -> String {
     let mut body = String::new();
@@ -149,6 +188,11 @@ pub fn page(screen: &Screen, title: &str, generated: &str) -> String {
             for p in panes {
                 body.push_str(&pane(p));
             }
+        }
+        Body::Tree(t) => {
+            body.push_str(r#"<section class="card tree">"#);
+            tree(&t.nodes, &mut body);
+            body.push_str("</section>");
         }
         Body::Detail(d) => {
             body.push_str(&format!(

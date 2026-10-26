@@ -20,13 +20,16 @@ pub enum Tab {
     Report,
     Notes,
     Status,
+    /// All open work as one tree: what waits on you, the agents' queue,
+    /// each project's tasks and runs, and the jobs.
+    Hub,
     /// One project, opened from a row that names it. It has no key of its
     /// own: which project is the front end's to remember.
     Project,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 11] = [
+    pub const ALL: [Tab; 12] = [
         Tab::Next,
         Tab::Matrix,
         Tab::Runs,
@@ -37,6 +40,7 @@ impl Tab {
         Tab::Report,
         Tab::Notes,
         Tab::Status,
+        Tab::Hub,
         Tab::Project,
     ];
 
@@ -52,6 +56,7 @@ impl Tab {
             Tab::Report => "report",
             Tab::Notes => "notes",
             Tab::Status => "status",
+            Tab::Hub => "hub",
             Tab::Project => "project",
         }
     }
@@ -81,6 +86,7 @@ impl Tab {
                 explain: false,
                 all: true,
             },
+            Tab::Hub => Query::Hub,
             Tab::Project => Query::Project {
                 name: project.to_string(),
             },
@@ -118,10 +124,22 @@ pub enum Act {
     RunCampaign,
     Sync,
     Verify,
+    /// Sets one field of the selected worker from a typed `field value`.
+    SetWorkerField,
+    /// Replaces the selected preset from a typed `worker [model] [args...]`.
+    EditPreset,
+    /// Names a preset from a typed `name worker [model] [args...]`.
+    AddPreset,
+    /// Creates a worker from a typed `name program`.
+    AddWorker,
+    /// Makes the selected worker or preset the default.
+    MakeDefault,
+    /// Removes the selected worker or preset.
+    RemoveConfig,
 }
 
 impl Act {
-    pub const ALL: [Act; 24] = [
+    pub const ALL: [Act; 30] = [
         Act::ApproveRun,
         Act::ApproveRuns,
         Act::RejectRun,
@@ -146,6 +164,12 @@ impl Act {
         Act::RunCampaign,
         Act::Sync,
         Act::Verify,
+        Act::SetWorkerField,
+        Act::EditPreset,
+        Act::AddPreset,
+        Act::AddWorker,
+        Act::MakeDefault,
+        Act::RemoveConfig,
     ];
 
     pub fn name(self) -> String {
@@ -164,6 +188,8 @@ impl Act {
                 | Act::SettlePrs
                 | Act::ApproveRuns
                 | Act::StartWorkflow
+                | Act::AddPreset
+                | Act::AddWorker
         )
     }
 
@@ -172,9 +198,12 @@ impl Act {
     pub fn weight(self) -> &'static str {
         match self {
             Act::ApproveRun | Act::ApproveJob | Act::Dispatch => "primary",
-            Act::RejectRun | Act::StopJob | Act::StopWorkflow | Act::RemoveNote | Act::Push => {
-                "danger"
-            }
+            Act::RejectRun
+            | Act::StopJob
+            | Act::StopWorkflow
+            | Act::RemoveNote
+            | Act::RemoveConfig
+            | Act::Push => "danger",
             _ => "default",
         }
     }
@@ -202,6 +231,11 @@ impl Act {
             Action::RunCampaign { .. } => &[Act::RunCampaign],
             Action::Sync { .. } => &[Act::Sync],
             Action::Verify { .. } => &[Act::Verify],
+            Action::SetWorker { .. } => &[Act::SetWorkerField],
+            Action::AddWorker { .. } => &[Act::AddWorker],
+            Action::SetPreset(_) => &[Act::EditPreset, Act::AddPreset],
+            Action::UseWorker { .. } | Action::UsePreset { .. } => &[Act::MakeDefault],
+            Action::RemoveWorker { .. } | Action::RemovePreset { .. } => &[Act::RemoveConfig],
         }
     }
 }
@@ -214,6 +248,12 @@ pub enum Command {
     Up,
     First,
     Last,
+    /// Opens the selected branch of a tree, or steps into it once open.
+    Expand,
+    /// Closes the selected branch of a tree, or steps out to its parent.
+    Collapse,
+    /// Opens or closes the selected branch of a tree.
+    Toggle,
     /// The next list on a tab with several.
     NextPane,
     PrevPane,
@@ -238,6 +278,9 @@ pub enum Ask {
     Confirm,
     /// A line of text, with this label.
     Text(&'static str),
+    /// A line for each label, asked in turn. The answers reach `action` one
+    /// per line.
+    Fields(&'static [&'static str]),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -276,7 +319,7 @@ const fn on(
     }
 }
 
-const TASKS: &[Tab] = &[Tab::Next, Tab::Matrix, Tab::Project];
+const TASKS: &[Tab] = &[Tab::Next, Tab::Matrix, Tab::Hub, Tab::Project];
 const PANES: &[Tab] = &[
     Tab::Next,
     Tab::Matrix,
@@ -284,7 +327,8 @@ const PANES: &[Tab] = &[
     Tab::Workflows,
     Tab::Project,
 ];
-const RUNS: &[Tab] = &[Tab::Runs, Tab::Project];
+const RUNS: &[Tab] = &[Tab::Next, Tab::Runs, Tab::Hub, Tab::Project];
+const JOBS: &[Tab] = &[Tab::Jobs, Tab::Hub];
 
 pub const BINDINGS: &[Binding] = &[
     bind("1", Command::Tab(Tab::Next), "next"),
@@ -297,6 +341,7 @@ pub const BINDINGS: &[Binding] = &[
     bind("8", Command::Tab(Tab::Report), "report"),
     bind("9", Command::Tab(Tab::Notes), "notes"),
     bind("0", Command::Tab(Tab::Status), "status"),
+    bind("H", Command::Tab(Tab::Hub), "hub"),
     bind("j", Command::Down, "down"),
     bind("ArrowDown", Command::Down, "down"),
     bind("k", Command::Up, "up"),
@@ -318,11 +363,37 @@ pub const BINDINGS: &[Binding] = &[
         ..bind("h", Command::PrevPane, "previous list")
     },
     Binding {
-        tabs: &[Tab::Runs, Tab::Jobs, Tab::Project],
+        tabs: &[Tab::Hub],
+        ..bind("l", Command::Expand, "expand")
+    },
+    Binding {
+        tabs: &[Tab::Hub],
+        ..bind("h", Command::Collapse, "collapse")
+    },
+    Binding {
+        tabs: &[Tab::Hub],
+        ..bind(" ", Command::Toggle, "fold")
+    },
+    Binding {
+        tabs: &[
+            Tab::Next,
+            Tab::Runs,
+            Tab::Jobs,
+            Tab::Agents,
+            Tab::Hub,
+            Tab::Project,
+        ],
         ..bind("Enter", Command::Open, "open")
     },
     Binding {
-        tabs: &[Tab::Next, Tab::Matrix, Tab::Runs, Tab::Agents, Tab::Status],
+        tabs: &[
+            Tab::Next,
+            Tab::Matrix,
+            Tab::Runs,
+            Tab::Agents,
+            Tab::Status,
+            Tab::Hub,
+        ],
         ..bind("o", Command::OpenProject, "open project")
     },
     bind("Escape", Command::Back, "back"),
@@ -363,15 +434,10 @@ pub const BINDINGS: &[Binding] = &[
     on("p", RUNS, Act::Pr, Ask::Confirm, "pull request"),
     on("u", RUNS, Act::Push, Ask::Confirm, "push"),
     on("y", RUNS, Act::SettlePrs, Ask::Nothing, "check PRs"),
-    // A job.
-    on(
-        "a",
-        &[Tab::Jobs],
-        Act::ApproveJob,
-        Ask::Nothing,
-        "approve plan",
-    ),
-    on("s", &[Tab::Jobs], Act::StopJob, Ask::Confirm, "stop"),
+    // A job. On the hub `a` and `s` also name run acts; the selected row
+    // decides which (`screen::lookup`).
+    on("a", JOBS, Act::ApproveJob, Ask::Nothing, "approve plan"),
+    on("s", JOBS, Act::StopJob, Ask::Confirm, "stop"),
     // A workflow instance.
     on(
         "r",
@@ -402,13 +468,57 @@ pub const BINDINGS: &[Binding] = &[
         Ask::Confirm,
         "run",
     ),
+    // A worker or a preset.
+    on(
+        "f",
+        &[Tab::Agents],
+        Act::SetWorkerField,
+        Ask::Text("field value"),
+        "set field",
+    ),
+    on(
+        "e",
+        &[Tab::Agents],
+        Act::EditPreset,
+        Ask::Text("worker [model] [args...]"),
+        "edit preset",
+    ),
+    on(
+        "+",
+        &[Tab::Agents],
+        Act::AddPreset,
+        Ask::Text("name worker [model] [args...]"),
+        "add preset",
+    ),
+    on(
+        "a",
+        &[Tab::Agents],
+        Act::AddWorker,
+        Ask::Fields(&["worker name", "program to run"]),
+        "add worker",
+    ),
+    on(
+        "u",
+        &[Tab::Agents],
+        Act::MakeDefault,
+        Ask::Nothing,
+        "make default",
+    ),
+    on(
+        "x",
+        &[Tab::Agents],
+        Act::RemoveConfig,
+        Ask::Confirm,
+        "remove",
+    ),
     // A note.
     on("e", &[Tab::Notes], Act::EditNote, Ask::Text("note"), "edit"),
     on("x", &[Tab::Notes], Act::RemoveNote, Ask::Confirm, "remove"),
 ];
 
 /// The binding `key` has on `tab`. One applying to that tab alone wins over
-/// one applying everywhere.
+/// one applying everywhere. Where a tab binds a key to acts on two kinds of
+/// row, this is the first; `screen::lookup` picks by the selected row.
 pub fn lookup(key: &str, tab: Tab) -> Option<&'static Binding> {
     let fits = |b: &&Binding| b.key == key;
     BINDINGS
@@ -454,15 +564,21 @@ mod tests {
 
     /// One key means one thing on a tab: two bindings for the same tab, or a
     /// tab binding that hides an everywhere binding, would make it ambiguous.
+    /// The one exception is two acts on different kinds of row, which the
+    /// selected row tells apart; `screen`'s tests hold them to that.
     #[test]
     fn no_key_means_two_things_on_one_tab() {
         for tab in Tab::ALL {
-            let keys: Vec<&str> = on_tab(tab).iter().map(|b| b.key).collect();
-            for k in &keys {
-                assert_eq!(
-                    keys.iter().filter(|x| *x == k).count(),
-                    1,
-                    "`{k}` is bound twice on {tab:?}"
+            let on = on_tab(tab);
+            for b in &on {
+                let same: Vec<_> = on.iter().filter(|x| x.key == b.key).collect();
+                assert!(
+                    same.len() == 1
+                        || same
+                            .iter()
+                            .all(|x| matches!(x.command, Command::Act(_)) && !x.tabs.is_empty()),
+                    "`{}` is bound twice on {tab:?}",
+                    b.key
                 );
             }
         }
@@ -489,7 +605,11 @@ mod tests {
             lookup("a", Tab::Runs).map(|b| b.command),
             Some(Command::Act(Act::ApproveRun))
         );
-        assert!(lookup("a", Tab::Next).is_none());
+        assert_eq!(
+            lookup("a", Tab::Next).map(|b| b.command),
+            Some(Command::Act(Act::ApproveRun))
+        );
+        assert!(lookup("a", Tab::Matrix).is_none());
         assert_eq!(
             lookup("c", Tab::Notes).map(|b| b.command),
             Some(Command::Act(Act::Scan))

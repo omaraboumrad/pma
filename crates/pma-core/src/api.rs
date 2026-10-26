@@ -10,8 +10,10 @@ use std::path::{Path, PathBuf};
 
 use crate::config::Config;
 use crate::store::{
-    Attempt, Campaign, Job, Note, Run, RunState, Session, Store, WorkflowInstance, WorkflowRevision,
+    Attempt, Campaign, Job, Note, Preset, Run, RunState, Session, Store, WorkflowInstance,
+    WorkflowRevision,
 };
+use crate::worker::Worker;
 use crate::{dates, dispatch, jobs, next, publish, rank, report_runs, store, todo};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -25,6 +27,9 @@ pub struct Selection {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Query {
+    /// Every open piece of work in one tree: what waits on you, what agents
+    /// may take, each project's tasks with their runs, and the jobs.
+    Hub,
     Next {
         of: Selection,
         all: bool,
@@ -54,8 +59,13 @@ pub enum Query {
     Run {
         id: i64,
     },
-    /// Jobs and running agents, as `pma watch` reads them.
+    /// Jobs and running agents, as `pma watch` reads them, and the workers
+    /// and presets that configure them.
     Agents,
+    /// One worker, every field.
+    Worker {
+        name: String,
+    },
     Jobs,
     JobLog {
         id: i64,
@@ -73,6 +83,19 @@ pub enum Query {
 }
 
 pub enum View {
+    Hub {
+        header: String,
+        portfolio: Box<Portfolio>,
+        /// The open tasks, in matrix order.
+        placed: Vec<rank::Placed>,
+        /// `pma next`'s lists: the agents' queue and what waits on you.
+        lists: next::Next,
+        /// Every run, newest first.
+        runs: Vec<Run>,
+        /// The latest jobs, newest first.
+        jobs: Vec<Job>,
+        today: i64,
+    },
     Next {
         header: String,
         lists: next::Next,
@@ -123,6 +146,17 @@ pub enum View {
         jobs: Vec<Job>,
         runs: Vec<Run>,
         now: i64,
+        workers: Vec<Worker>,
+        presets: Vec<Preset>,
+        /// `config agent` and `config preset`: the defaults.
+        agent: String,
+        preset: Option<String>,
+    },
+    Worker {
+        worker: Worker,
+        default: bool,
+        /// The presets that run it.
+        presets: Vec<Preset>,
     },
     Jobs(Vec<Job>),
     /// `None` until the job writes output.
@@ -209,6 +243,34 @@ pub enum Action {
     },
     RemoveNote {
         id: i64,
+    },
+    /// Sets one field of a worker, as `pma agent set` does; a worker that
+    /// does not exist yet is created when `command` is set first.
+    SetWorker {
+        name: String,
+        field: String,
+        value: String,
+    },
+    /// Creates a worker that runs `command`; its other fields start empty.
+    AddWorker {
+        name: String,
+        command: String,
+    },
+    RemoveWorker {
+        name: String,
+    },
+    /// Names a worker, a model and its arguments, replacing one of the name.
+    SetPreset(Preset),
+    RemovePreset {
+        name: String,
+    },
+    /// Makes a worker `config agent`, the one a dispatch runs by default.
+    UseWorker {
+        name: String,
+    },
+    /// Makes a preset `config preset`, which wins over `config agent`.
+    UsePreset {
+        name: String,
     },
 
     // Queued as jobs.
@@ -507,6 +569,23 @@ pub fn settle_interrupted(store: &Store) -> Result<()> {
 
 pub fn query(store: &Store, q: Query) -> Result<View> {
     Ok(match q {
+        Query::Hub => {
+            settle_interrupted(store)?;
+            // Untiered projects too, at the default tier: the hub is where
+            // all the work is, and an untiered project's tasks are work.
+            let p = portfolio(store, &Selection::default(), true)?;
+            let mut runs = store.runs()?;
+            runs.sort_by_key(|r| std::cmp::Reverse(r.id));
+            View::Hub {
+                header: p.header(),
+                lists: next_lists(store, &p)?,
+                placed: rank::place(&p.cfg, p.tasks.clone(), p.today),
+                today: p.today,
+                portfolio: Box::new(p),
+                runs,
+                jobs: store.jobs(20)?,
+            }
+        }
         Query::Next { of, all } => {
             let p = portfolio(store, &of, false)?;
             View::Next {
@@ -600,12 +679,32 @@ pub fn query(store: &Store, q: Query) -> Result<View> {
                 moved,
             }
         }
-        Query::Agents => View::Agents {
-            state: store::state_home()?,
-            jobs: store.jobs(50)?,
-            runs: store.runs()?,
-            now: dates::now(),
-        },
+        Query::Agents => {
+            let cfg = config(store)?;
+            View::Agents {
+                state: store::state_home()?,
+                jobs: store.jobs(50)?,
+                runs: store.runs()?,
+                now: dates::now(),
+                workers: store.agents()?,
+                presets: store.presets()?,
+                agent: cfg.agent,
+                preset: cfg.preset,
+            }
+        }
+        Query::Worker { name } => {
+            let worker = store.agent(&name)?;
+            let presets = store
+                .presets()?
+                .into_iter()
+                .filter(|p| p.agent == name)
+                .collect();
+            View::Worker {
+                default: config(store)?.agent == name,
+                worker,
+                presets,
+            }
+        }
         Query::Jobs => View::Jobs(store.jobs(20)?),
         Query::JobLog { id } => {
             store.job(id)?;
@@ -794,6 +893,91 @@ pub fn act(store: &Store, a: Action) -> Result<Outcome> {
             }
             Outcome::default()
         }
+        Action::SetWorker { name, field, value } => {
+            let mut w = store.agent(&name).unwrap_or_else(|_| Worker::blank(&name));
+            w.set_field(&field, &value)?;
+            if w.command.is_empty() {
+                return Err(format!("set `command` for `{name}` first").into());
+            }
+            store.set_agent(&w)?;
+            Outcome::said(format!("{name}: {field} set"))
+        }
+        Action::AddWorker { name, command } => {
+            if store.agent(&name).is_ok() {
+                return Err(format!("a worker `{name}` exists; `f` sets its fields").into());
+            }
+            let mut w = Worker::blank(&name);
+            w.set_field("command", &command)?;
+            if w.command.is_empty() {
+                return Err(format!("`{name}` needs a program to run").into());
+            }
+            store.set_agent(&w)?;
+            Outcome::said(format!(
+                "worker `{name}` runs `{command}`; set its args and parse next"
+            ))
+        }
+        Action::RemoveWorker { name } => {
+            if !store.remove_agent(&name)? {
+                return Err(format!("unknown agent `{name}`").into());
+            }
+            let mut out = Outcome::said(format!("worker `{name}` removed"));
+            if config(store)?.agent == name {
+                out.warnings.push(format!(
+                    "`{name}` was the default worker; make another the default \
+                     before dispatching"
+                ));
+            }
+            out
+        }
+        Action::SetPreset(p) => {
+            let p = Preset {
+                name: p.name.trim().to_string(),
+                model: p.model.filter(|m| !m.is_empty()),
+                ..p
+            };
+            if p.name.is_empty() {
+                return Err("a preset needs a name".into());
+            }
+            store.set_preset(&p)?;
+            Outcome::said(format!(
+                "preset `{}`: {}{}{}",
+                p.name,
+                p.agent,
+                p.model
+                    .as_ref()
+                    .map(|m| format!(" at {m}"))
+                    .unwrap_or_default(),
+                match p.args.is_empty() {
+                    true => String::new(),
+                    false => format!(" with {}", p.args.join(" ")),
+                }
+            ))
+        }
+        Action::RemovePreset { name } => {
+            if !store.remove_preset(&name)? {
+                return Err(format!("no preset `{name}`").into());
+            }
+            if config(store)?.preset.as_deref() == Some(name.as_str()) {
+                store.set_config("preset", "")?;
+            }
+            Outcome::said(format!("preset `{name}` removed"))
+        }
+        Action::UseWorker { name } => {
+            store.agent(&name)?;
+            store.set_config("agent", &name)?;
+            let mut out = Outcome::said(format!("`{name}` is the default worker"));
+            if let Some(p) = config(store)?.preset.filter(|p| !p.is_empty()) {
+                out.warnings
+                    .push(format!("the default preset `{p}` still wins over it"));
+            }
+            out
+        }
+        Action::UsePreset { name } => {
+            // Read first, so naming one that does not exist changes nothing.
+            store.preset(&name)?;
+            store.set_config("preset", &name)?;
+            Outcome::said(format!("`{name}` is the default preset"))
+        }
         Action::Scan {
             offline: true,
             deps: true,
@@ -926,7 +1110,14 @@ pub fn command_line(a: &Action) -> Option<Vec<String>> {
         | Action::StopWorkflow { .. }
         | Action::AddNote { .. }
         | Action::EditNote { .. }
-        | Action::RemoveNote { .. } => return None,
+        | Action::RemoveNote { .. }
+        | Action::SetWorker { .. }
+        | Action::AddWorker { .. }
+        | Action::RemoveWorker { .. }
+        | Action::SetPreset(_)
+        | Action::RemovePreset { .. }
+        | Action::UseWorker { .. }
+        | Action::UsePreset { .. } => return None,
     }
     Some(v)
 }

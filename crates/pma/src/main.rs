@@ -4,8 +4,7 @@
 
 use pma_core::{
     api, class, config, dates, deps, dispatch, history, jobs, next, pass, progress, projects,
-    publish, rank, report, report_runs, route, scan, script, store, sync, todo, watch, worker,
-    workflow,
+    publish, rank, report, report_runs, route, scan, script, store, sync, todo, watch, workflow,
 };
 use pma_tui::{choose, tui};
 
@@ -2664,38 +2663,17 @@ fn preset_command(action: Option<PresetAction>) -> Result<()> {
             agent,
             model,
             args,
-        } => {
-            let p = store::Preset {
-                name: name.clone(),
-                agent: agent.clone(),
-                model: model.clone().filter(|m| !m.is_empty()),
+        } => say(api::act(
+            &store,
+            Action::SetPreset(store::Preset {
+                name,
+                agent,
+                model,
                 args,
-            };
-            store.set_preset(&p)?;
-            println!(
-                "preset `{name}`: {agent}{}{}",
-                p.model.map(|m| format!(" at {m}")).unwrap_or_default(),
-                if p.args.is_empty() {
-                    String::new()
-                } else {
-                    format!(" with {}", p.args.join(" "))
-                }
-            );
-        }
-        PresetAction::Use { name } => {
-            // Read first, so naming one that does not exist changes nothing.
-            store.preset(&name)?;
-            store.set_config("preset", &name)?;
-            println!("`{name}` is the default preset");
-        }
-        PresetAction::Rm { name } => {
-            if !store.remove_preset(&name)? {
-                return Err(format!("no preset `{name}`").into());
-            }
-            if cfg.preset.as_deref() == Some(name.as_str()) {
-                store.set_config("preset", "")?;
-            }
-        }
+            }),
+        )?),
+        PresetAction::Use { name } => say(api::act(&store, Action::UsePreset { name })?),
+        PresetAction::Rm { name } => say(api::act(&store, Action::RemovePreset { name })?),
     }
     Ok(())
 }
@@ -3363,22 +3341,7 @@ fn agent_command(action: Option<AgentAction>) -> Result<()> {
             .agents()?
             .iter()
             .map(|w| {
-                let mut flags: Vec<&str> = Vec::new();
-                if w.reports_cost {
-                    flags.push("cost");
-                }
-                if w.enforces_budget {
-                    flags.push("budget");
-                }
-                if w.sandbox {
-                    flags.push("sandbox");
-                }
-                if w.allow.is_some() {
-                    flags.push("allowlist");
-                }
-                if w.resumes {
-                    flags.push("resumes");
-                }
+                let flags = w.flags();
                 vec![
                     if w.name == cfg.agent {
                         format!("* {}", w.name)
@@ -3409,94 +3372,10 @@ fn agent_command(action: Option<AgentAction>) -> Result<()> {
         return Ok(());
     };
     match action {
-        AgentAction::Show { name } => {
-            let w = store.agent(&name)?;
-            let rows = vec![
-                vec!["command".into(), w.command.clone()],
-                vec![
-                    "args".into(),
-                    serde_json::to_string(&w.args).unwrap_or_default(),
-                ],
-                vec![
-                    "allow".into(),
-                    w.allow.clone().unwrap_or_else(|| "none".into()),
-                ],
-                vec!["parse".into(), w.parse.name()],
-                vec!["reports-cost".into(), w.reports_cost.to_string()],
-                vec!["enforces-budget".into(), w.enforces_budget.to_string()],
-                vec!["sandbox".into(), w.sandbox.to_string()],
-                vec!["resumes".into(), w.resumes.to_string()],
-                vec![
-                    "env".into(),
-                    serde_json::to_string(&w.env).unwrap_or_default(),
-                ],
-            ];
-            print!("{}", report::table(&rows, ""));
-        }
-        AgentAction::Rm { name } => {
-            if !store.remove_agent(&name)? {
-                return Err(format!("unknown agent `{name}`").into());
-            }
-        }
+        AgentAction::Show { name } => show(Query::Worker { name })?,
+        AgentAction::Rm { name } => say(api::act(&store, Action::RemoveWorker { name })?),
         AgentAction::Set { name, field, value } => {
-            let mut w = store.agent(&name).unwrap_or_else(|_| worker::Worker {
-                name: name.clone(),
-                command: String::new(),
-                args: Vec::new(),
-                allow: None,
-                parse: worker::Parser::TextTail,
-                reports_cost: false,
-                enforces_budget: false,
-                sandbox: false,
-                resumes: false,
-                env: std::collections::BTreeMap::new(),
-            });
-            let flag = |v: &str| match v {
-                "true" | "yes" => Ok(true),
-                "false" | "no" => Ok(false),
-                _ => Err(format!("expected true or false, not `{v}`")),
-            };
-            match field.as_str() {
-                "command" => w.command = value,
-                "args" => {
-                    w.args = serde_json::from_str(&value)
-                        .map_err(|e| format!("args must be a JSON array of strings: {e}"))?;
-                }
-                "allow" => w.allow = (!value.is_empty()).then_some(value),
-                "parse" => {
-                    w.parse = worker::Parser::parse(&value).ok_or_else(|| {
-                        format!(
-                            "unknown parser `{value}`; expected {}",
-                            worker::Parser::names()
-                        )
-                    })?;
-                }
-                "reports-cost" => w.reports_cost = flag(&value)?,
-                "enforces-budget" => w.enforces_budget = flag(&value)?,
-                "sandbox" => w.sandbox = flag(&value)?,
-                "resumes" => w.resumes = flag(&value)?,
-                "model" => {
-                    return Err(format!(
-                        "a worker no longer names a model: \
-                         `pma preset set <name> {name} {value}`"
-                    )
-                    .into());
-                }
-                "env" => {
-                    w.env = serde_json::from_str(&value)
-                        .map_err(|e| format!("env must be a JSON object of name to value: {e}"))?;
-                }
-                _ => {
-                    let names: Vec<&str> = worker::FIELDS.iter().map(|(n, _)| *n).collect();
-                    return Err(
-                        format!("unknown field `{field}`; expected {}", names.join(", ")).into(),
-                    );
-                }
-            }
-            if w.command.is_empty() {
-                return Err(format!("set `command` for `{name}` first").into());
-            }
-            store.set_agent(&w)?;
+            say(api::act(&store, Action::SetWorker { name, field, value })?)
         }
     }
     Ok(())
@@ -3832,6 +3711,34 @@ fn show_with(store: &Store, q: Query) -> Result<()> {
 /// A view as the CLI prints it.
 fn render(view: View) -> String {
     match view {
+        hub @ View::Hub { .. } => {
+            let s = pma_core::screen::screen(hub);
+            let mut out = s.header.map(|h| format!("{h}\n\n")).unwrap_or_default();
+            if let pma_core::screen::Body::Tree(tree) = &s.body {
+                for v in pma_core::screen::visible(&tree.nodes, &Default::default()) {
+                    let marker = match (v.node.children.is_empty(), v.open) {
+                        (true, _) => " ",
+                        (false, true) => "-",
+                        (false, false) => "+",
+                    };
+                    let facts: Vec<&str> = v
+                        .node
+                        .facts
+                        .iter()
+                        .chain(&v.node.cells)
+                        .map(|c| c.text.as_str())
+                        .filter(|t| !t.is_empty())
+                        .collect();
+                    out.push_str(&format!(
+                        "{}{marker} {}  {}\n",
+                        "  ".repeat(v.depth),
+                        v.node.label.text,
+                        facts.join("  ")
+                    ));
+                }
+            }
+            out
+        }
         View::Next {
             header,
             lists,
@@ -3888,7 +3795,16 @@ fn render(view: View) -> String {
             jobs,
             runs,
             now,
+            ..
         } => watch::screen(&state, &jobs, &runs, now),
+        View::Worker { worker, .. } => {
+            let rows: Vec<Vec<String>> = worker
+                .fields()
+                .into_iter()
+                .map(|(k, v)| vec![k.to_string(), v])
+                .collect();
+            report::table(&rows, "")
+        }
         View::Jobs(all) => jobs::list(&all),
         View::JobLog { id, text } => {
             text.unwrap_or_else(|| format!("job {id} has no output yet\n"))
