@@ -1,24 +1,21 @@
 // pma web. Draws the screens the server sends: tables with typed columns,
-// a drawer for the selected row and its actions, toasts for outcomes. What a
+// the selected row's actions in the toolbar, a run or a job in place of the
+// tables when opened, toasts for outcomes and for what changed. What a
 // row is, what a key does to it and what a state means come from the server
 // (pma_core::screen and ::keys), as they do for the TUI. Text from the store
 // is only ever set as textContent, never parsed as HTML.
 "use strict";
 
 const TABS = {
-  next: { label: "Next up", group: "Work", about: "What agents can take now, and what waits on you." },
-  runs: { label: "Runs", group: "Work", about: "Agent runs waiting on a decision." },
-  jobs: { label: "Jobs", group: "Work", about: "Background commands, and plans waiting for approval." },
-  agents: { label: "Agents", group: "Work", about: "What running agents are doing right now." },
-  matrix: { label: "Matrix", group: "Plan", about: "Every open task, by urgency and importance." },
-  workflows: { label: "Workflows", group: "Plan", about: "Workflow instances and the revisions behind them." },
-  campaigns: { label: "Campaigns", group: "Plan", about: "One task across many projects." },
-  status: { label: "Health", group: "Insight", about: "Every project, worst first, by what needs attention." },
-  report: { label: "Report", group: "Insight", about: "What dispatching produced." },
-  notes: { label: "Notes", group: "Insight", about: "Notes that belong to no one project." },
-  project: { label: "Project", group: null, about: "" },
+  inbox: { label: "Inbox", about: "What waits on you, what is under way, and what agents can take." },
+  projects: { label: "Projects", about: "Every project, worst first, by what needs attention." },
+  activity: { label: "Activity", about: "Jobs, running agents and workflow instances, newest first." },
+  matrix: { label: "Matrix", about: "Every open task, by urgency and importance." },
+  library: { label: "Library", about: "Workflow revisions and campaigns: what can be run." },
+  report: { label: "Report", about: "What dispatching produced." },
+  notes: { label: "Notes", about: "Notes that belong to no one project." },
+  project: { label: "Project", about: "" },
 };
-const GROUPS = ["Work", "Plan", "Insight"];
 
 const S = {
   keys: null,
@@ -27,7 +24,7 @@ const S = {
   screens: {},
   pane: {},
   sel: {},
-  drawer: null, // null, { mode: "row" }, or { mode: "detail", screen }
+  detail: null, // an open run or job: { screen, pick, acts }, over the tab
   project: "", // the project the project view shows
   previous: "next", // the view it was opened from
   projects: [], // every project, worst first: { name, tier, state, tone }
@@ -88,11 +85,18 @@ async function api(path, body) {
   return data;
 }
 
-// The binding `key` has on the current tab; one for that tab alone wins over
-// one for every tab. As pma_core::keys::lookup.
+// The binding `key` has on the current tab for the row in hand: one for
+// that tab alone wins over one for every tab; among those, an act that fits
+// the row, then a command that is not an act, then the first. As
+// pma_core::keys::lookup.
 function lookup(key) {
   const fit = S.keys.bindings.filter((b) => b.key === key);
-  return fit.find((b) => b.tabs.includes(S.tab)) || fit.find((b) => b.tabs.length === 0);
+  const onTab = fit.filter((b) => b.tabs.includes(S.tab));
+  const cands = onTab.length ? onTab : fit.filter((b) => b.tabs.length === 0);
+  const fits = currentActs();
+  return cands.find((b) => b.command.kind === "act" && fits.includes(b.command.act))
+    || cands.find((b) => b.command.kind !== "act")
+    || cands[0];
 }
 
 function onTab() {
@@ -120,9 +124,17 @@ function selected() {
   return pane && pane.items[i] ? { pane, item: pane.items[i] } : null;
 }
 
+// What an act is about: the open detail, else the selected row.
 function currentPick() {
+  if (S.detail) return S.detail.pick;
   const s = selected();
   return s ? s.item.pick : { kind: "nothing" };
+}
+
+function currentActs() {
+  if (S.detail) return S.detail.acts;
+  const s = selected();
+  return s ? s.item.acts : [];
 }
 
 // ---------------------------------------------------------------- loading
@@ -144,7 +156,6 @@ async function load() {
     p = first >= 0 ? first : 0;
   }
   S.pane[S.tab] = p;
-  if (S.drawer && S.drawer.mode === "row" && !selected()) S.drawer = null;
   draw();
 }
 
@@ -156,21 +167,19 @@ function drawNav() {
   const tabKeys = Object.fromEntries(
     S.keys.bindings.filter((b) => b.command.kind === "tab").map((b) => [b.command.tab, b]),
   );
-  for (const g of GROUPS) {
-    const group = el("div", { class: "nav-group" }, el("h2", {}, g));
-    for (const [tab, meta] of Object.entries(TABS)) {
-      if (meta.group !== g || !tabKeys[tab]) continue;
-      const b = tabKeys[tab];
-      group.append(el("button", {
-        class: "nav-item",
-        type: "button",
-        "data-tab": tab,
-        "aria-keyshortcuts": b.key,
-        onclick: () => run(b),
-      }, el("span", {}, meta.label), el("kbd", {}, b.key)));
-    }
-    nav.append(group);
+  const views = el("div", { class: "nav-group" });
+  for (const [tab, meta] of Object.entries(TABS)) {
+    const b = tabKeys[tab];
+    if (!b) continue;
+    views.append(el("button", {
+      class: "nav-item",
+      type: "button",
+      "data-tab": tab,
+      "aria-keyshortcuts": b.key,
+      onclick: () => run(b),
+    }, el("span", {}, meta.label), el("kbd", {}, b.key)));
   }
+  nav.append(views);
   const projects = el("div", { class: "nav-group projects" },
     el("h2", { id: "projects-heading" }, "Projects"),
     el("input", {
@@ -226,8 +235,23 @@ function openProject(name) {
   if (S.tab !== "project") S.previous = S.tab;
   S.tab = "project";
   S.project = name;
-  S.drawer = null;
+  S.detail = null;
   load();
+}
+
+// Opens the run or job `pick` names over the tab, from a row, a toast or a
+// key.
+async function openDetail(pick) {
+  if (pick.kind !== "run" && pick.kind !== "job") return;
+  try {
+    const screen = await api("/api/open", { pick });
+    const d = screen.body.detail;
+    S.detail = { screen, pick: d.pick, acts: d.acts };
+    $("content").scrollTop = 0;
+  } catch (e) {
+    toast(e.message, "bad");
+  }
+  draw();
 }
 
 function button(b, extraClass) {
@@ -260,6 +284,13 @@ function draw() {
 
   const toolbar = $("toolbar");
   toolbar.replaceChildren();
+  const content = $("content");
+  content.replaceChildren();
+  content.className = "content";
+  if (S.detail) {
+    drawDetail(toolbar, content);
+    return;
+  }
   if (S.tab === "report") {
     S.keys.by.forEach((name, i) => {
       toolbar.append(el("button", {
@@ -271,10 +302,30 @@ function draw() {
     });
   }
   for (const b of acts(false)) toolbar.append(button(b));
+  // The selected row's acts, after the view's: what the key would do to it.
+  const sel = selected();
+  if (sel) {
+    const fit = sel.item.acts;
+    const own = acts(true).filter((b) => fit.includes(b.command.act));
+    const proj = onTab().find((b) => b.command.kind === "OpenProject");
+    const open = onTab().find((b) => b.command.kind === "Open");
+    const named = sel.item.pick.project;
+    const openable = sel.item.pick.kind === "run" || sel.item.pick.kind === "job";
+    if (own.length || (proj && named && S.tab !== "project") || (open && openable)) {
+      toolbar.append(el("span", { class: "sep", "aria-hidden": "true" }));
+    }
+    if (open && openable) {
+      toolbar.append(el("button", { class: "button primary", type: "button", onclick: () => run(open) },
+        sel.item.pick.kind === "run" ? "Open run" : "Open log", el("kbd", {}, "Enter")));
+    }
+    for (const b of own) toolbar.append(button(b));
+    if (proj && named && S.tab !== "project") {
+      // Enter opens it too, when the row is a task.
+      toolbar.append(el("button", { class: `button ${openable ? "" : "primary"}`, type: "button", onclick: () => run(proj) },
+        `Open ${named}`, el("kbd", {}, openable ? proj.key : "Enter")));
+    }
+  }
 
-  const content = $("content");
-  content.replaceChildren();
-  content.className = "content";
   if (!s) {
     content.append(el("p", { class: "empty" }, "Loading..."));
   } else if (s.error) {
@@ -285,7 +336,7 @@ function draw() {
         el("div", { class: "stat" }, el("dt", {}, label(k)), el("dd", { class: `tone-${c.tone}` }, ...inline(c.text))))));
     }
     const ps = panes();
-    if (S.tab === "status" && ps.length > 1) {
+    if (S.tab === "projects" && ps.length > 1) {
       // One table a page: four side by side each scroll both ways.
       const at = S.pane[S.tab] || 0;
       content.className = "content paged";
@@ -301,11 +352,38 @@ function draw() {
         }, p.title, el("span", { class: "count" }, p.items.length)))));
       content.append(card(ps[at], at));
     } else {
-      if (ps.length === 4) content.className = "content grid";
+      if (S.tab === "matrix" && ps.length === 4) content.className = "content grid";
       ps.forEach((p, pi) => content.append(card(p, pi)));
     }
   }
-  drawDrawer();
+}
+
+// A run or a job in place of the tables: its facts, then its sections, with
+// the acts that fit it in the toolbar beside Back.
+function drawDetail(toolbar, content) {
+  const s = S.detail.screen;
+  const dt = s.body.detail;
+  const back = onTab().find((b) => b.command.kind === "Back");
+  toolbar.append(el("button", { class: "button", type: "button", onclick: () => run(back) }, "Back", el("kbd", {}, "Esc")));
+  const own = acts(true).filter((b) => S.detail.acts.includes(b.command.act));
+  if (own.length) toolbar.append(el("span", { class: "sep", "aria-hidden": "true" }));
+  for (const b of own) toolbar.append(button(b));
+  const head = el("header", { class: "detail-head" },
+    el("p", { class: "kicker" },
+      dt.badge ? el("span", { class: `pill tone-${dt.badge.tone}` }, dt.badge.text) : null,
+      s.header || null),
+    el("h2", {}, ...inline(dt.title)));
+  const box = el("article", { class: "detail" }, head);
+  if (dt.notice) box.append(el("div", { class: "notice", role: "alert" }, dt.notice));
+  if (dt.fields.length) box.append(fieldList(dt.fields));
+  for (const sec of dt.sections) {
+    const body = sec.kind === "diff" ? diffNode(sec.text)
+      : sec.kind === "log" ? el("pre", { class: "log" }, sec.text)
+      : el("div", { class: "prose" }, sec.text.split("\n").flatMap((l, i) => (i ? ["\n", ...inline(l)] : inline(l))));
+    box.append(el("section", { class: "section" }, el("h3", {}, sec.title), body));
+  }
+  content.className = "content detail-view";
+  content.append(box);
 }
 
 function cellNode(c, col) {
@@ -357,7 +435,6 @@ function card(p, pi) {
 function select(pi, ii) {
   S.pane[S.tab] = pi;
   S.sel[S.tab][pi] = ii;
-  S.drawer = { mode: "row" };
   draw();
 }
 
@@ -375,82 +452,44 @@ function diffNode(text) {
   }));
 }
 
-function drawDrawer() {
-  const d = $("drawer");
-  const sel = selected();
-  if (!S.drawer || (S.drawer.mode === "row" && !sel)) {
-    d.hidden = true;
-    return;
-  }
-  d.hidden = false;
-  const body = $("drawer-body");
-  const actions = $("drawer-actions");
-  body.replaceChildren();
-  actions.replaceChildren();
-  const kicker = $("drawer-kicker");
-  kicker.replaceChildren();
-
-  if (S.drawer.mode === "detail") {
-    d.classList.add("wide");
-    const s = S.drawer.screen;
-    const dt = s.body.detail;
-    $("drawer-heading").replaceChildren(...inline(dt.title));
-    if (dt.badge) kicker.append(el("span", { class: `pill tone-${dt.badge.tone}` }, dt.badge.text));
-    if (s.header) kicker.append(s.header);
-    if (sel) body.append(el("button", { class: "link back", type: "button", onclick: () => { S.drawer = { mode: "row" }; draw(); } }, "Back to summary"));
-    if (dt.notice) body.append(el("div", { class: "notice", role: "alert" }, dt.notice));
-    if (dt.fields.length) body.append(fieldList(dt.fields));
-    for (const sec of dt.sections) {
-      const content = sec.kind === "diff" ? diffNode(sec.text)
-        : sec.kind === "log" ? el("pre", { class: "log" }, sec.text)
-        : el("div", { class: "prose" }, sec.text.split("\n").flatMap((l, i) => (i ? ["\n", ...inline(l)] : inline(l))));
-      body.append(el("section", { class: "section" }, el("h3", {}, sec.title), content));
-    }
-  } else {
-    d.classList.remove("wide");
-    const { pane, item } = sel;
-    const wide = pane.columns.findIndex((c) => c.kind === "wide");
-    const title = wide >= 0 && item.cells[wide] ? item.cells[wide].text : item.cells[0].text;
-    $("drawer-heading").replaceChildren(...inline(title));
-    kicker.append(pane.title);
-    const pairs = [];
-    pane.columns.forEach((c, i) => {
-      const cell = item.cells[i];
-      if (!cell || !cell.text || i === wide) return;
-      pairs.push([label(c.title), cellNode(cell, c)]);
-    });
-    body.append(fieldList(pairs));
-    const proj = onTab().find((b) => b.command.kind === "OpenProject");
-    const named = item.pick.project;
-    if (proj && named) {
-      actions.append(el("button", { class: "button", type: "button", onclick: () => run(proj) },
-        `Open ${named}`, el("kbd", {}, proj.key)));
-    }
-    const open = onTab().find((b) => b.command.kind === "Open");
-    if (open && (item.pick.kind === "run" || item.pick.kind === "job")) {
-      actions.append(el("button", { class: "button primary", type: "button", onclick: () => run(open) },
-        item.pick.kind === "run" ? "Review diff" : "View log", el("kbd", {}, "Enter")));
-    }
-  }
-  // Only the acts the server says fit this row.
-  const fit = S.drawer.mode === "row" ? sel.item.acts : (sel ? sel.item.acts : []);
-  for (const b of acts(true)) if (fit.includes(b.command.act)) actions.append(button(b));
-}
-
 // ---------------------------------------------------------------- feedback
 
-function toast(text, tone) {
+// `open` is a pick: the toast gets a button that opens it, and stays longer.
+function toast(text, tone, open) {
   const t = el("div", { class: `toast ${tone}`, role: tone === "bad" ? "alert" : "status" },
     el("p", {}, text),
+    open ? el("button", { class: "button act", type: "button", onclick: () => { t.remove(); openDetail(open); } },
+      open.kind === "run" ? "Open run" : "Open log") : null,
     el("button", { type: "button", "aria-label": "Dismiss", onclick: () => t.remove() }, "Dismiss"));
   $("toasts").append(t);
-  setTimeout(() => t.remove(), tone === "bad" ? 12000 : 6000);
+  setTimeout(() => t.remove(), tone === "bad" || open ? 15000 : 6000);
   return t;
 }
 
+// The list an act offers: one radio per option, a checkbox per flag. Its
+// `read` gives the input line the chosen option and flags make.
+function chooser(asked, name) {
+  const box = el("div", { class: "chooser" });
+  const list = el("div", { class: "options", role: "radiogroup", "aria-label": name });
+  asked.options.forEach((o, i) => list.append(el("label", { class: "option" },
+    el("input", { type: "radio", name: "choice", value: o.name, checked: i === 0 }),
+    el("span", { class: "option-name" }, o.name),
+    el("span", { class: "option-about" }, ...inline(o.about)))));
+  const flags = el("div", { class: "flags" }, asked.flags.map((f) => el("label", { class: "flag" },
+    el("input", { type: "checkbox", value: f.arg }), f.label)));
+  box.append(list, flags);
+  box.read = () => {
+    const chosen = box.querySelector("input[name=choice]:checked");
+    if (!chosen) return null;
+    const on = [...box.querySelectorAll(".flags input:checked")].map((i) => i.value);
+    return [chosen.value, ...on].join(" ");
+  };
+  return box;
+}
+
 // One dialog serves a question, a prompt and a list. Resolves to the input's
-// value, true for OK, or null when cancelled.
-function dialog({ title, text, field, input, ok, okClass, cancel }) {
+// value, what `read` gives, true for OK, or null when cancelled.
+function dialog({ title, text, field, input, ok, okClass, cancel, read }) {
   const d = $("dialog");
   $("dialog-title").textContent = title;
   const t = $("dialog-text");
@@ -471,6 +510,7 @@ function dialog({ title, text, field, input, ok, okClass, cancel }) {
   return new Promise((resolve) => {
     d.addEventListener("close", () => {
       if (d.returnValue !== "ok") return resolve(null);
+      if (read) return resolve(read());
       resolve(field === undefined ? true : $("dialog-input").value);
     }, { once: true });
   });
@@ -517,6 +557,11 @@ async function act(b) {
           cancel: true,
         });
         if (!yes) return;
+      } else if (b.ask.kind === "choose") {
+        const node = chooser(asked, label(b.ask.label));
+        const chosen = await dialog({ title: label(b.label), text: node, ok: label(b.label), cancel: true, read: node.read });
+        if (chosen === null) return;
+        input = chosen;
       } else {
         const typed = await dialog({ title: label(b.label), field: label(b.ask.label), input: asked.input, ok: label(b.label), cancel: true });
         if (typed === null) return;
@@ -531,7 +576,8 @@ async function act(b) {
   } catch (e) {
     toast(e.message, "bad");
   }
-  if (S.drawer && S.drawer.mode === "detail") S.drawer = { mode: "row" };
+  // The detail's run or job has moved on; the tab shows where it went.
+  S.detail = null;
   await Promise.all([load(), loadProjects()]);
 }
 
@@ -541,11 +587,11 @@ async function run(b) {
   const p = S.pane[t] || 0;
   const sel = S.sel[t] || [];
   const len = (panes()[p] || { items: [] }).items.length;
-  const move = (i) => { if (len) { sel[p] = i; if (S.drawer && S.drawer.mode === "row") S.drawer = { mode: "row" }; } };
+  const move = (i) => { if (len) sel[p] = i; };
   switch (b.command.kind) {
     case "tab":
       S.tab = b.command.tab;
-      S.drawer = null;
+      S.detail = null;
       return load();
     case "Down": move(Math.min((sel[p] || 0) + 1, len - 1)); break;
     case "Up": move(Math.max((sel[p] || 0) - 1, 0)); break;
@@ -554,8 +600,8 @@ async function run(b) {
     case "NextPane": S.pane[t] = (p + 1) % Math.max(panes().length, 1); break;
     case "PrevPane": S.pane[t] = (p + panes().length - 1) % Math.max(panes().length, 1); break;
     case "Back":
-      if (S.drawer) {
-        S.drawer = S.drawer.mode === "detail" && selected() ? { mode: "row" } : null;
+      if (S.detail) {
+        S.detail = null;
       } else if (S.tab === "project") {
         S.tab = S.previous;
         return load();
@@ -576,12 +622,8 @@ async function run(b) {
     case "Quit": toast("Close the browser tab to leave. pma web runs until Ctrl-C in its terminal.", "accent"); break;
     case "Open": {
       const pick = currentPick();
-      if (pick.kind !== "run" && pick.kind !== "job") break;
-      try {
-        S.drawer = { mode: "detail", screen: await api("/api/open", { pick }) };
-      } catch (e) {
-        toast(e.message, "bad");
-      }
+      if (pick.kind === "run" || pick.kind === "job") return openDetail(pick);
+      if (pick.project) return openProject(pick.project);
       break;
     }
     case "act": return act(b);
@@ -599,6 +641,10 @@ function onKey(e) {
   const b = lookup(e.key);
   if (!b) return;
   if (e.key === "Enter" && e.target instanceof HTMLButtonElement) return;
+  // Over a detail, only its own acts and Back apply; the tables beneath
+  // are not what the eye is on.
+  if (S.detail && !(b.command.kind === "Back" || b.command.kind === "Help"
+    || (b.command.kind === "act" && S.detail.acts.includes(b.command.act)))) return;
   e.preventDefault();
   run(b);
 }
@@ -628,7 +674,6 @@ async function start() {
     return;
   }
   drawNav();
-  $("drawer-close").addEventListener("click", () => { S.drawer = null; draw(); });
   $("help-button").addEventListener("click", () => run(lookup("?")));
   document.addEventListener("keydown", onKey);
   await Promise.all([load(), loadProjects()]);
@@ -637,7 +682,7 @@ async function start() {
     let d = {};
     try { d = JSON.parse(e.data); } catch (_) { /* keep the defaults */ }
     setBusy(d.busy ? "Agents working" : "Idle", d.busy ? "working" : "");
-    for (const t of d.transitions || []) toast(transitionText(t), transitionTone(t));
+    for (const t of d.transitions || []) toast(t.line, transitionTone(t), t.pick);
     refresh();
   };
   events.addEventListener("tick", heard);
@@ -645,25 +690,21 @@ async function start() {
   events.addEventListener("error", () => setBusy("Disconnected", "lost"));
 }
 
-// Reloads what is on screen: the tab, the project list, and a detail drawer
-// showing a run or a job, whose state may have moved. Not under a dialog,
-// which holds a question the reload would pull from under the user.
+// Reloads what is on screen: the tab, the project list, and an open run or
+// job, whose state may have moved. Not under a dialog, which holds a
+// question the reload would pull from under the user.
 async function refresh() {
   if ($("dialog").open) return;
-  const detail = S.drawer && S.drawer.mode === "detail" ? currentPick() : null;
+  const open = S.detail ? S.detail.pick : null;
   await Promise.all([load(), loadProjects()]);
-  if (detail && (detail.kind === "run" || detail.kind === "job") && S.drawer && S.drawer.mode === "detail") {
+  if (open && S.detail) {
     try {
-      S.drawer = { mode: "detail", screen: await api("/api/open", { pick: detail }) };
+      const screen = await api("/api/open", { pick: open });
+      const d = screen.body.detail;
+      S.detail = { screen, pick: d.pick, acts: d.acts };
       draw();
-    } catch (_) { /* the row may be gone; the drawer keeps what it showed */ }
+    } catch (_) { /* the row may be gone; the page keeps what it showed */ }
   }
-}
-
-function transitionText(t) {
-  const who = t.kind === "run" ? `#${t.id} ${t.project}` : `job ${t.id}`;
-  const what = t.kind === "run" && t.state === "ready" ? "ready for review" : t.state;
-  return `${who}: ${what}. ${t.text}`;
 }
 
 function transitionTone(t) {

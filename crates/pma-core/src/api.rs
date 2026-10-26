@@ -10,10 +10,11 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::config::Config;
+use crate::keys::Act;
 use crate::store::{
     Attempt, Campaign, Job, Note, Run, RunState, Session, Store, WorkflowInstance, WorkflowRevision,
 };
-use crate::{dates, dispatch, jobs, next, publish, rank, report_runs, store, todo};
+use crate::{dates, dispatch, jobs, next, publish, rank, report_runs, screen, store, todo};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -50,6 +51,14 @@ pub enum Query {
     },
     /// Runs that are not final: what waits on a reviewer.
     Runs,
+    /// What waits on you, what is under way, and what agents can take.
+    Inbox {
+        of: Selection,
+    },
+    /// Jobs, running agents and workflow instances.
+    Activity,
+    /// Workflow revisions and campaigns.
+    Library,
     /// One run, with its diff. Showing it records the tree shown, which an
     /// approval then requires.
     Run {
@@ -71,6 +80,35 @@ pub enum Query {
     Project {
         name: String,
     },
+    /// One task in full: a TODO.md item by line, or a signal by key.
+    Task {
+        project: String,
+        line: Option<i64>,
+        key: Option<String>,
+    },
+}
+
+impl Query {
+    /// The task a dispatch target names: `name:12` is the item on line 12,
+    /// `name:ci` the signal.
+    pub fn task(project: &str, target: &str) -> Query {
+        let rest = target
+            .strip_prefix(project)
+            .and_then(|r| r.strip_prefix(':'))
+            .unwrap_or(target);
+        match rest.parse::<i64>() {
+            Ok(line) => Query::Task {
+                project: project.to_string(),
+                line: Some(line),
+                key: None,
+            },
+            Err(_) => Query::Task {
+                project: project.to_string(),
+                line: None,
+                key: Some(rest.to_string()),
+            },
+        }
+    }
 }
 
 pub enum View {
@@ -108,6 +146,25 @@ pub enum View {
         by: report_runs::By,
     },
     Runs(Vec<Run>),
+    Inbox {
+        header: String,
+        lists: next::Next,
+        state: PathBuf,
+        jobs: Vec<Job>,
+        runs: Vec<Run>,
+        now: i64,
+    },
+    Activity {
+        state: PathBuf,
+        jobs: Vec<Job>,
+        instances: Vec<WorkflowInstance>,
+        runs: Vec<Run>,
+        now: i64,
+    },
+    Library {
+        revisions: Vec<WorkflowRevision>,
+        campaigns: Vec<Campaign>,
+    },
     Run {
         run: Box<Run>,
         attempts: Vec<Attempt>,
@@ -130,6 +187,8 @@ pub enum View {
     JobLog {
         id: i64,
         text: Option<String>,
+        /// Stopped at a plan, which an approval runs.
+        awaiting: bool,
     },
     Notes(Vec<Note>),
     Workflows {
@@ -157,6 +216,23 @@ pub enum View {
         today: i64,
         /// Every run it has had, newest first.
         runs: Vec<Run>,
+        /// Its jobs, newest first, among the newest 50.
+        jobs: Vec<Job>,
+        /// The state directory, where agent logs are read from.
+        state: PathBuf,
+    },
+    Task {
+        placed: rank::Placed,
+        today: i64,
+        /// The TODO.md item, with its indented description; `None` for a
+        /// signal, or when the file no longer holds the line.
+        item: Option<todo::Item>,
+        /// What a signal says: the failing workflows, the outdated packages.
+        signal: Vec<String>,
+        /// The GitHub repository, for an issue link.
+        repo: Option<String>,
+        /// Runs on it that are not final.
+        held_by: Vec<Run>,
     },
 }
 
@@ -520,6 +596,41 @@ pub struct Transition {
     pub state: String,
 }
 
+impl Transition {
+    /// One line to tell: `#4 spore: ready for review: fix CI`.
+    pub fn line(&self) -> String {
+        match self.kind {
+            "run" => format!(
+                "#{} {}: {}: {}",
+                self.id,
+                self.project,
+                match self.state.as_str() {
+                    "ready" => "ready for review",
+                    s => s,
+                },
+                self.text
+            ),
+            _ => format!("job {} {}: {}", self.id, self.state, self.text),
+        }
+    }
+
+    /// The row it is about, for a front end to open.
+    pub fn pick(&self) -> screen::Pick {
+        match self.kind {
+            "run" => screen::Pick::Run {
+                id: self.id,
+                clean: false,
+                state: self.state.clone(),
+                project: self.project.clone(),
+            },
+            _ => screen::Pick::Job {
+                id: self.id,
+                awaiting: self.state == "awaiting-approval",
+            },
+        }
+    }
+}
+
 /// What a front end watches between loads: the store's data version, and
 /// the state of every run and job, so a change can be named rather than
 /// found by reloading everything on a timer.
@@ -612,6 +723,60 @@ impl Watch {
     }
 }
 
+/// A list a front end offers before an act, and the flags it may add. The
+/// choice and the flags on become the one input line `screen::action` reads,
+/// so a typed line and a chosen one build the same action.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Choices {
+    pub options: Vec<crate::catalog::Choice>,
+    pub flags: Vec<Flag>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Flag {
+    /// The key that toggles it in a list.
+    pub key: &'static str,
+    /// What it adds to the input line.
+    pub arg: &'static str,
+    pub label: &'static str,
+}
+
+impl Choices {
+    /// The input line for `name` with the flags whose `on` entry is set.
+    pub fn line(&self, name: &str, on: &[bool]) -> String {
+        let mut line = name.to_string();
+        for (f, on) in self.flags.iter().zip(on) {
+            if *on {
+                line.push(' ');
+                line.push_str(f.arg);
+            }
+        }
+        line
+    }
+}
+
+/// What a front end lists for an act that asks `Ask::Choose`.
+pub fn choices(store: &Store, act: Act) -> Result<Choices> {
+    match act {
+        Act::Run => Ok(Choices {
+            options: crate::catalog::choices(store)?.0,
+            flags: vec![
+                Flag {
+                    key: "p",
+                    arg: "--push",
+                    label: "push when clean",
+                },
+                Flag {
+                    key: "w",
+                    arg: "--worktree",
+                    label: "edit in a worktree",
+                },
+            ],
+        }),
+        other => Err(format!("{other:?} offers no list").into()),
+    }
+}
+
 /// Marks runs whose session died `failed`, when no session holds the lock.
 pub fn settle_interrupted(store: &Store) -> Result<()> {
     if let Some(s) = Session::try_acquire(&store::home()?)? {
@@ -674,6 +839,40 @@ pub fn query(store: &Store, q: Query) -> Result<View> {
             attempts: store.attempts(None)?,
             by,
         },
+        Query::Inbox { of } => {
+            settle_interrupted(store)?;
+            // The first view a new store shows: it says to scan rather
+            // than failing, and still lists runs and jobs.
+            let (header, lists) = match store.last_scan()? {
+                None => (
+                    "nothing scanned yet; `c` scans every root".to_string(),
+                    next::Next::default(),
+                ),
+                Some(_) => {
+                    let p = portfolio(store, &of, false)?;
+                    (p.header(), next_lists(store, &p)?)
+                }
+            };
+            View::Inbox {
+                header,
+                lists,
+                state: store::state_home()?,
+                jobs: store.jobs(50)?,
+                runs: store.runs()?,
+                now: dates::now(),
+            }
+        }
+        Query::Activity => View::Activity {
+            state: store::state_home()?,
+            jobs: store.jobs(50)?,
+            instances: store.workflow_instances()?,
+            runs: store.runs()?,
+            now: dates::now(),
+        },
+        Query::Library => View::Library {
+            revisions: store.workflow_revisions()?,
+            campaigns: store.campaigns()?,
+        },
         Query::Runs => {
             settle_interrupted(store)?;
             View::Runs(
@@ -723,10 +922,11 @@ pub fn query(store: &Store, q: Query) -> Result<View> {
         },
         Query::Jobs => View::Jobs(store.jobs(20)?),
         Query::JobLog { id } => {
-            store.job(id)?;
+            let job = store.job(id)?;
             View::JobLog {
                 id,
                 text: crate::agent::read_log(&jobs::log_path(id)?),
+                awaiting: job.state == "awaiting-approval",
             }
         }
         Query::Notes => View::Notes(store.notes()?),
@@ -739,6 +939,7 @@ pub fn query(store: &Store, q: Query) -> Result<View> {
             campaign: store.campaign(&name)?,
             runs: store.runs()?,
         },
+        Query::Task { project, line, key } => task_view(store, &project, line, key.as_deref())?,
         Query::Project { name } => {
             let row = store
                 .project(&name)?
@@ -767,7 +968,14 @@ pub fn query(store: &Store, q: Query) -> Result<View> {
                 .filter(|r| r.project == name)
                 .collect();
             runs.sort_by_key(|r| std::cmp::Reverse(r.id));
+            let jobs = store
+                .jobs(50)?
+                .into_iter()
+                .filter(|j| j.project.as_deref() == Some(name.as_str()))
+                .collect();
             View::Project {
+                jobs,
+                state: store::state_home()?,
                 scanned_at: row.scanned_at,
                 path: row.path,
                 tags: store
@@ -787,6 +995,86 @@ pub fn query(store: &Store, q: Query) -> Result<View> {
     })
 }
 
+/// The task in `project` on `line`, or with `key`, with everything the
+/// store and its TODO.md know about it.
+fn task_view(store: &Store, project: &str, line: Option<i64>, key: Option<&str>) -> Result<View> {
+    let row = store
+        .project(project)?
+        .ok_or_else(|| format!("unknown project `{project}`"))?;
+    let p = portfolio(
+        store,
+        &Selection {
+            projects: vec![project.to_string()],
+            tags: Vec::new(),
+        },
+        true,
+    )?;
+    let today = p.today;
+    let placed = rank::place(&p.cfg, p.tasks, today)
+        .into_iter()
+        .find(|t| match (line, key) {
+            (Some(l), _) => t.task.line == Some(l),
+            (None, Some(k)) => t.task.line.is_none() && t.task.key.as_deref() == Some(k),
+            (None, None) => false,
+        })
+        .ok_or_else(|| match (line, key) {
+            (Some(l), _) => format!("{project} has no open task on line {l}; rescan it"),
+            _ => format!("{project} has no `{}` signal now", key.unwrap_or("")),
+        })?;
+    let item = line.and_then(|l| {
+        let text = std::fs::read_to_string(row.path.join("TODO.md")).ok()?;
+        todo::parse(&text)
+            .items
+            .into_iter()
+            .find(|i| i.line as i64 == l)
+    });
+    let signal = match key {
+        Some("ci") => {
+            let mut lines = match &row.ci {
+                crate::scan::Ci::Failing(workflows) => workflows
+                    .iter()
+                    .map(|w| {
+                        let url = row
+                            .ci_runs
+                            .iter()
+                            .find(|(name, _)| name == w)
+                            .map(|(_, u)| format!("  {u}"))
+                            .unwrap_or_default();
+                        format!("{w}{url}")
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
+            let since = store.failing_since()?;
+            let latest = store.last_scan()?;
+            lines.push(format!(
+                "failing {}",
+                crate::history::since_text(since.get(project), latest, dates::now())
+            ));
+            lines
+        }
+        Some("deps") => row.deps_detail.lines().map(str::to_string).collect(),
+        _ => Vec::new(),
+    };
+    let task_key = placed.task.key.clone();
+    Ok(View::Task {
+        held_by: store
+            .runs()?
+            .into_iter()
+            .filter(|r| {
+                r.project == project
+                    && !r.state.is_final()
+                    && Some(&r.task_key) == task_key.as_ref()
+            })
+            .collect(),
+        placed,
+        today,
+        item,
+        signal,
+        repo: row.slug.as_deref().and_then(crate::scan::github_url),
+    })
+}
+
 /// Refuses a run that left the state a front end showed it in.
 fn unmoved(run: &Run, seen: Option<&str>) -> Result<()> {
     match seen {
@@ -801,6 +1089,24 @@ fn unmoved(run: &Run, seen: Option<&str>) -> Result<()> {
 }
 
 pub fn act(store: &Store, a: Action) -> Result<Outcome> {
+    // A reviewer who commits, pushes or opens a pull request for a ready
+    // run from a view has read it: it is approved first, as one act. Staging
+    // is the review itself and takes a ready run as it is.
+    if let Action::Publish {
+        ids,
+        all_approved: false,
+        target,
+    } = &a
+        && *target != publish::Target::Stage
+    {
+        let by = whoami();
+        for id in ids {
+            let mut run = store.run(*id)?;
+            if run.state == RunState::Ready {
+                dispatch::approve(store, &mut run, &by)?;
+            }
+        }
+    }
     let note_text = |t: String| -> Result<String> {
         let t = t.trim().to_string();
         if t.is_empty() {
@@ -916,12 +1222,29 @@ pub fn act(store: &Store, a: Action) -> Result<Outcome> {
         } => return Err("a scan is offline or reads dependencies, not both".into()),
         queued => {
             let args = command_line(&queued).expect("every other action is queued");
-            let id = jobs::queue(store, &args, &std::env::current_dir()?)?;
-            Outcome::said(format!(
-                "job {id} queued; `pma job` lists jobs and `pma job log {id}` shows its output"
-            ))
+            let project = project_of(&queued);
+            let id = jobs::queue(store, &args, &std::env::current_dir()?, project.as_deref())?;
+            Outcome::said(format!("job {id} queued: pma {}", args.join(" ")))
         }
     })
+}
+
+/// The one project a queued action is about, when it names exactly one, so
+/// the job shows in that project's view. A target may be `name:task`.
+fn project_of(a: &Action) -> Option<String> {
+    let one = |names: &[String]| match names {
+        [name] => Some(name.split(':').next().unwrap_or(name).to_string()),
+        _ => None,
+    };
+    match a {
+        Action::Run { project, .. } => Some(project.clone()),
+        Action::Dispatch { targets, .. } => one(targets),
+        Action::WorkflowRun { projects, .. } => one(projects),
+        Action::Scan { of, .. } | Action::Sync { of, .. } | Action::Verify { of } => {
+            one(&of.projects)
+        }
+        _ => None,
+    }
 }
 
 /// The CLI command a queued action runs; `None` for one that runs in place.

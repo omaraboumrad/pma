@@ -24,7 +24,7 @@ use crate::worker::{Parser, Worker};
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
-const VERSION: i64 = 41;
+const VERSION: i64 = 42;
 
 const SCHEMA: &str = "
 CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -388,6 +388,12 @@ ALTER TABLE runs ADD COLUMN start TEXT;
 
 /// Version 39. Seeds `refresh`, the worker that runs `pma deps refresh`.
 /// Seeded through `settings.toml`, which every later edit applies whole.
+/// Version 42. The project a queued command is about, when it names one,
+/// so a project's view lists its jobs beside its runs.
+const JOB_PROJECT: &str = "
+ALTER TABLE jobs ADD COLUMN project TEXT;
+";
+
 const REFRESH_WORKER: &str = "-- no schema change; the seed is in Rust";
 
 /// Version 38. When the stalest lock last changed, read on every scan, and
@@ -991,6 +997,7 @@ impl Store {
                     REFRESH_WORKER,
                     SCAN_FAULTS,
                     WORKSPACE,
+                    JOB_PROJECT,
                 ];
                 let tx = conn.unchecked_transaction()?;
                 for step in &steps[version as usize..] {
@@ -1772,13 +1779,15 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    pub fn add_job(&self, args: &[String], cwd: &Path) -> Result<i64> {
+    pub fn add_job(&self, args: &[String], cwd: &Path, project: Option<&str>) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO jobs (args, cwd, state, created_at) VALUES (?1, ?2, 'queued', ?3)",
+            "INSERT INTO jobs (args, cwd, state, created_at, project)
+             VALUES (?1, ?2, 'queued', ?3, ?4)",
             params![
                 serde_json::to_string(args)?,
                 cwd.to_string_lossy(),
-                crate::dates::now()
+                crate::dates::now(),
+                project
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -2944,10 +2953,12 @@ pub struct Job {
     /// For a job that stopped at a workflow plan: the arguments that approve
     /// it, which `pma job approve` queues.
     pub awaiting: Option<Vec<String>>,
+    /// The project the command is about, when it names one.
+    pub project: Option<String>,
 }
 
-const JOB_COLUMNS: &str =
-    "id, args, cwd, state, created_at, started_at, finished_at, pid, exit_code, awaiting";
+const JOB_COLUMNS: &str = "id, args, cwd, state, created_at, started_at, finished_at, pid, \
+                           exit_code, awaiting, project";
 
 fn job_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
     let args: String = r.get(1)?;
@@ -2964,6 +2975,7 @@ fn job_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
         awaiting: r
             .get::<_, Option<String>>(9)?
             .and_then(|a| serde_json::from_str(&a).ok()),
+        project: r.get(10)?,
     })
 }
 
@@ -3803,10 +3815,10 @@ mod tests {
         }
     }
 
-    /// The columns version 40 drops, for a test that replays it.
-    /// Undoes versions 40 and 41, for a test that rewinds the schema past
+    /// Undoes versions 40 to 42, for a test that rewinds the schema past
     /// them.
     const BEFORE_SCAN_FAULTS: &str = "
+        ALTER TABLE jobs DROP COLUMN project;
         ALTER TABLE runs DROP COLUMN workspace;
         ALTER TABLE runs DROP COLUMN start;
         ALTER TABLE projects ADD COLUMN scan_error TEXT;
@@ -3929,6 +3941,7 @@ mod tests {
             // First: it refills the tables from settings.toml, which knows no
             // `model` column.
             store.set_config("agent", "claude").unwrap();
+            store.conn.execute_batch(BEFORE_SCAN_FAULTS).unwrap();
             store
                 .conn
                 .execute_batch(
@@ -3943,7 +3956,6 @@ mod tests {
                 .conn
                 .execute("UPDATE agents SET model = 'opus' WHERE name = 'claude'", [])
                 .unwrap();
-            store.conn.execute_batch(BEFORE_SCAN_FAULTS).unwrap();
             store.conn.pragma_update(None, "user_version", 23).unwrap();
         }
         let store = Store::open(&path).unwrap();

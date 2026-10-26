@@ -6,7 +6,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 Upgrading from 0.8:
 
-- The database moves from schema 40 to 41 on first open. 0.8 refuses it afterwards; copy `~/.config/pma/projects.db` first if you may go back.
+- The database moves from schema 40 to 42 on first open. 0.8 refuses it afterwards; copy `~/.config/pma/projects.db` first if you may go back.
+
+- The TUI and the web have seven tabs on `1` to `7`, not ten on `0` to `9`: inbox, projects, activity, matrix, library, report, notes. `0`, `8` and `9` do nothing.
 
 - Runs edit your clone by default. `pma config workspace worktree` restores the previous behaviour for every run, `--worktree` for one.
 
@@ -27,7 +29,11 @@ pma run fix-ci spore --push   # approve and push when the gates are clean
 
 **Front ends notice changes.** Both read the store's data version once a second and reload within a second of any other process committing; the web shows a toast when a run reaches review, fails or is pushed, and when a job ends or waits for approval. Before, a view refreshed on a 30 s timer when idle, not at all behind an open detail, and said nothing about what changed.
 
-**`run` from the TUI and the web.** `z` on a project, or on a row naming one, runs a `pma run` name over it, with `--review`, `--worktree`, `--push` and `--worker=agent:model` as typed.
+**`run` from the TUI and the web.** `z` on a project, or on a row naming one, lists the `pma run` names with what each does; `p` and `w` (checkboxes in the web) add `--push` and `--worktree`. The job it queues shows in the project's view as it runs.
+
+**Seven tabs, and one place per thing.** Inbox: what waits on you (runs in review, plans awaiting approval), what is under way (running agents with what their log last showed, queued jobs), and the tasks, marked for an agent or for you. Projects: the status view. Activity: every job, running agent and workflow instance. Library: workflow revisions and campaigns. Matrix, report and notes as before. A project's view lists its runs and jobs in one Activity pane, under way first. Chosen over keeping ten tabs because a run in review showed on three of them, a running agent on three, and one CI fix took six views to follow from `z` to pushed. `docs/dev/frontends.md`.
+
+**One confirm from review to the branch.** `u` on a ready run approves it and pushes; `m` and `p` likewise commit or open a pull request. `a` still approves alone. In the TUI the acts apply inside a run's detail, after reading the diff. A run that reaches review, fails or is pushed, and a job that ends or waits for approval, is named in the TUI's footer with Enter to open it, and in a web toast with an Open button.
 
 ### Changed
 
@@ -36,6 +42,18 @@ pma run fix-ci spore --push   # approve and push when the gates are clean
 - A discarded or rejected run keeps its patch in `runs/<id>/change.patch`, as the `--local` help said and the code did not; `pma review <id>` shows a run's diff after its worktree is gone, from the tree it recorded.
 
 - The project view's `for` column says `named` for a task an agent takes only when dispatched by name, such as a signal of an untiered project, rather than `you`.
+
+- The web page has no drawer. The selected row's actions join the toolbar, and a run or a job opens in place of the tables, full width. The drawer repeated the row's cells beside the row and squeezed the diff into an overlay.
+
+- A key means one thing for a row rather than one thing per tab: on the inbox, `a` approves a run or a plan and `s` stages a run or stops a job, by the row it is pressed on. The footer, the toolbar and `?` show only the acts that fit the row.
+
+- Enter on a task opens its project, as `o` does; in the project's own view it opens the task in full: its line, group, tags, due date, issue, placement, who may take it, the runs holding it, the item's indented description, and for a signal the failing workflows or the outdated packages. `d` dispatches from there. On a run or a job Enter opens the diff or the log, as before.
+
+- A job queued with `--detach` from the CLI records the project its one target names, so it shows in that project's view as jobs queued from the TUI and the web do.
+
+- `pma run --review` is documented as what it is since runs edit the clone: it applies to a worktree run, which otherwise writes a verified edit into the clone unstaged. A clone run waits in `pma review` with or without it.
+
+- The TUI and the web say `job 7 queued: pma run fix-ci spore` when they queue a job, rather than the CLI's hint to run `pma job`.
 
 ## [0.8.0]
 

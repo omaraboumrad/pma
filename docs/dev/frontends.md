@@ -29,7 +29,12 @@ Phase 3, crates:
 Phase 4, the TUI:
 
 - A third shared module, `pma_core::screen`, sits between the API and both front ends. It turns a `View` into panes of rows, each with a `Pick` saying what it is about, or into text; and it builds the `Action` a key takes on a pick. The design had each front end do this. Shared, neither decides for itself what a row is or what a key does to it.
-- Ten tabs: next, matrix, runs, jobs, agents, workflows, campaigns, report, notes, and status on `0`. `stale` has no tab.
+- Seven tabs, on `1` to `7`: inbox, projects, activity, matrix, library, report, notes; and the project view, opened from a row. `stale` has no tab. Until 2026-10-26 there were ten (next, matrix, runs, jobs, agents, workflows, campaigns, report, notes, status): a run in review showed on three of them and a running agent on three, and one fix took six views to see through. The inbox holds what waits on you (runs and plans), what is under way, and the tasks; activity holds every job, running agent and workflow instance; library holds revisions and campaigns; projects is the status view. A project's view lists its runs and jobs in one Activity pane, under way first, with what a running agent's log last showed; jobs carry the project they are about for it (schema 42).
+- A key means one thing for a row, not one thing per tab: `a` approves a run or a plan, `s` stages a run or stops a job, and `keys::lookup` tells them apart by the pick. A test holds that no sample pick fits two bindings of one key on one tab.
+- `Ask::Choose`: `z` (run) offers the `pma run` names from `api::choices` with their descriptions and the flags `--push` and `--worktree` as toggles, in a list in the TUI and a dialog in the web. The choice becomes the same input line a typed prompt would read.
+- Publishing a ready run from either front end approves it first, in `api::act`, so `u` on a run just read is one confirm from the branch. `a` alone still approves without publishing.
+- `Query::Task` opens a task in full (`View::Task`): the placed task, the TODO.md item re-read from the file for its description, the signal's facts, and the runs holding it. Enter on a task in its project view opens it; elsewhere Enter opens the project, as `o` does.
+- A detail carries its pick, so the acts that fit it apply from inside it: the TUI's detail mode takes `a`, `x`, `u` and the rest, and the web's detail shows them in the toolbar. The watch's transitions name the run or job and the TUI's footer offers Enter to open it; a web toast gets an Open button.
 - Keys are DOM `KeyboardEvent.key` names (`j`, `Enter`, `Escape`), so the web reads the table unchanged. A binding names the tabs it applies on, whether it confirms or prompts, and its label.
 - `App` is a state machine: a key returns `Load(Query)` or `Act(Action)`, and the loop sends it through the API. Its tests need no store.
 - A `Screen` is typed: each pane has columns of a kind (text, wide, number, badge), each cell a `Tone` (good, warn, bad, accent, muted, strong), and a detail has fields and sections (prose, log, diff). The tone of a run state, a job state, a priority or a project state is decided once, in `screen`, so both front ends colour it alike. Each draws it its own way: the TUI from the terminal's ANSI palette, the web as pills. The web is not laid out like the TUI; parity covers what each shows and does, not how.
@@ -42,12 +47,13 @@ Phase 5, the web:
 - Browsers do not separate cookies by port, so another server on 127.0.0.1 that the browser visits receives the session cookie. Only a local process can listen there, and one running as the user can already run `pma`.
 - `--app` opens the page in Chrome or Chromium with `--app=<url>`: a window with no browser controls. It is not a webview: the server and its checks are the same, and the token is still on that process's command line.
 - The event stream sends a `tick`, every 2 s while a job or run is under way and every 30 s otherwise, and the page reloads its tab. It does not push views.
+- The page has no drawer: the selected row's acts join the toolbar, and a run or a job opens in place of the tables, full width, with Back. The drawer of before repeated the row's cells beside the row and put the diff in a 920 px overlay.
 - `/api/ask` refuses an act that cannot apply to the selected row before the page asks to confirm it, as the TUI does.
 
 Phase 6, parity:
 
 - Compile-time: `screen::screen` matches every `View`, `Act::of` every `Action`, and `screen::action` every `Act`.
-- Tests: every act and tab has a key; no key means two things on one tab; the TUI handles every binding on every tab; `app.js` has a case for every command kind; the web server takes every act by name; every queued action's command line parses.
+- Tests: every act and tab has a key; no key means two things for one row; the TUI handles every binding on every tab; `app.js` has a case for every command kind; the web server takes every act by name; every queued action's command line parses.
 - Races: a front end's approve or reject carries the state its row showed (`seen`), and is refused once the run has left it. Rejecting now writes its state conditionally before it removes the worktree, so a reject from a stale view no longer overwrites an approval. Tested between the web and the CLI on one run, one plan and one job.
 - The page's JavaScript has no unit tests. It was driven in headless Chrome against a scratch store and a real one: tabs, a prompt, a confirmation, help, run detail, and no console errors.
 

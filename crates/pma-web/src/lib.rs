@@ -230,10 +230,27 @@ fn route(req: &Request, ctx: &Ctx) -> Response {
                         b["project"].as_str().unwrap_or(""),
                     )?;
                 }
-                Ok(json!({
+                let mut out = json!({
                     "question": screen::question(act, &pick),
                     "input": screen::initial_input(act, &pick),
-                }))
+                });
+                let chooses = keys::BINDINGS
+                    .iter()
+                    .any(|b| b.command == Command::Act(act) && matches!(b.ask, Ask::Choose(_)));
+                if chooses {
+                    let c = api::choices(store, act)?;
+                    out["options"] = c
+                        .options
+                        .iter()
+                        .map(|o| json!({ "name": o.name, "reads": o.reads, "about": o.about }))
+                        .collect();
+                    out["flags"] = c
+                        .flags
+                        .iter()
+                        .map(|f| json!({ "key": f.key, "arg": f.arg, "label": f.label }))
+                        .collect();
+                }
+                Ok(out)
             })
         }
         ("POST", "/api/open") => {
@@ -243,6 +260,9 @@ fn route(req: &Request, ctx: &Ctx) -> Response {
             let q = match pick_from(&b["pick"]) {
                 Some(Pick::Run { id, .. }) => api::Query::Run { id },
                 Some(Pick::Job { id, .. }) => api::Query::JobLog { id },
+                Some(Pick::Task {
+                    project, target, ..
+                }) => api::Query::task(&project, &target),
                 _ => return Response::status(400),
             };
             answer(ctx, |store| {
@@ -353,6 +373,8 @@ fn transition_json(t: &api::Transition) -> Value {
         "project": t.project,
         "text": t.text,
         "state": t.state,
+        "line": t.line(),
+        "pick": pick_json(&t.pick()),
     })
 }
 
@@ -383,6 +405,7 @@ fn keys_json() -> Value {
                 Ask::Nothing => json!({ "kind": "nothing" }),
                 Ask::Confirm => json!({ "kind": "confirm" }),
                 Ask::Text(label) => json!({ "kind": "text", "label": label }),
+                Ask::Choose(label) => json!({ "kind": "choose", "label": label }),
             };
             json!({
                 "key": b.key,
@@ -408,6 +431,8 @@ fn screen_json(s: &Screen) -> Value {
     let body = match &s.body {
         Body::Detail(d) => json!({ "detail": {
             "title": d.title,
+            "pick": pick_json(&d.pick),
+            "acts": acts_json(&d.pick),
             "badge": d.badge.as_ref().map(cell_json),
             "notice": d.notice,
             "fields": d.fields,
@@ -437,11 +462,7 @@ fn screen_json(s: &Screen) -> Value {
                 "items": p.items.iter().map(|i| json!({
                     "cells": i.cells.iter().map(cell_json).collect::<Vec<_>>(),
                     "pick": pick_json(&i.pick),
-                    "acts": Act::ALL
-                        .iter()
-                        .filter(|a| a.on_row() && screen::fits(**a, &i.pick))
-                        .map(|a| a.name())
-                        .collect::<Vec<_>>(),
+                    "acts": acts_json(&i.pick),
                 })).collect::<Vec<_>>(),
             })).collect::<Vec<_>>(),
         }),
@@ -452,6 +473,15 @@ fn screen_json(s: &Screen) -> Value {
         "summary": s.summary.iter().map(|(l, c)| json!([l, cell_json(c)])).collect::<Vec<_>>(),
         "body": body,
     })
+}
+
+/// The acts on a row that fit `pick`, by name.
+fn acts_json(pick: &Pick) -> Value {
+    Act::ALL
+        .iter()
+        .filter(|a| a.on_row() && screen::fits(**a, pick))
+        .map(|a| a.name())
+        .collect()
 }
 
 fn pick_json(p: &Pick) -> Value {

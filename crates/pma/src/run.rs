@@ -5,106 +5,14 @@
 
 use std::path::{Path, PathBuf};
 
+use pma_core::catalog::{CATALOG, Entry, LIBRARY_BY, Runs};
 use pma_core::{api, dispatch, scan, store, workflow};
 use store::{Result, Store, WorkflowRevision};
 
 use super::{WorkflowAction, run_dispatch, workflow_command};
 
-/// What a name runs.
-#[derive(Clone, Copy)]
-enum Runs<'a> {
-    /// A workflow of the revision in effect.
-    Workflow(&'a str),
-    /// `pma dispatch project:<signal>`, whose prompt carries the failing
-    /// logs or the outdated packages; a workflow `edit` would get the names
-    /// alone.
-    Signal(&'static str),
-}
-
-struct Entry {
-    name: &'static str,
-    about: &'static str,
-    runs: Runs<'static>,
-    /// The `claude` model asked for when nothing else names one. Reviews
-    /// get the strongest: in the pilot, haiku's review findings were false
-    /// and Opus's were true (`docs/dev/workflow-pilot.md`).
-    model: Option<&'static str>,
-}
-
-const CATALOG: &[Entry] = &[
-    Entry {
-        name: "review",
-        about: "Review a project, then confirm each finding against the code",
-        runs: Runs::Workflow("find-issues"),
-        model: Some("opus"),
-    },
-    Entry {
-        name: "ensemble-review",
-        about: "Review for bugs, missing tests and misusable interfaces; confirm each",
-        runs: Runs::Workflow("ensemble-review"),
-        model: Some("opus"),
-    },
-    Entry {
-        name: "doc-drift",
-        about: "Find README and doc statements the code contradicts",
-        runs: Runs::Workflow("doc-drift"),
-        model: Some("opus"),
-    },
-    Entry {
-        name: "todo-audit",
-        about: "Find open TODO.md items the code already does, as notes",
-        runs: Runs::Workflow("todo-audit"),
-        model: Some("opus"),
-    },
-    Entry {
-        name: "security-review",
-        about: "Review for security faults; confirm each by tracing input to its sink",
-        runs: Runs::Workflow("security-review"),
-        model: Some("opus"),
-    },
-    Entry {
-        name: "test-gaps",
-        about: "Find code no test reaches and tests that cannot fail; confirm each",
-        runs: Runs::Workflow("test-gaps"),
-        model: Some("opus"),
-    },
-    Entry {
-        name: "review-and-fix",
-        about: "Review, confirm, then fix the critical and high findings; edits wait in `pma review`",
-        runs: Runs::Workflow("review-and-fix"),
-        model: Some("opus"),
-    },
-    Entry {
-        name: "project-brief",
-        about: "One note per project: what it does, for whom, in what",
-        runs: Runs::Workflow("project-brief"),
-        model: None,
-    },
-    Entry {
-        name: "triage-issues",
-        about: "Judge each open GitHub issue against the code, by severity",
-        runs: Runs::Workflow("triage-issues"),
-        model: None,
-    },
-    Entry {
-        name: "fix-ci",
-        about: "Fix failing CI from its logs; each verified edit lands unstaged",
-        runs: Runs::Signal("ci"),
-        model: None,
-    },
-    Entry {
-        name: "deps-upgrade",
-        about: "Update outdated dependencies; each verified edit lands unstaged",
-        runs: Runs::Signal("deps"),
-        model: None,
-    },
-];
-
 /// The worker a catalog model belongs to.
 const HINTED_AGENT: &str = "claude";
-
-/// Who a bundled revision is proposed and activated by.
-const LIBRARY_BY: &str = "pma run";
 
 pub struct Request {
     pub name: Option<String>,
@@ -115,7 +23,8 @@ pub struct Request {
     pub set: Vec<String>,
     pub dry_run: bool,
     pub yes: bool,
-    /// Leave each edit in `pma review` rather than in the clone.
+    /// For a worktree run: leave each edit in `pma review` rather than
+    /// writing it into the clone. A clone run waits in review either way.
     pub review: bool,
     /// Edit in a worktree, whatever the setting says.
     pub worktree: bool,
@@ -302,60 +211,14 @@ pub fn run(req: Request) -> Result<()> {
     }
 }
 
-/// Input types a command-line target can name; see `pass::root_units`.
-const TARGETABLE: [&str; 3] = ["project", "item", "signal"];
-
 /// The catalog, then every other workflow of the revision in effect, or of
 /// the bundled library before one is. A workflow whose input no target can
 /// name is left out, and said so.
 fn list() -> Result<()> {
     let store = Store::open_default()?;
-    // A library revision is replaced at the next run when `pma` ships
-    // another, so the bundled text is what would run.
-    let (doc, from) = match store.active_workflow()? {
-        Some(r) if r.proposed_by != LIBRARY_BY => {
-            (r.document()?, format!("revision {}", r.revision))
-        }
-        _ => (
-            workflow::Document::parse(workflow::LIBRARY)?,
-            "the bundled library".to_string(),
-        ),
-    };
+    let (choices, unreachable) = pma_core::catalog::choices(&store)?;
     let mut rows = vec![["name", "reads", "what"].map(String::from).to_vec()];
-    for e in CATALOG {
-        let (reads, about) = match e.runs {
-            Runs::Signal(_) => ("project".to_string(), e.about.to_string()),
-            Runs::Workflow(w) => match doc.workflow(w) {
-                Some(w) => (w.input.clone(), e.about.to_string()),
-                None => ("-".into(), format!("{} (not in {from})", e.about)),
-            },
-        };
-        rows.push(vec![e.name.to_string(), reads, about]);
-    }
-    let named = |n: &str| {
-        CATALOG
-            .iter()
-            .any(|e| matches!(e.runs, Runs::Workflow(w) if w == n))
-    };
-    let mut unreachable = Vec::new();
-    for w in doc.workflows.iter().filter(|w| !named(&w.name)) {
-        if !TARGETABLE.contains(&w.input.as_str()) {
-            unreachable.push(format!("{} (reads {})", w.name, w.input));
-            continue;
-        }
-        let effects = match w.effects.names().as_slice() {
-            [] => String::new(),
-            names => format!("; {}", names.join(", ")),
-        };
-        rows.push(vec![
-            w.name.clone(),
-            w.input.clone(),
-            format!(
-                "workflow of {from}, returns {}{effects}",
-                w.output.as_deref().unwrap_or("nothing")
-            ),
-        ]);
-    }
+    rows.extend(choices.into_iter().map(|c| vec![c.name, c.reads, c.about]));
     println!("pma run <name> <project|path>... [--all | --tag T] [-w agent[:model]]\n");
     print!("{}", pma_core::report::table(&rows, "  "));
     if !unreachable.is_empty() {

@@ -7,7 +7,7 @@
 
 use crate::api::{Action, Selection, View, WorkerChoice};
 use crate::keys::{Act, Tab};
-use crate::store::{Run, RunState};
+use crate::store::{Job, Run, RunState};
 use crate::{accept, dates, history, next, publish, rank, report, report_runs, scan, watch};
 
 /// What a row is about.
@@ -181,6 +181,8 @@ pub enum Section {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Detail {
     pub title: String,
+    /// What it is about, so the acts that fit it apply from inside it.
+    pub pick: Pick,
     /// A badge beside the title, such as the run's state.
     pub badge: Option<Cell>,
     /// A warning above everything else.
@@ -434,11 +436,377 @@ fn run_detail(
     sections.push(("Diff".into(), Section::Diff, diff));
     Detail {
         title: format!("#{} {}", run.id, run.text),
+        pick: run_pick(run),
         badge: Some(cell(run.state.name(), run_tone(run.state.name()))),
         notice: moved
             .then(|| "The run changed while it was shown. Read it again before approving.".into()),
         fields,
         sections,
+    }
+}
+
+fn run_pick(r: &Run) -> Pick {
+    Pick::Run {
+        id: r.id,
+        clean: r.state == RunState::Ready && accept::review_reasons(r).is_empty(),
+        state: r.state.name().into(),
+        project: r.project.clone(),
+    }
+}
+
+/// Runs and jobs in one list: under way first, then newest first. A running
+/// agent's row says what its log last showed. `with_project` adds the
+/// project column, for a list across projects.
+fn activity_pane(
+    state: &std::path::Path,
+    runs: &[Run],
+    jobs: &[Job],
+    now: i64,
+    with_project: bool,
+) -> Pane {
+    let agents = watch::agents(state, runs, now);
+    let doing = |r: &Run| -> String {
+        let Some(a) = agents.iter().find(|a| a.run.id == r.id) else {
+            return String::new();
+        };
+        let what = a
+            .progress
+            .last_tool
+            .clone()
+            .or_else(|| a.progress.last_text.clone())
+            .unwrap_or_else(|| "starting".into());
+        match a.progress.tool_calls {
+            0 => what,
+            n => format!("{what}  ({n} tools, quiet {})", a.quiet),
+        }
+    };
+    let row = |item: Cell,
+               state: Cell,
+               project: &str,
+               what: String,
+               doing: String,
+               cost: Cell,
+               age: Cell| {
+        let mut cells = vec![item, state];
+        if with_project {
+            cells.push(plain(project));
+        }
+        cells.extend([plain(what), cell(doing, Tone::Accent), cost, age]);
+        cells
+    };
+    let mut rows: Vec<(bool, i64, Item)> = runs
+        .iter()
+        .map(|r| {
+            (
+                r.state == RunState::Running,
+                r.dispatched_at.unwrap_or(0),
+                Item {
+                    cells: row(
+                        muted(format!("#{}", r.id)),
+                        cell(r.state.name(), run_tone(r.state.name())),
+                        &r.project,
+                        r.text.clone(),
+                        doing(r),
+                        muted(r.cost_usd.map_or("-".into(), |c| format!("${c:.2}"))),
+                        muted(r.dispatched_at.map_or("-".into(), |t| report::ago(now - t))),
+                    ),
+                    pick: run_pick(r),
+                },
+            )
+        })
+        .chain(jobs.iter().map(|j| {
+            (
+                matches!(j.state.as_str(), "queued" | "running" | "awaiting-approval"),
+                j.created_at,
+                Item {
+                    cells: row(
+                        muted(format!("job {}", j.id)),
+                        cell(j.state.clone(), job_tone(&j.state)),
+                        j.project.as_deref().unwrap_or(""),
+                        format!("pma {}", j.args.join(" ")),
+                        String::new(),
+                        muted(""),
+                        muted(report::ago(now - j.created_at)),
+                    ),
+                    pick: Pick::Job {
+                        id: j.id,
+                        awaiting: j.state == "awaiting-approval",
+                    },
+                },
+            )
+        }))
+        .collect();
+    rows.sort_by_key(|(active, at, _)| (!*active, std::cmp::Reverse(*at)));
+    let mut columns = vec![col("item", Kind::Text), col("state", Kind::Badge)];
+    if with_project {
+        columns.push(col("project", Kind::Text));
+    }
+    columns.extend([
+        col("what", Kind::Wide),
+        col("doing", Kind::Wide),
+        col("cost", Kind::Number),
+        col("age", Kind::Text),
+    ]);
+    Pane {
+        title: "Activity".into(),
+        columns,
+        items: rows.into_iter().map(|(_, _, i)| i).collect(),
+        empty: "No agent has worked on it yet.",
+    }
+}
+
+/// `pma next`'s rows as items, each about what the row is about.
+fn next_items(rows: Vec<next::Row>, cells: fn(&[String]) -> Vec<Cell>) -> Vec<Item> {
+    rows.into_iter()
+        .map(|r| Item {
+            pick: next_pick(&r.subject),
+            cells: cells(&r.cells),
+        })
+        .collect()
+}
+
+/// A waiting run's cells as `pma next` builds them: run, state, what is
+/// next, project and task.
+fn run_row(c: &[String]) -> Vec<Cell> {
+    let get = |i: usize| c.get(i).cloned().unwrap_or_default();
+    vec![
+        muted(get(0)),
+        cell(get(1), run_tone(&get(1))),
+        cell(get(2), Tone::Warn),
+        plain(get(3)),
+        plain(get(4)),
+    ]
+}
+
+const WAITING_COLUMNS: [Column; 5] = [
+    col("item", Kind::Text),
+    col("state", Kind::Badge),
+    col("next", Kind::Text),
+    col("project", Kind::Text),
+    col("what", Kind::Wide),
+];
+
+/// Each running agent, with what its log says.
+fn agents_pane(state: &std::path::Path, runs: &[Run], now: i64) -> Pane {
+    let agents = watch::agents(state, runs, now)
+        .into_iter()
+        .map(|a| Item {
+            cells: vec![
+                muted(format!("#{}", a.run.id)),
+                plain(a.run.project.clone()),
+                plain(a.run.node.clone().unwrap_or_else(|| "dispatch".into())),
+                muted(a.run.agent.clone()),
+                cell(a.running, Tone::Accent),
+                muted(a.quiet),
+                plain(a.progress.tool_calls.to_string()),
+                plain(
+                    a.progress
+                        .last_tool
+                        .or(a.progress.last_text)
+                        .unwrap_or_default(),
+                ),
+            ],
+            pick: run_pick(a.run),
+        })
+        .collect();
+    Pane {
+        title: "Running agents".into(),
+        columns: vec![
+            col("run", Kind::Text),
+            col("project", Kind::Text),
+            col("node", Kind::Text),
+            col("agent", Kind::Text),
+            col("running", Kind::Text),
+            col("quiet", Kind::Text),
+            col("tools", Kind::Number),
+            col("doing", Kind::Wide),
+        ],
+        items: agents,
+        empty: "No agent is running.",
+    }
+}
+
+fn job_item(j: &Job, cells: Vec<Cell>) -> Item {
+    Item {
+        cells,
+        pick: Pick::Job {
+            id: j.id,
+            awaiting: j.state == "awaiting-approval",
+        },
+    }
+}
+
+fn open_jobs_pane(jobs: &[Job]) -> Pane {
+    Pane {
+        title: "Open jobs".into(),
+        columns: vec![
+            col("job", Kind::Text),
+            col("state", Kind::Badge),
+            col("command", Kind::Wide),
+        ],
+        items: watch::open_jobs(jobs)
+            .into_iter()
+            .map(|j| {
+                job_item(
+                    j,
+                    vec![
+                        muted(format!("#{}", j.id)),
+                        cell(j.state.clone(), job_tone(&j.state)),
+                        plain(format!("pma {}", j.args.join(" "))),
+                    ],
+                )
+            })
+            .collect(),
+        empty: "No job is queued, running or waiting.",
+    }
+}
+
+fn jobs_pane(jobs: &[Job], now: i64) -> Pane {
+    Pane {
+        title: "Jobs".into(),
+        columns: vec![
+            col("job", Kind::Text),
+            col("state", Kind::Badge),
+            col("queued", Kind::Text),
+            col("command", Kind::Wide),
+        ],
+        items: jobs
+            .iter()
+            .map(|j| {
+                job_item(
+                    j,
+                    vec![
+                        muted(format!("#{}", j.id)),
+                        cell(j.state.clone(), job_tone(&j.state)),
+                        muted(report::ago(now - j.created_at)),
+                        plain(format!("pma {}", j.args.join(" "))),
+                    ],
+                )
+            })
+            .collect(),
+        empty: "No jobs. `--detach` on dispatch or workflow run queues one.",
+    }
+}
+
+fn instances_pane(instances: &[crate::store::WorkflowInstance], now: i64) -> Pane {
+    let items = instances
+        .iter()
+        .map(|i| {
+            let outcome = i.outcome.clone().unwrap_or_else(|| "open".into());
+            Item {
+                cells: vec![
+                    muted(i.id.to_string()),
+                    plain(i.workflow.clone()),
+                    plain(i.target.clone()),
+                    cell(
+                        outcome.clone(),
+                        match outcome.as_str() {
+                            "open" => Tone::Accent,
+                            "finished" => Tone::Good,
+                            "failed" => Tone::Bad,
+                            _ => Tone::Muted,
+                        },
+                    ),
+                    muted(report::ago(now - i.started_at)),
+                ],
+                pick: Pick::Instance {
+                    id: i.id,
+                    workflow: i.workflow.clone(),
+                    open: i.finished_at.is_none(),
+                },
+            }
+        })
+        .collect();
+    Pane {
+        title: "Workflow instances".into(),
+        columns: vec![
+            col("instance", Kind::Text),
+            col("workflow", Kind::Text),
+            col("target", Kind::Wide),
+            col("status", Kind::Badge),
+            col("started", Kind::Text),
+        ],
+        items,
+        empty: "No instance. Press f to start one.",
+    }
+}
+
+fn revisions_pane(revisions: &[crate::store::WorkflowRevision]) -> Pane {
+    let items = revisions
+        .iter()
+        .map(|r| Item {
+            cells: vec![
+                muted(r.revision.to_string()),
+                match r.activated_at {
+                    None => muted("draft"),
+                    Some(_) => cell("active", Tone::Good),
+                },
+                plain(
+                    r.document()
+                        .map(|d| {
+                            d.workflows
+                                .iter()
+                                .map(|w| w.name.clone())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        })
+                        .unwrap_or_default(),
+                ),
+                muted(match r.worst_case_cost {
+                    Some(c) => format!("${c:.2} per unit"),
+                    None => String::new(),
+                }),
+            ],
+            pick: Pick::Nothing,
+        })
+        .collect();
+    Pane {
+        title: "Workflow revisions".into(),
+        columns: vec![
+            col("revision", Kind::Text),
+            col("status", Kind::Badge),
+            col("workflows", Kind::Wide),
+            col("worst case", Kind::Number),
+        ],
+        items,
+        empty: "No revision. `pma workflow propose <file>` stores one.",
+    }
+}
+
+fn campaigns_pane(all: &[crate::store::Campaign]) -> Pane {
+    let items = all
+        .iter()
+        .map(|c| {
+            let taken = c.members.iter().filter(|(_, r)| r.is_some()).count();
+            Item {
+                cells: vec![
+                    plain(c.name.clone()),
+                    muted(format!("class {}", c.class.name())),
+                    cell(
+                        format!("{taken}/{}", c.members.len()),
+                        match taken == c.members.len() {
+                            true => Tone::Good,
+                            false => Tone::Accent,
+                        },
+                    ),
+                    plain(c.text.clone()),
+                ],
+                pick: Pick::Campaign {
+                    name: c.name.clone(),
+                },
+            }
+        })
+        .collect();
+    Pane {
+        title: "Campaigns".into(),
+        columns: vec![
+            col("campaign", Kind::Text),
+            col("class", Kind::Text),
+            col("dispatched", Kind::Number),
+            col("task", Kind::Wide),
+        ],
+        items,
+        empty: "No campaigns. `pma campaign add` defines one.",
     }
 }
 
@@ -613,52 +981,102 @@ pub fn screen(view: View) -> Screen {
     };
     let now = dates::now();
     match view {
-        View::Next { header, lists, .. } => {
-            let rows = |rows: Vec<next::Row>, cells: fn(&[String]) -> Vec<Cell>| -> Vec<Item> {
-                rows.into_iter()
-                    .map(|r| Item {
-                        pick: next_pick(&r.subject),
-                        cells: cells(&r.cells),
+        View::Next { header, lists, .. } => panes(
+            Tab::Inbox,
+            Some(header),
+            vec![
+                Pane {
+                    title: "Ready for agents".into(),
+                    columns: TASK_COLUMNS.to_vec(),
+                    items: next_items(lists.agents, task_cells),
+                    empty: "Nothing an agent may take. Tag a TODO.md item #agent.",
+                },
+                Pane {
+                    title: "Runs waiting on you".into(),
+                    columns: WAITING_COLUMNS.to_vec(),
+                    items: next_items(lists.runs, run_row),
+                    empty: "No run waits on you.",
+                },
+                Pane {
+                    title: "Tasks for you".into(),
+                    columns: TASK_COLUMNS.to_vec(),
+                    items: next_items(lists.tasks, task_cells),
+                    empty: "No critical or urgent task needs you.",
+                },
+            ],
+        ),
+        View::Inbox {
+            header,
+            lists,
+            state,
+            jobs,
+            runs,
+            now: at,
+        } => {
+            // Runs waiting on a decision, then plans waiting for approval.
+            let mut waiting = next_items(lists.runs, run_row);
+            waiting.extend(
+                jobs.iter()
+                    .filter(|j| j.state == "awaiting-approval")
+                    .map(|j| Item {
+                        cells: vec![
+                            muted(format!("job {}", j.id)),
+                            cell(j.state.clone(), job_tone(&j.state)),
+                            cell("approve plan", Tone::Warn),
+                            plain(j.project.clone().unwrap_or_default()),
+                            plain(format!("pma {}", j.args.join(" "))),
+                        ],
+                        pick: Pick::Job {
+                            id: j.id,
+                            awaiting: true,
+                        },
+                    }),
+            );
+            let running: Vec<Run> = runs
+                .into_iter()
+                .filter(|r| r.state == RunState::Running)
+                .collect();
+            let open: Vec<Job> = jobs
+                .into_iter()
+                .filter(|j| matches!(j.state.as_str(), "queued" | "running"))
+                .collect();
+            let mut working = activity_pane(&state, &running, &open, at, true);
+            working.title = "Working now".into();
+            working.empty = "No agent or job is under way.";
+            // Tasks agents may take, then the critical and urgent ones only
+            // you can.
+            let for_cell = |who: &str, items: Vec<Item>| -> Vec<Item> {
+                items
+                    .into_iter()
+                    .map(|mut i| {
+                        i.cells.push(match who {
+                            "agent" => cell("agent", Tone::Accent),
+                            _ => muted("you"),
+                        });
+                        i
                     })
                     .collect()
             };
-            let run_row = |c: &[String]| -> Vec<Cell> {
-                let get = |i: usize| c.get(i).cloned().unwrap_or_default();
-                vec![
-                    muted(get(0)),
-                    cell(get(1), run_tone(&get(1))),
-                    cell(get(2), Tone::Warn),
-                    plain(get(3)),
-                    plain(get(4)),
-                ]
-            };
+            let mut tasks = for_cell("agent", next_items(lists.agents, task_cells));
+            tasks.extend(for_cell("you", next_items(lists.tasks, task_cells)));
+            let mut columns = TASK_COLUMNS.to_vec();
+            columns.push(col("for", Kind::Badge));
             panes(
-                Tab::Next,
+                Tab::Inbox,
                 Some(header),
                 vec![
                     Pane {
-                        title: "Ready for agents".into(),
-                        columns: TASK_COLUMNS.to_vec(),
-                        items: rows(lists.agents, task_cells),
-                        empty: "Nothing an agent may take. Tag a TODO.md item #agent.",
+                        title: "Waiting on you".into(),
+                        columns: WAITING_COLUMNS.to_vec(),
+                        items: waiting,
+                        empty: "Nothing waits on you.",
                     },
+                    working,
                     Pane {
-                        title: "Runs waiting on you".into(),
-                        columns: vec![
-                            col("run", Kind::Text),
-                            col("state", Kind::Badge),
-                            col("next", Kind::Text),
-                            col("project", Kind::Text),
-                            col("task", Kind::Wide),
-                        ],
-                        items: rows(lists.runs, run_row),
-                        empty: "No run waits on you.",
-                    },
-                    Pane {
-                        title: "Tasks for you".into(),
-                        columns: TASK_COLUMNS.to_vec(),
-                        items: rows(lists.tasks, task_cells),
-                        empty: "No critical or urgent task needs you.",
+                        title: "Tasks".into(),
+                        columns,
+                        items: tasks,
+                        empty: "No task is ready for an agent, and none needs you now.",
                     },
                 ],
             )
@@ -778,7 +1196,7 @@ pub fn screen(view: View) -> Screen {
                 }
             }
             panes(
-                Tab::Status,
+                Tab::Projects,
                 Some(header),
                 vec![
                     Pane {
@@ -822,6 +1240,7 @@ pub fn screen(view: View) -> Screen {
             Some(header),
             Detail {
                 title: "Stale tasks".into(),
+                pick: Pick::Nothing,
                 badge: None,
                 notice: None,
                 fields: Vec::new(),
@@ -877,16 +1296,11 @@ pub fn screen(view: View) -> Screen {
                 .iter()
                 .map(|r| Item {
                     cells: run_cells(r, now),
-                    pick: Pick::Run {
-                        id: r.id,
-                        clean: r.state == RunState::Ready && accept::review_reasons(r).is_empty(),
-                        state: r.state.name().into(),
-                        project: r.project.clone(),
-                    },
+                    pick: run_pick(r),
                 })
                 .collect::<Vec<_>>();
             panes(
-                Tab::Runs,
+                Tab::Inbox,
                 None,
                 vec![Pane {
                     title: "Runs not yet final".into(),
@@ -912,116 +1326,42 @@ pub fn screen(view: View) -> Screen {
             jobs,
             runs,
             now,
+        } => panes(
+            Tab::Activity,
+            None,
+            vec![agents_pane(&state, &runs, now), open_jobs_pane(&jobs)],
+        ),
+        View::Activity {
+            state,
+            jobs,
+            instances,
+            runs,
+            now: at,
         } => {
-            let agents = watch::agents(&state, &runs, now)
+            let running: Vec<Run> = runs
                 .into_iter()
-                .map(|a| Item {
-                    cells: vec![
-                        muted(format!("#{}", a.run.id)),
-                        plain(a.run.project.clone()),
-                        plain(a.run.node.clone().unwrap_or_else(|| "dispatch".into())),
-                        muted(a.run.agent.clone()),
-                        cell(a.running, Tone::Accent),
-                        muted(a.quiet),
-                        plain(a.progress.tool_calls.to_string()),
-                        plain(
-                            a.progress
-                                .last_tool
-                                .or(a.progress.last_text)
-                                .unwrap_or_default(),
-                        ),
-                    ],
-                    pick: Pick::Run {
-                        id: a.run.id,
-                        clean: false,
-                        state: a.run.state.name().into(),
-                        project: a.run.project.clone(),
-                    },
-                })
-                .collect();
-            let open = watch::open_jobs(&jobs)
-                .into_iter()
-                .map(|j| Item {
-                    cells: vec![
-                        muted(format!("#{}", j.id)),
-                        cell(j.state.clone(), job_tone(&j.state)),
-                        plain(format!("pma {}", j.args.join(" "))),
-                    ],
-                    pick: Pick::Job {
-                        id: j.id,
-                        awaiting: j.state == "awaiting-approval",
-                    },
-                })
+                .filter(|r| r.state == RunState::Running)
                 .collect();
             panes(
-                Tab::Agents,
+                Tab::Activity,
                 None,
                 vec![
-                    Pane {
-                        title: "Running agents".into(),
-                        columns: vec![
-                            col("run", Kind::Text),
-                            col("project", Kind::Text),
-                            col("node", Kind::Text),
-                            col("agent", Kind::Text),
-                            col("running", Kind::Text),
-                            col("quiet", Kind::Text),
-                            col("tools", Kind::Number),
-                            col("doing", Kind::Wide),
-                        ],
-                        items: agents,
-                        empty: "No agent is running.",
-                    },
-                    Pane {
-                        title: "Open jobs".into(),
-                        columns: vec![
-                            col("job", Kind::Text),
-                            col("state", Kind::Badge),
-                            col("command", Kind::Wide),
-                        ],
-                        items: open,
-                        empty: "No job is queued, running or waiting.",
-                    },
+                    activity_pane(&state, &running, &jobs, at, true),
+                    instances_pane(&instances, at),
                 ],
             )
         }
-        View::Jobs(jobs) => {
-            let items = jobs
-                .iter()
-                .map(|j| Item {
-                    cells: vec![
-                        muted(format!("#{}", j.id)),
-                        cell(j.state.clone(), job_tone(&j.state)),
-                        muted(report::ago(now - j.created_at)),
-                        plain(format!("pma {}", j.args.join(" "))),
-                    ],
-                    pick: Pick::Job {
-                        id: j.id,
-                        awaiting: j.state == "awaiting-approval",
-                    },
-                })
-                .collect::<Vec<_>>();
-            panes(
-                Tab::Jobs,
-                None,
-                vec![Pane {
-                    title: "Jobs".into(),
-                    columns: vec![
-                        col("job", Kind::Text),
-                        col("state", Kind::Badge),
-                        col("queued", Kind::Text),
-                        col("command", Kind::Wide),
-                    ],
-                    items,
-                    empty: "No jobs. `--detach` on dispatch or workflow run queues one.",
-                }],
-            )
-        }
-        View::JobLog { id, text: log } => detail(
+        View::Jobs(jobs) => panes(Tab::Activity, None, vec![jobs_pane(&jobs, now)]),
+        View::JobLog {
+            id,
+            text: log,
+            awaiting,
+        } => detail(
             None,
             None,
             Detail {
                 title: format!("Job #{id}"),
+                pick: Pick::Job { id, awaiting },
                 badge: None,
                 notice: None,
                 fields: Vec::new(),
@@ -1065,133 +1405,20 @@ pub fn screen(view: View) -> Screen {
         View::Workflows {
             revisions,
             instances,
-        } => {
-            let open: Vec<Item> = instances
-                .iter()
-                .map(|i| {
-                    let outcome = i.outcome.clone().unwrap_or_else(|| "open".into());
-                    Item {
-                        cells: vec![
-                            muted(i.id.to_string()),
-                            plain(i.workflow.clone()),
-                            plain(i.target.clone()),
-                            cell(
-                                outcome.clone(),
-                                match outcome.as_str() {
-                                    "open" => Tone::Accent,
-                                    "finished" => Tone::Good,
-                                    "failed" => Tone::Bad,
-                                    _ => Tone::Muted,
-                                },
-                            ),
-                            muted(report::ago(now - i.started_at)),
-                        ],
-                        pick: Pick::Instance {
-                            id: i.id,
-                            workflow: i.workflow.clone(),
-                            open: i.finished_at.is_none(),
-                        },
-                    }
-                })
-                .collect();
-            let revs: Vec<Item> = revisions
-                .iter()
-                .map(|r| Item {
-                    cells: vec![
-                        muted(r.revision.to_string()),
-                        match r.activated_at {
-                            None => muted("draft"),
-                            Some(_) => cell("active", Tone::Good),
-                        },
-                        plain(
-                            r.document()
-                                .map(|d| {
-                                    d.workflows
-                                        .iter()
-                                        .map(|w| w.name.clone())
-                                        .collect::<Vec<_>>()
-                                        .join(", ")
-                                })
-                                .unwrap_or_default(),
-                        ),
-                        muted(match r.worst_case_cost {
-                            Some(c) => format!("${c:.2} per unit"),
-                            None => String::new(),
-                        }),
-                    ],
-                    pick: Pick::Nothing,
-                })
-                .collect();
-            panes(
-                Tab::Workflows,
-                None,
-                vec![
-                    Pane {
-                        title: "Instances".into(),
-                        columns: vec![
-                            col("instance", Kind::Text),
-                            col("workflow", Kind::Text),
-                            col("target", Kind::Wide),
-                            col("status", Kind::Badge),
-                            col("started", Kind::Text),
-                        ],
-                        items: open,
-                        empty: "No instance. Press f to start one.",
-                    },
-                    Pane {
-                        title: "Revisions".into(),
-                        columns: vec![
-                            col("revision", Kind::Text),
-                            col("status", Kind::Badge),
-                            col("workflows", Kind::Wide),
-                            col("worst case", Kind::Number),
-                        ],
-                        items: revs,
-                        empty: "No revision. `pma workflow propose <file>` stores one.",
-                    },
-                ],
-            )
-        }
-        View::Campaigns(all) => {
-            let items = all
-                .iter()
-                .map(|c| {
-                    let taken = c.members.iter().filter(|(_, r)| r.is_some()).count();
-                    Item {
-                        cells: vec![
-                            plain(c.name.clone()),
-                            muted(format!("class {}", c.class.name())),
-                            cell(
-                                format!("{taken}/{}", c.members.len()),
-                                match taken == c.members.len() {
-                                    true => Tone::Good,
-                                    false => Tone::Accent,
-                                },
-                            ),
-                            plain(c.text.clone()),
-                        ],
-                        pick: Pick::Campaign {
-                            name: c.name.clone(),
-                        },
-                    }
-                })
-                .collect::<Vec<_>>();
-            panes(
-                Tab::Campaigns,
-                None,
-                vec![Pane {
-                    title: "Campaigns".into(),
-                    columns: vec![
-                        col("campaign", Kind::Text),
-                        col("class", Kind::Text),
-                        col("dispatched", Kind::Number),
-                        col("task", Kind::Wide),
-                    ],
-                    items,
-                    empty: "No campaigns. `pma campaign add` defines one.",
-                }],
-            )
-        }
+        } => panes(
+            Tab::Library,
+            None,
+            vec![instances_pane(&instances, now), revisions_pane(&revisions)],
+        ),
+        View::Library {
+            revisions,
+            campaigns,
+        } => panes(
+            Tab::Library,
+            None,
+            vec![revisions_pane(&revisions), campaigns_pane(&campaigns)],
+        ),
+        View::Campaigns(all) => panes(Tab::Library, None, vec![campaigns_pane(&all)]),
         View::Project {
             name,
             path,
@@ -1202,6 +1429,8 @@ pub fn screen(view: View) -> Screen {
             placed,
             today,
             runs,
+            jobs,
+            state,
         } => {
             let mut summary: Vec<(String, Cell)> = Vec::new();
             match &status {
@@ -1284,24 +1513,6 @@ pub fn screen(view: View) -> Screen {
                     }
                 })
                 .collect();
-            let runs = runs
-                .iter()
-                .map(|r| Item {
-                    cells: vec![
-                        muted(format!("#{}", r.id)),
-                        cell(r.state.name(), run_tone(r.state.name())),
-                        plain(r.text.clone()),
-                        muted(r.cost_usd.map_or("-".into(), |c| format!("${c:.2}"))),
-                        muted(r.dispatched_at.map_or("-".into(), |t| report::ago(now - t))),
-                    ],
-                    pick: Pick::Run {
-                        id: r.id,
-                        clean: r.state == RunState::Ready && accept::review_reasons(r).is_empty(),
-                        state: r.state.name().into(),
-                        project: r.project.clone(),
-                    },
-                })
-                .collect();
             Screen {
                 tab: Some(Tab::Project),
                 header: Some(format!("{name}  {}", path.display())),
@@ -1319,20 +1530,115 @@ pub fn screen(view: View) -> Screen {
                         items: tasks,
                         empty: "No open task in its TODO.md.",
                     },
-                    Pane {
-                        title: "Runs".into(),
-                        columns: vec![
-                            col("run", Kind::Text),
-                            col("state", Kind::Badge),
-                            col("task", Kind::Wide),
-                            col("cost", Kind::Number),
-                            col("started", Kind::Text),
-                        ],
-                        items: runs,
-                        empty: "No agent has worked on it yet.",
-                    },
+                    activity_pane(&state, &runs, &jobs, now, false),
                 ]),
             }
+        }
+        View::Task {
+            placed,
+            today,
+            item,
+            signal,
+            repo,
+            held_by,
+        } => {
+            let t = &placed.task;
+            let priority = t.priority.name();
+            let mut fields: Vec<(String, String)> = vec![("project".into(), t.project.clone())];
+            match t.line {
+                Some(line) => fields.push(("where".into(), format!("TODO.md:{line}"))),
+                None => fields.push((
+                    "where".into(),
+                    format!(
+                        "the `{}` signal of the last scan",
+                        t.key.as_deref().unwrap_or("-")
+                    ),
+                )),
+            }
+            if let Some(g) = &t.group {
+                fields.push(("group".into(), g.clone()));
+            }
+            if let Some(i) = &item {
+                if !i.tags.is_empty() {
+                    fields.push((
+                        "tags".into(),
+                        i.tags
+                            .iter()
+                            .map(|g| format!("#{g}"))
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                    ));
+                }
+                if let Some(due) = &i.due {
+                    fields.push(("due".into(), due.clone()));
+                }
+                if let Some(gh) = i.gh {
+                    fields.push((
+                        "issue".into(),
+                        match &repo {
+                            Some(r) => format!("{r}/issues/{gh}"),
+                            None => format!("gh:{gh}"),
+                        },
+                    ));
+                }
+                if let Some(id) = &i.id {
+                    fields.push(("id".into(), id.clone()));
+                }
+            }
+            fields.push(("when".into(), report::when(&placed, today)));
+            fields.push((
+                "placed".into(),
+                format!(
+                    "{:?} {}, importance {:.1}, tier {}",
+                    placed.quadrant,
+                    placed.quadrant.title(),
+                    placed.importance,
+                    t.tier
+                ),
+            ));
+            fields.push((
+                "for".into(),
+                match (t.eligible, t.manual, t.key.is_some()) {
+                    (true, _, _) => "an agent: `--auto` takes it".into(),
+                    (false, false, true) => "an agent, when dispatched by name".into(),
+                    _ => "you: no agent may take it".into(),
+                },
+            ));
+            fields.push(("open".into(), format!("{}d", t.age_days)));
+            for r in &held_by {
+                fields.push(("held by".into(), format!("#{} {}", r.id, r.state.name())));
+            }
+            // The title is one line in a TUI dialog; the text in full is the
+            // first thing to read.
+            let mut sections = vec![("Task".into(), Section::Prose, t.text.clone())];
+            if let Some(i) = &item
+                && !i.description.is_empty()
+            {
+                sections.push((
+                    "Description".into(),
+                    Section::Prose,
+                    i.description
+                        .iter()
+                        .map(|l| l.trim_start().to_string())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ));
+            }
+            if !signal.is_empty() {
+                sections.push(("Signal".into(), Section::Log, signal.join("\n")));
+            }
+            detail(
+                None,
+                Some(t.project.clone()),
+                Detail {
+                    title: report::truncate(&t.text, 72),
+                    pick: task_pick(&placed),
+                    badge: Some(cell(priority, priority_tone(priority))),
+                    notice: None,
+                    fields,
+                    sections,
+                },
+            )
         }
         View::Campaign { campaign, runs } => {
             let fields = campaign
@@ -1351,6 +1657,9 @@ pub fn screen(view: View) -> Screen {
                 None,
                 Detail {
                     title: campaign.name.clone(),
+                    pick: Pick::Campaign {
+                        name: campaign.name.clone(),
+                    },
                     badge: None,
                     notice: None,
                     fields,
@@ -1379,12 +1688,18 @@ pub fn question(act: Act, pick: &Pick) -> String {
         Pick::Campaign { name } => name.clone(),
         Pick::Nothing => String::new(),
     };
+    // Publishing a ready run approves it first (`api::act`); the question
+    // says so.
+    let ready = matches!(pick, Pick::Run { state, .. } if state == "ready");
     let verb = match act {
         Act::Dispatch => "dispatch",
         Act::RejectRun => "reject",
         Act::Stage => "stage in its clone",
+        Act::Commit if ready => "approve and commit in its clone",
         Act::Commit => "commit in its clone",
+        Act::Pr if ready => "approve and open a pull request for",
         Act::Pr => "open a pull request for",
+        Act::Push if ready => "approve and push",
         Act::Push => "push",
         Act::StopJob | Act::StopWorkflow => "stop",
         Act::RemoveNote => "remove note",
@@ -1831,6 +2146,63 @@ mod tests {
         assert!(action(Act::Run, &Pick::Nothing, &[], "review").is_err());
         assert!(action(Act::Run, &row, &[], "").is_err());
         assert!(action(Act::Run, &row, &[], "review --nope").is_err());
+    }
+
+    /// The inbox puts each thing in one place: plans awaiting approval
+    /// wait with the runs, a running job is under way, a done one is
+    /// neither.
+    #[test]
+    fn the_inbox_puts_each_thing_in_one_place() {
+        let job = |id, state: &str| Job {
+            id,
+            args: vec!["scan".into()],
+            cwd: "/".into(),
+            state: state.into(),
+            created_at: 0,
+            started_at: None,
+            finished_at: None,
+            pid: None,
+            exit_code: None,
+            awaiting: None,
+            project: Some("p".into()),
+        };
+        let view = View::Inbox {
+            header: "h".into(),
+            lists: next::Next::default(),
+            state: std::env::temp_dir(),
+            jobs: vec![
+                job(1, "awaiting-approval"),
+                job(2, "running"),
+                job(3, "done"),
+            ],
+            runs: vec![Run {
+                id: 7,
+                project: "p".into(),
+                text: "t".into(),
+                state: RunState::Running,
+                ..Default::default()
+            }],
+            now: 0,
+        };
+        let Body::Panes(p) = screen(view).body else {
+            panic!("panes");
+        };
+        let titles: Vec<&str> = p.iter().map(|p| p.title.as_str()).collect();
+        assert_eq!(titles, ["Waiting on you", "Working now", "Tasks"]);
+        assert_eq!(
+            p[0].items[0].texts()[..3],
+            ["job 1", "awaiting-approval", "approve plan"]
+        );
+        let working: Vec<&str> = p[1].items.iter().map(|i| i.texts()[0]).collect();
+        assert_eq!(working, ["#7", "job 2"]);
+        assert_eq!(question(Act::Push, &p[1].items[0].pick), "push #7?");
+        let ready = Pick::Run {
+            id: 7,
+            clean: false,
+            state: "ready".into(),
+            project: "p".into(),
+        };
+        assert_eq!(question(Act::Push, &ready), "approve and push #7?");
     }
 
     #[test]

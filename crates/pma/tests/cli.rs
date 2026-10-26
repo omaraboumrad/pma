@@ -3858,6 +3858,15 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"ok","total
     assert_eq!(fs::read_to_string(alpha.join("hello.txt")).unwrap(), "hi\n");
     let log = env.ok(&["job", "log", "2"]);
     assert!(log.contains("nothing left to run"), "{log}");
+    // The hook runs after the job is marked done, so it may be a moment.
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !fs::read_to_string(&heard).unwrap().contains("2 done") {
+        assert!(
+            std::time::Instant::now() < until,
+            "notify did not hear job 2"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
     assert_eq!(
         fs::read_to_string(&heard).unwrap(),
         "1 awaiting-approval\n2 done\n"
@@ -4080,15 +4089,15 @@ fn the_web_view_is_local_and_shares_the_store() {
         "/api/ask",
         &origin,
         &cookie,
-        r#"{"tab":"runs","act":"RejectRun","pick":{"kind":"nothing"}}"#,
+        r#"{"tab":"inbox","act":"RejectRun","pick":{"kind":"nothing"}}"#,
     );
     assert!(
         ask.starts_with("HTTP/1.1 400") && ask.contains("select a run first"),
         "{ask}"
     );
-    let runs = get("/api/screen?tab=runs", &host, &cookie);
+    let runs = get("/api/screen?tab=inbox", &host, &cookie);
     assert!(
-        runs.contains("Runs not yet final") && runs.contains("\"items\":[]"),
+        runs.contains("Waiting on you") && runs.contains("\"items\":[]"),
         "{runs}"
     );
 
@@ -4227,7 +4236,7 @@ fn front_ends_racing_on_one_run_act_only_on_what_they_were_shown() {
     let (env, _origin, _alpha) = dispatch_env(&s, &[("claude", FAKE_CLAUDE)]);
     env.ok(&["dispatch", "alpha:5"]);
     let (child, port, cookie) = start_web(&env);
-    let seen = first_pick(port, &cookie, "runs");
+    let seen = first_pick(port, &cookie, "inbox");
     assert_eq!(seen["state"], "ready", "{seen}");
 
     env.ok(&["review", "1", "--approve"]);
@@ -4236,7 +4245,7 @@ fn front_ends_racing_on_one_run_act_only_on_what_they_were_shown() {
             port,
             &cookie,
             "/api/act",
-            Some(serde_json::json!({ "tab": "runs", "act": "RejectRun", "pick": pick })),
+            Some(serde_json::json!({ "tab": "inbox", "act": "RejectRun", "pick": pick })),
         )
     };
     let (status, body) = reject(&seen);
@@ -4253,7 +4262,7 @@ fn front_ends_racing_on_one_run_act_only_on_what_they_were_shown() {
         "nothing changed"
     );
 
-    let fresh = first_pick(port, &cookie, "runs");
+    let fresh = first_pick(port, &cookie, "inbox");
     assert_eq!(fresh["state"], "approved");
     let (status, body) = reject(&fresh);
     assert_eq!(status, 200, "{body}");
@@ -4290,13 +4299,23 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"ok","total
         .collect();
 
     let (child, port, cookie) = start_web(&env);
-    let job = first_pick(port, &cookie, "jobs");
+    let job = first_pick(port, &cookie, "activity");
     assert_eq!(job["awaiting"], true, "{job}");
+    // Queued from the CLI, the job still names its project.
+    let (_, project) = web(port, &cookie, "/api/screen?tab=project&project=alpha", None);
+    assert!(
+        project["body"]["panes"][1]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["cells"][0]["text"] == "job 1"),
+        "{project}"
+    );
     let (status, body) = web(
         port,
         &cookie,
         "/api/act",
-        Some(serde_json::json!({ "tab": "jobs", "act": "ApproveJob", "pick": job })),
+        Some(serde_json::json!({ "tab": "activity", "act": "ApproveJob", "pick": job })),
     );
     assert_eq!(status, 200, "{body}");
     let (_, err, success) = env.run(&["job", "approve", "1"]);
@@ -4319,6 +4338,50 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"ok","total
     drop(child);
 }
 
+/// A task opens in full from its project: the item's line, description,
+/// issue and the acts that fit it; a signal the scan did not find is refused.
+#[test]
+fn a_task_opens_in_full_from_its_project() {
+    let s = Scratch::new("taskopen");
+    let (env, _origin, _alpha) = dispatch_env(&s, &[("claude", FAKE_CLAUDE)]);
+    let (child, port, cookie) = start_web(&env);
+    let open = |target: &str| {
+        web(
+            port,
+            &cookie,
+            "/api/open",
+            Some(serde_json::json!({
+                "pick": { "kind": "task", "project": "alpha", "target": target, "retry": false },
+            })),
+        )
+    };
+    let (status, body) = open("alpha:5");
+    assert_eq!(status, 200, "{body}");
+    let d = &body["body"]["detail"];
+    assert_eq!(d["title"], "add greeting");
+    assert!(
+        d["sections"].to_string().contains("say hello in hello.txt"),
+        "{d}"
+    );
+    assert!(d["fields"].to_string().contains("TODO.md:5"), "{d}");
+    assert!(d["acts"].to_string().contains("Dispatch"), "{d}");
+    let (status, body) = open("alpha:7");
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body["body"]["detail"]["fields"]
+            .to_string()
+            .contains("gh:7"),
+        "{body}"
+    );
+    let (status, body) = open("alpha:ci");
+    assert_eq!(status, 400);
+    assert!(
+        body["error"].to_string().contains("no `ci` signal"),
+        "{body}"
+    );
+    drop(child);
+}
+
 /// Every act the key table binds is one the web server takes by name: asked
 /// about with no row selected, it answers with a question or with the reason
 /// it cannot apply, never with a request it could not read.
@@ -4337,7 +4400,7 @@ fn the_web_understands_every_act_in_the_key_table() {
         if b["command"]["kind"] != "act" {
             continue;
         }
-        let tab = b["tabs"][0].as_str().unwrap_or("next");
+        let tab = b["tabs"][0].as_str().unwrap_or("inbox");
         let (status, body) = web(
             port,
             &cookie,

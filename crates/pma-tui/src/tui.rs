@@ -36,6 +36,12 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 pub enum Request {
     Load(Query),
     Act(Action),
+    /// The list `api::choices` gives for an act, to choose from.
+    Choose {
+        act: Act,
+        pick: Pick,
+        label: &'static str,
+    },
     Quit,
 }
 
@@ -57,6 +63,15 @@ enum Mode {
         label: &'static str,
         input: String,
         pick: Pick,
+    },
+    /// A list to choose from, with flags to toggle, for an act.
+    Choose {
+        act: Act,
+        label: &'static str,
+        pick: Pick,
+        choices: api::Choices,
+        at: usize,
+        on: Vec<bool>,
     },
 }
 
@@ -113,6 +128,8 @@ pub struct App {
     selected: Vec<Vec<TableState>>,
     mode: Mode,
     status: Option<(String, Tone)>,
+    /// A run or a job the footer names, which Enter opens.
+    notice: Option<Pick>,
     busy: bool,
     palette: Palette,
 }
@@ -131,15 +148,16 @@ impl App {
     pub fn new() -> App {
         let n = Tab::ALL.len();
         App {
-            tab: Tab::Next,
+            tab: Tab::Inbox,
             project: String::new(),
-            previous: Tab::Next,
+            previous: Tab::Inbox,
             by: 1,
             screens: vec![None; n],
             pane: vec![0; n],
             selected: vec![Vec::new(); n],
             mode: Mode::Normal,
             status: None,
+            notice: None,
             busy: false,
             palette: Palette::from_env(),
         }
@@ -163,6 +181,22 @@ impl App {
 
     fn say(&mut self, text: impl Into<String>, tone: Tone) {
         self.status = Some((text.into(), tone));
+        self.notice = None;
+    }
+
+    /// Runs and jobs that reached a state worth telling, from the watch.
+    /// The footer names the last one, and Enter opens it.
+    pub fn noticed(&mut self, moved: &[api::Transition]) {
+        let Some(t) = moved.last() else {
+            return;
+        };
+        let tone = match t.state.as_str() {
+            "failed" | "stopped" => Tone::Bad,
+            "pushed" | "merged" | "applied" | "done" => Tone::Good,
+            _ => Tone::Warn,
+        };
+        self.say(format!("{}  (Enter opens it)", t.line()), tone);
+        self.notice = Some(t.pick());
     }
 
     fn panes(&self) -> &[Pane] {
@@ -232,6 +266,31 @@ impl App {
         self.screens[t] = Some(Ok(s));
     }
 
+    /// The list for an act arrived, or failed to.
+    pub fn offered(
+        &mut self,
+        act: Act,
+        pick: Pick,
+        label: &'static str,
+        choices: std::result::Result<api::Choices, String>,
+    ) {
+        match choices {
+            Ok(choices) if choices.options.is_empty() => self.say("Nothing to choose.", Tone::Warn),
+            Ok(choices) => {
+                let on = vec![false; choices.flags.len()];
+                self.mode = Mode::Choose {
+                    act,
+                    label,
+                    pick,
+                    choices,
+                    at: 0,
+                    on,
+                };
+            }
+            Err(e) => self.say(e, Tone::Bad),
+        }
+    }
+
     /// An action finished; what it said, or its error, shows in the footer.
     pub fn acted(&mut self, outcome: std::result::Result<Outcome, String>) {
         self.mode = Mode::Normal;
@@ -260,7 +319,7 @@ impl App {
                 self.mode = Mode::Normal;
                 return None;
             }
-            Mode::Detail { scroll, .. } => {
+            Mode::Detail { scroll, screen } => {
                 match key {
                     "j" | "ArrowDown" => *scroll = scroll.saturating_add(1),
                     "k" | "ArrowUp" => *scroll = scroll.saturating_sub(1),
@@ -268,7 +327,21 @@ impl App {
                     "PageDown" | " " => *scroll = scroll.saturating_add(20),
                     "PageUp" => *scroll = scroll.saturating_sub(20),
                     "Escape" | "q" | "Enter" => self.mode = Mode::Normal,
-                    _ => {}
+                    _ => {
+                        // An act that fits what the detail shows applies
+                        // from inside it: approve after reading the diff.
+                        let Body::Detail(d) = &screen.body else {
+                            return None;
+                        };
+                        let pick = d.pick.clone();
+                        let b = keys::lookup(key, self.tab, &pick)?;
+                        if let Command::Act(act) = b.command
+                            && act.on_row()
+                            && screen::fits(act, &pick)
+                        {
+                            return self.begin(act, b.ask, pick, Vec::new());
+                        }
+                    }
                 }
                 return None;
             }
@@ -307,9 +380,56 @@ impl App {
                 }
                 return None;
             }
+            Mode::Choose {
+                choices, at, on, ..
+            } => {
+                let n = choices.options.len();
+                match key {
+                    "Escape" => {
+                        self.mode = Mode::Normal;
+                        self.say("Cancelled.", Tone::Muted);
+                    }
+                    "j" | "ArrowDown" => *at = (*at + 1).min(n.saturating_sub(1)),
+                    "k" | "ArrowUp" => *at = at.saturating_sub(1),
+                    "g" | "Home" => *at = 0,
+                    "G" | "End" => *at = n.saturating_sub(1),
+                    "Enter" => {
+                        let Mode::Choose {
+                            act,
+                            pick,
+                            choices,
+                            at,
+                            on,
+                            ..
+                        } = std::mem::replace(&mut self.mode, Mode::Normal)
+                        else {
+                            unreachable!("in a list");
+                        };
+                        let input = choices.line(&choices.options[at].name, &on);
+                        let (_, pane) = self.pick();
+                        return self.ask_done(act, &pick, &pane, &input);
+                    }
+                    k => {
+                        if let Some(i) = choices.flags.iter().position(|f| f.key == k) {
+                            on[i] = !on[i];
+                        }
+                    }
+                }
+                return None;
+            }
             Mode::Normal => {}
         }
-        let binding = keys::lookup(key, self.tab)?;
+        if let Some(pick) = self.notice.take()
+            && key == "Enter"
+        {
+            self.status = None;
+            return match pick {
+                Pick::Run { id, .. } => Some(Request::Load(Query::Run { id })),
+                Pick::Job { id, .. } => Some(Request::Load(Query::JobLog { id })),
+                _ => None,
+            };
+        }
+        let binding = keys::lookup(key, self.tab, &self.pick().0)?;
         let t = index(self.tab);
         match binding.command {
             Command::Tab(tab) => {
@@ -343,7 +463,14 @@ impl App {
                 return match self.pick().0 {
                     Pick::Run { id, .. } => Some(Request::Load(Query::Run { id })),
                     Pick::Job { id, .. } => Some(Request::Load(Query::JobLog { id })),
-                    _ => None,
+                    // In its project, a task opens in full; elsewhere Enter
+                    // on a task is `o`: the project is what there is to open.
+                    Pick::Task {
+                        project, target, ..
+                    } if self.tab == Tab::Project => {
+                        Some(Request::Load(Query::task(&project, &target)))
+                    }
+                    other => other.project().map(|p| self.open_project(p.to_string())),
                 };
             }
             Command::Back => {
@@ -354,15 +481,7 @@ impl App {
                 }
             }
             Command::OpenProject => match self.pick().0.project() {
-                Some(name) => {
-                    self.project = name.to_string();
-                    if self.tab != Tab::Project {
-                        self.previous = self.tab;
-                    }
-                    self.tab = Tab::Project;
-                    self.status = None;
-                    return Some(Request::Load(self.query()));
-                }
+                Some(name) => return Some(self.open_project(name.to_string())),
                 None => self.say("Select a row that names a project.", Tone::Warn),
             },
             Command::ReportBy => {
@@ -373,29 +492,51 @@ impl App {
             Command::Quit => return Some(Request::Quit),
             Command::Act(act) => {
                 let (pick, pane) = self.pick();
-                match binding.ask {
-                    Ask::Text(label) => {
-                        self.mode = Mode::Prompt {
-                            act,
-                            label,
-                            input: screen::initial_input(act, &pick),
-                            pick,
-                        };
-                    }
-                    Ask::Confirm => match screen::action_in(act, &pick, &pane, "", &self.project) {
-                        Ok(action) => {
-                            self.mode = Mode::Confirm {
-                                action,
-                                question: screen::question(act, &pick),
-                            }
-                        }
-                        Err(e) => self.say(e, Tone::Bad),
-                    },
-                    Ask::Nothing => return self.ask_done(act, &pick, &pane, ""),
-                }
+                return self.begin(act, binding.ask, pick, pane);
             }
         }
         None
+    }
+
+    /// Opens `name`'s project view, remembering where it was opened from.
+    fn open_project(&mut self, name: String) -> Request {
+        self.project = name;
+        if self.tab != Tab::Project {
+            self.previous = self.tab;
+        }
+        self.tab = Tab::Project;
+        self.status = None;
+        Request::Load(self.query())
+    }
+
+    /// Starts an act on `pick`: asks what the binding asks, or does it.
+    fn begin(&mut self, act: Act, ask: Ask, pick: Pick, pane: Vec<Item>) -> Option<Request> {
+        match ask {
+            Ask::Text(label) => {
+                self.mode = Mode::Prompt {
+                    act,
+                    label,
+                    input: screen::initial_input(act, &pick),
+                    pick,
+                };
+                None
+            }
+            Ask::Choose(label) => Some(Request::Choose { act, pick, label }),
+            Ask::Confirm => match screen::action_in(act, &pick, &pane, "", &self.project) {
+                Ok(action) => {
+                    self.mode = Mode::Confirm {
+                        action,
+                        question: screen::question(act, &pick),
+                    };
+                    None
+                }
+                Err(e) => {
+                    self.say(e, Tone::Bad);
+                    None
+                }
+            },
+            Ask::Nothing => self.ask_done(act, &pick, &pane, ""),
+        }
     }
 
     fn ask_done(&mut self, act: Act, pick: &Pick, pane: &[Item], input: &str) -> Option<Request> {
@@ -456,6 +597,13 @@ impl App {
             }
             Mode::Confirm { question, .. } => self.render_confirm(frame, &question),
             Mode::Prompt { label, input, .. } => self.render_prompt(frame, label, &input),
+            Mode::Choose {
+                label,
+                choices,
+                at,
+                on,
+                ..
+            } => self.render_choose(frame, body, label, &choices, at, &on),
             Mode::Normal => {}
         }
     }
@@ -516,11 +664,26 @@ impl App {
                 return hints(p, &[("Enter", "submit"), ("Esc", "cancel")]);
             }
             Mode::Confirm { .. } => return hints(p, &[("y", "yes"), ("any key", "no")]),
-            Mode::Detail { .. } => {
-                return hints(
-                    p,
-                    &[("j/k", "scroll"), ("PgDn/PgUp", "page"), ("Esc", "close")],
-                );
+            Mode::Choose { choices, .. } => {
+                let mut pairs = vec![("j/k", "move")];
+                pairs.extend(choices.flags.iter().map(|f| (f.key, f.label)));
+                pairs.extend([("Enter", "start"), ("Esc", "cancel")]);
+                return hints(p, &pairs);
+            }
+            Mode::Detail { screen, .. } => {
+                let pick = match &screen.body {
+                    Body::Detail(d) => d.pick.clone(),
+                    Body::Panes(_) => Pick::Nothing,
+                };
+                let mut pairs: Vec<(&str, &str)> = keys::on_tab(self.tab)
+                    .iter()
+                    .filter(|b| {
+                        matches!(b.command, Command::Act(a) if a.on_row() && screen::fits(a, &pick))
+                    })
+                    .map(|b| (b.key, b.label))
+                    .collect();
+                pairs.extend([("j/k", "scroll"), ("PgDn/PgUp", "page"), ("Esc", "close")]);
+                return hints(p, &pairs);
             }
             Mode::Help => return hints(p, &[("any key", "close")]),
             Mode::Normal => {}
@@ -534,7 +697,9 @@ impl App {
             .iter()
             .filter(|b| match b.command {
                 Command::Act(a) => a.on_row() && screen::fits(a, &pick),
-                Command::Open => matches!(pick, Pick::Run { .. } | Pick::Job { .. }),
+                Command::Open => {
+                    matches!(pick, Pick::Run { .. } | Pick::Job { .. }) || pick.project().is_some()
+                }
                 Command::OpenProject => pick.project().is_some(),
                 _ => false,
             })
@@ -553,9 +718,9 @@ impl App {
         let [lists, preview] =
             Layout::vertical([Constraint::Min(4), Constraint::Length(3)]).areas(area);
         let t = index(self.tab);
-        let areas: Vec<Rect> = match panes.len() {
+        let areas: Vec<Rect> = match (self.tab, panes.len()) {
             // The matrix: urgent on the left, important on top.
-            4 => {
+            (Tab::Matrix, 4) => {
                 let [upper, lower] =
                     Layout::vertical([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
                         .areas(lists);
@@ -884,6 +1049,83 @@ impl App {
         );
     }
 
+    /// The list for an act: one line per option, its name and what it does,
+    /// and the flags with their state.
+    fn render_choose(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        label: &str,
+        choices: &api::Choices,
+        at: usize,
+        on: &[bool],
+    ) {
+        let p = self.palette;
+        let width = choices
+            .options
+            .iter()
+            .map(|c| c.name.chars().count())
+            .max()
+            .unwrap_or(0);
+        let mut lines: Vec<Line> = choices
+            .options
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let chosen = i == at;
+                let mark = match chosen {
+                    true => Span::styled("> ", p.accent().add_modifier(Modifier::BOLD)),
+                    false => Span::raw("  "),
+                };
+                let name = Span::styled(
+                    format!("{:<width$}  ", c.name),
+                    match chosen {
+                        true => p.accent().add_modifier(Modifier::BOLD),
+                        false => Style::new().add_modifier(Modifier::BOLD),
+                    },
+                );
+                Line::from(vec![mark, name, Span::styled(c.about.clone(), p.muted())])
+            })
+            .collect();
+        if !choices.flags.is_empty() {
+            lines.push(Line::raw(""));
+            let mut spans = Vec::new();
+            for (f, on) in choices.flags.iter().zip(on) {
+                spans.push(Span::styled(
+                    match on {
+                        true => "[x] ",
+                        false => "[ ] ",
+                    },
+                    match on {
+                        true => p.tone(Tone::Good),
+                        false => p.muted(),
+                    },
+                ));
+                spans.push(Span::styled(
+                    f.key.to_string(),
+                    p.accent().add_modifier(Modifier::BOLD),
+                ));
+                spans.push(Span::raw(format!(" {}    ", f.label)));
+            }
+            lines.push(Line::from(spans));
+        }
+        let height = (lines.len() as u16 + 2).min(area.height);
+        let longest = lines.iter().map(Line::width).max().unwrap_or(0) as u16 + 4;
+        let area = centered(area, longest.min(area.width), height);
+        frame.render_widget(Clear, area);
+        frame.render_widget(
+            Paragraph::new(lines)
+                .scroll((
+                    at.saturating_sub(height.saturating_sub(3) as usize) as u16,
+                    0,
+                ))
+                .block(
+                    dialog(p, &format!(" {label} "), p.accent()).padding(Padding::horizontal(1)),
+                ),
+            area,
+        );
+    }
+
     fn render_prompt(&self, frame: &mut Frame, label: &str, input: &str) {
         let p = self.palette;
         let area = centered(frame.area(), 70.min(frame.area().width), 5);
@@ -1057,6 +1299,14 @@ fn execute(store: &Store, app: &mut App, request: Request) {
             let q = app.query();
             app.loaded(api::query(store, q).map_err(|e| e.to_string()));
         }
+        Request::Choose { act, pick, label } => {
+            app.offered(
+                act,
+                pick,
+                label,
+                api::choices(store, act).map_err(|e| e.to_string()),
+            );
+        }
         Request::Quit => {}
     }
 }
@@ -1093,9 +1343,11 @@ pub fn run(store: &Store) -> Result<()> {
                 false => Duration::from_secs(30),
             };
             if !event::poll(Duration::from_secs(1))? {
-                let changed = watch
-                    .as_mut()
-                    .is_some_and(|w| matches!(w.poll(store), Ok(Some(_))));
+                let moved = watch.as_mut().and_then(|w| w.poll(store).ok().flatten());
+                let changed = moved.is_some();
+                if let Some(moved) = moved {
+                    app.noticed(&moved);
+                }
                 if (changed || loaded.elapsed() >= cadence) && app.idle() {
                     let again = Request::Load(app.query());
                     execute(store, &mut app, again);
@@ -1183,39 +1435,43 @@ mod tests {
         View::Next {
             header: "last scan just now".into(),
             limit: None,
-            lists: Next {
-                agents: vec![NextRow {
-                    cells: vec![
-                        "a:5".into(),
-                        "T1".into(),
-                        "critical".into(),
-                        "open 3d".into(),
-                        "text of a".into(),
-                    ],
-                    command: Some("pma dispatch a:5".into()),
-                    subject: Subject::Task {
-                        project: "a".into(),
-                        target: "a:5".into(),
-                        retry: false,
-                    },
-                }],
-                runs: vec![NextRow {
-                    cells: vec![
-                        "#4".into(),
-                        "ready".into(),
-                        "to review".into(),
-                        "b".into(),
-                        "a run".into(),
-                    ],
-                    command: Some("pma review 4".into()),
-                    subject: Subject::Run {
-                        id: 4,
-                        state: "ready".into(),
-                        project: "b".into(),
-                    },
-                }],
-                tasks: vec![],
-            },
+            lists: next_view_lists(),
+        }
+    }
+
+    fn next_view_lists() -> Next {
+        Next {
+            agents: vec![NextRow {
+                cells: vec![
+                    "a:5".into(),
+                    "T1".into(),
+                    "critical".into(),
+                    "open 3d".into(),
+                    "text of a".into(),
+                ],
+                command: Some("pma dispatch a:5".into()),
+                subject: Subject::Task {
+                    project: "a".into(),
+                    target: "a:5".into(),
+                    retry: false,
+                },
+            }],
+            runs: vec![NextRow {
+                cells: vec![
+                    "#4".into(),
+                    "ready".into(),
+                    "to review".into(),
+                    "b".into(),
+                    "a run".into(),
+                ],
+                command: Some("pma review 4".into()),
+                subject: Subject::Run {
+                    id: 4,
+                    state: "ready".into(),
+                    project: "b".into(),
+                },
+            }],
+            tasks: vec![],
         }
     }
 
@@ -1231,6 +1487,7 @@ mod tests {
             pid: None,
             exit_code: None,
             awaiting: None,
+            project: None,
         }
     }
 
@@ -1239,7 +1496,7 @@ mod tests {
     #[test]
     fn tabs_load_and_keys_act_on_the_selection() {
         let mut app = App::new();
-        assert_eq!(app.query(), Tab::Next.query(By::Class, ""));
+        assert_eq!(app.query(), Tab::Inbox.query(By::Class, ""));
         app.loaded(Ok(next_view()));
         let out = screen_text(&mut app);
         assert!(
@@ -1264,8 +1521,12 @@ mod tests {
         assert_eq!(targets, ["a:5"]);
 
         app.key("Tab");
-        assert_eq!(app.key("Enter"), None, "not a key on next");
-        assert_eq!(app.key("4"), Some(Request::Load(Query::Jobs)));
+        assert_eq!(
+            app.key("Enter"),
+            Some(Request::Load(Query::Run { id: 4 })),
+            "opens the waiting run"
+        );
+        assert_eq!(app.key("3"), Some(Request::Load(Query::Activity)));
         app.loaded(Ok(View::Jobs(vec![
             job(7, "awaiting-approval"),
             job(6, "done"),
@@ -1289,6 +1550,7 @@ mod tests {
         app.loaded(Ok(View::JobLog {
             id: 6,
             text: Some("plan abc".into()),
+            awaiting: false,
         }));
         assert!(!app.idle(), "a detail holds off refreshes");
         assert!(screen_text(&mut app).contains("plan abc"));
@@ -1304,6 +1566,13 @@ mod tests {
         let mut app = App::new();
         app.loaded(Ok(next_view()));
         assert_eq!(
+            app.key("Enter"),
+            Some(Request::Load(Query::Project { name: "a".into() })),
+            "Enter on a task is `o`"
+        );
+        assert_eq!(app.tab, Tab::Project);
+        app.key("Escape");
+        assert_eq!(
             app.key("o"),
             Some(Request::Load(Query::Project { name: "a".into() }))
         );
@@ -1315,15 +1584,55 @@ mod tests {
         let Some(Request::Act(Action::Scan { of, .. })) = app.key("r") else {
             panic!("a rescan");
         };
+        app.loaded(Ok(View::Project {
+            name: "a".into(),
+            path: "/a".into(),
+            scanned_at: None,
+            tags: vec![],
+            verify: None,
+            status: None,
+            placed: vec![pma_core::rank::Placed {
+                task: pma_core::rank::Task {
+                    project: "a".into(),
+                    tier: 1,
+                    priority: pma_core::todo::Priority::High,
+                    text: "text of a".into(),
+                    line: Some(5),
+                    key: Some("k".into()),
+                    group: None,
+                    due: None,
+                    tagged_urgent: false,
+                    signal_urgent: false,
+                    age_days: 0,
+                    eligible: true,
+                    manual: false,
+                },
+                importance: 1.0,
+                urgency: None,
+                quadrant: pma_core::rank::Quadrant::Q1,
+            }],
+            today: 0,
+            runs: vec![],
+            jobs: vec![],
+            state: std::env::temp_dir(),
+        }));
+        assert_eq!(
+            app.key("Enter"),
+            Some(Request::Load(Query::Task {
+                project: "a".into(),
+                line: Some(5),
+                key: None,
+            })),
+            "in its project, Enter opens the task in full"
+        );
         assert_eq!(of.projects, ["a"], "that project, not the portfolio");
         assert_eq!(
             app.key("Escape"),
-            Some(Request::Load(Query::Next {
+            Some(Request::Load(Query::Inbox {
                 of: api::Selection::default(),
-                all: true
             }))
         );
-        assert_eq!(app.tab, Tab::Next);
+        assert_eq!(app.tab, Tab::Inbox);
     }
 
     /// Meaning is coloured: a critical priority red, a run waiting on you
@@ -1347,7 +1656,7 @@ mod tests {
     #[test]
     fn prompts_read_text_for_the_action() {
         let mut app = App::new();
-        app.key("9");
+        app.key("7");
         app.loaded(Ok(View::Notes(vec![Note {
             id: 3,
             created_at: 0,
@@ -1400,7 +1709,11 @@ mod tests {
     #[test]
     fn a_diff_is_coloured_by_line() {
         let mut app = colour(App::new());
-        app.loaded(Ok(View::JobLog { id: 1, text: None }));
+        app.loaded(Ok(View::JobLog {
+            id: 1,
+            text: None,
+            awaiting: false,
+        }));
         let Mode::Detail { screen: s, .. } = app.mode.clone() else {
             panic!("a detail");
         };
@@ -1481,6 +1794,21 @@ mod tests {
                     input: "x".into(),
                     pick: Pick::Nothing,
                 },
+                Mode::Choose {
+                    act: Act::Run,
+                    label: "run",
+                    pick: Pick::Nothing,
+                    choices: api::Choices {
+                        options: vec![pma_core::catalog::Choice {
+                            name: "review".into(),
+                            reads: "project".into(),
+                            about: "Review".into(),
+                        }],
+                        flags: vec![],
+                    },
+                    at: 0,
+                    on: vec![],
+                },
             ];
             for mode in modes {
                 app.mode = mode.clone();
@@ -1490,6 +1818,127 @@ mod tests {
                     .unwrap_or_else(|e| panic!("{w}x{h} {mode:?}: {e}"));
             }
         }
+    }
+
+    /// `z` asks for the list of names; the choice and its toggled flags
+    /// build the run, on the project in view.
+    #[test]
+    fn a_run_is_chosen_from_the_list() {
+        let mut app = App::new();
+        app.tab = Tab::Project;
+        app.project = "spore".into();
+        let Some(Request::Choose { act, label, .. }) = app.key("z") else {
+            panic!("a list");
+        };
+        assert_eq!((act, label), (Act::Run, "run"));
+        let choice = |name: &str, about: &str| pma_core::catalog::Choice {
+            name: name.into(),
+            reads: "project".into(),
+            about: about.into(),
+        };
+        let choices = api::Choices {
+            options: vec![
+                choice("review", "Review a project"),
+                choice("fix-ci", "Fix failing CI"),
+            ],
+            flags: vec![api::Flag {
+                key: "p",
+                arg: "--push",
+                label: "push when clean",
+            }],
+        };
+        app.offered(Act::Run, Pick::Nothing, "run", Ok(choices));
+        assert!(!app.idle());
+        let out = screen_text(&mut app);
+        assert!(
+            out.contains("> review") && out.contains("[ ] p push when clean"),
+            "{out}"
+        );
+        app.key("j");
+        app.key("p");
+        assert!(screen_text(&mut app).contains("[x] p"));
+        let Some(Request::Act(Action::Run {
+            name,
+            project,
+            push,
+            ..
+        })) = app.key("Enter")
+        else {
+            panic!("a run");
+        };
+        assert_eq!(
+            (name.as_str(), project.as_str(), push),
+            ("fix-ci", "spore", true)
+        );
+        app.offered(Act::Run, Pick::Nothing, "run", Err("no store".into()));
+        assert!(app.status.as_ref().unwrap().0.contains("no store"));
+        assert!(app.idle());
+    }
+
+    /// Inside a run's detail its acts apply: `u` on a ready run, after
+    /// reading its diff, asks to approve and push it.
+    #[test]
+    fn acts_apply_inside_a_detail() {
+        let mut app = App::new();
+        app.loaded(Ok(next_view()));
+        app.key("Tab");
+        assert_eq!(app.key("Enter"), Some(Request::Load(Query::Run { id: 4 })));
+        app.loaded(Ok(View::Run {
+            run: Box::new(pma_core::store::Run {
+                id: 4,
+                project: "b".into(),
+                text: "a run".into(),
+                state: pma_core::store::RunState::Ready,
+                ..Default::default()
+            }),
+            attempts: vec![],
+            changelog: None,
+            diff: "+hi".into(),
+            moved: false,
+        }));
+        let text = screen_text(&mut app);
+        assert!(
+            text.contains("u push") && text.contains("+hi"),
+            "the footer offers the run's acts: {text}"
+        );
+        assert_eq!(app.key("u"), None);
+        assert!(screen_text(&mut app).contains("approve and push #4?"));
+        let Some(Request::Act(Action::Publish { ids, target, .. })) = app.key("y") else {
+            panic!("a push");
+        };
+        assert_eq!((ids, target), (vec![4], pma_core::publish::Target::Push));
+    }
+
+    /// A run reaching review is named in the footer and Enter opens it;
+    /// any other key lets it go.
+    #[test]
+    fn a_noticed_run_opens_on_enter() {
+        let mut app = App::new();
+        app.loaded(Ok(next_view()));
+        app.noticed(&[api::Transition {
+            kind: "run",
+            id: 9,
+            project: "spore".into(),
+            text: "fix CI".into(),
+            state: "ready".into(),
+        }]);
+        assert!(
+            screen_text(&mut app).contains("#9 spore: ready for review: fix CI  (Enter opens it)")
+        );
+        assert_eq!(app.key("Enter"), Some(Request::Load(Query::Run { id: 9 })));
+        app.noticed(&[api::Transition {
+            kind: "job",
+            id: 2,
+            project: String::new(),
+            text: "pma scan".into(),
+            state: "done".into(),
+        }]);
+        app.key("j");
+        assert_eq!(
+            app.key("Enter"),
+            Some(Request::Load(Query::Project { name: "a".into() })),
+            "the notice is gone; Enter opens the task's project"
+        );
     }
 
     #[test]

@@ -194,10 +194,10 @@ pma status --all                # untiered projects too, when default_tier is ne
 pma status --all --html s.html  # the same, with the last scan's changes, as one HTML page
 pma history                     # past scans; `pma history last` for what the latest changed
 pma stale                       # open items by age, oldest first
-pma tui                         # every view and action; 0-9 switch tabs, ? lists keys, q quits
+pma tui                         # every view and action; 1-7 switch tabs, ? lists keys, q quits
 pma web                         # the same in a browser, on 127.0.0.1 behind a one-time token
 pma web --app                   # as an app window, in Chrome or Chromium
-pma project show myproject      # one project: state, open tasks, runs; `o` in the TUI and web
+pma project show myproject      # one project: state, open tasks, runs and jobs; `o` in the TUI and web
 pma web --no-open --port 9000   # for `ssh -L 9000:127.0.0.1:9000 host` from another machine
 pma note add "move CI to a reusable workflow"
 ```

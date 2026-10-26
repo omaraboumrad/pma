@@ -6,52 +6,48 @@
 
 use crate::api::{Action, Query, Selection};
 use crate::report_runs::By;
+use crate::screen::{self, Pick};
 
 /// A screen: one query, rendered as a list or as text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Tab {
-    Next,
+    /// What waits on you, what is under way, and what agents can take.
+    Inbox,
+    /// Every project, worst first.
+    Projects,
+    /// Jobs, running agents and workflow instances, newest first.
+    Activity,
     Matrix,
-    Runs,
-    Jobs,
-    Agents,
-    Workflows,
-    Campaigns,
+    /// Workflow revisions and campaigns: what can be run.
+    Library,
     Report,
     Notes,
-    Status,
     /// One project, opened from a row that names it. It has no key of its
     /// own: which project is the front end's to remember.
     Project,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 11] = [
-        Tab::Next,
+    pub const ALL: [Tab; 8] = [
+        Tab::Inbox,
+        Tab::Projects,
+        Tab::Activity,
         Tab::Matrix,
-        Tab::Runs,
-        Tab::Jobs,
-        Tab::Agents,
-        Tab::Workflows,
-        Tab::Campaigns,
+        Tab::Library,
         Tab::Report,
         Tab::Notes,
-        Tab::Status,
         Tab::Project,
     ];
 
     pub fn title(self) -> &'static str {
         match self {
-            Tab::Next => "next",
+            Tab::Inbox => "inbox",
+            Tab::Projects => "projects",
+            Tab::Activity => "activity",
             Tab::Matrix => "matrix",
-            Tab::Runs => "runs",
-            Tab::Jobs => "jobs",
-            Tab::Agents => "agents",
-            Tab::Workflows => "workflows",
-            Tab::Campaigns => "campaigns",
+            Tab::Library => "library",
             Tab::Report => "report",
             Tab::Notes => "notes",
-            Tab::Status => "status",
             Tab::Project => "project",
         }
     }
@@ -61,26 +57,23 @@ impl Tab {
     pub fn query(self, by: By, project: &str) -> Query {
         let of = Selection::default();
         match self {
-            Tab::Next => Query::Next { of, all: true },
+            Tab::Inbox => Query::Inbox { of },
+            // Every project, untiered ones too: it is the list a project is
+            // opened from.
+            Tab::Projects => Query::Status {
+                of,
+                explain: false,
+                all: true,
+            },
+            Tab::Activity => Query::Activity,
             Tab::Matrix => Query::Matrix {
                 of,
                 quadrant: None,
                 all: true,
             },
-            Tab::Runs => Query::Runs,
-            Tab::Jobs => Query::Jobs,
-            Tab::Agents => Query::Agents,
-            Tab::Workflows => Query::Workflows,
-            Tab::Campaigns => Query::Campaigns,
+            Tab::Library => Query::Library,
             Tab::Report => Query::Report { by },
             Tab::Notes => Query::Notes,
-            // Every project, untiered ones too: it is the list a project is
-            // opened from.
-            Tab::Status => Query::Status {
-                of,
-                explain: false,
-                all: true,
-            },
             Tab::Project => Query::Project {
                 name: project.to_string(),
             },
@@ -223,7 +216,8 @@ pub enum Command {
     /// The next list on a tab with several.
     NextPane,
     PrevPane,
-    /// The selected item in full: a run's diff, a job's log.
+    /// The selected item in full: a run's diff, a job's log; a task's
+    /// project.
     Open,
     /// Closes what `Open` or a prompt opened.
     Back,
@@ -244,6 +238,8 @@ pub enum Ask {
     Confirm,
     /// A line of text, with this label.
     Text(&'static str),
+    /// One of a list `api::choices` gives, plus its flags, with this label.
+    Choose(&'static str),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -282,27 +278,25 @@ const fn on(
     }
 }
 
-const TASKS: &[Tab] = &[Tab::Next, Tab::Matrix, Tab::Project];
+const TASKS: &[Tab] = &[Tab::Inbox, Tab::Matrix, Tab::Project];
 const PANES: &[Tab] = &[
-    Tab::Next,
+    Tab::Inbox,
+    Tab::Activity,
     Tab::Matrix,
-    Tab::Agents,
-    Tab::Workflows,
+    Tab::Library,
     Tab::Project,
 ];
-const RUNS: &[Tab] = &[Tab::Runs, Tab::Project];
+const RUNS: &[Tab] = &[Tab::Inbox, Tab::Project];
+const JOBS: &[Tab] = &[Tab::Inbox, Tab::Activity, Tab::Project];
 
 pub const BINDINGS: &[Binding] = &[
-    bind("1", Command::Tab(Tab::Next), "next"),
-    bind("2", Command::Tab(Tab::Matrix), "matrix"),
-    bind("3", Command::Tab(Tab::Runs), "runs"),
-    bind("4", Command::Tab(Tab::Jobs), "jobs"),
-    bind("5", Command::Tab(Tab::Agents), "agents"),
-    bind("6", Command::Tab(Tab::Workflows), "workflows"),
-    bind("7", Command::Tab(Tab::Campaigns), "campaigns"),
-    bind("8", Command::Tab(Tab::Report), "report"),
-    bind("9", Command::Tab(Tab::Notes), "notes"),
-    bind("0", Command::Tab(Tab::Status), "status"),
+    bind("1", Command::Tab(Tab::Inbox), "inbox"),
+    bind("2", Command::Tab(Tab::Projects), "projects"),
+    bind("3", Command::Tab(Tab::Activity), "activity"),
+    bind("4", Command::Tab(Tab::Matrix), "matrix"),
+    bind("5", Command::Tab(Tab::Library), "library"),
+    bind("6", Command::Tab(Tab::Report), "report"),
+    bind("7", Command::Tab(Tab::Notes), "notes"),
     bind("j", Command::Down, "down"),
     bind("ArrowDown", Command::Down, "down"),
     bind("k", Command::Up, "up"),
@@ -323,12 +317,19 @@ pub const BINDINGS: &[Binding] = &[
         tabs: PANES,
         ..bind("h", Command::PrevPane, "previous list")
     },
+    // A run or a job in full; a task's project.
     Binding {
-        tabs: &[Tab::Runs, Tab::Jobs, Tab::Project],
+        tabs: &[
+            Tab::Inbox,
+            Tab::Projects,
+            Tab::Activity,
+            Tab::Matrix,
+            Tab::Project,
+        ],
         ..bind("Enter", Command::Open, "open")
     },
     Binding {
-        tabs: &[Tab::Next, Tab::Matrix, Tab::Runs, Tab::Agents, Tab::Status],
+        tabs: &[Tab::Inbox, Tab::Projects, Tab::Activity, Tab::Matrix],
         ..bind("o", Command::OpenProject, "open project")
     },
     bind("Escape", Command::Back, "back"),
@@ -352,9 +353,9 @@ pub const BINDINGS: &[Binding] = &[
     // A project: the one in view, or the selected row's.
     on(
         "z",
-        &[Tab::Project, Tab::Status, Tab::Next, Tab::Matrix],
+        &[Tab::Project, Tab::Projects, Tab::Inbox, Tab::Matrix],
         Act::Run,
-        Ask::Text("name [--review] [--worktree] [--push]"),
+        Ask::Choose("run"),
         "run",
     ),
     // A task.
@@ -377,33 +378,28 @@ pub const BINDINGS: &[Binding] = &[
     on("p", RUNS, Act::Pr, Ask::Confirm, "pull request"),
     on("u", RUNS, Act::Push, Ask::Confirm, "push"),
     on("y", RUNS, Act::SettlePrs, Ask::Nothing, "check PRs"),
-    // A job.
-    on(
-        "a",
-        &[Tab::Jobs],
-        Act::ApproveJob,
-        Ask::Nothing,
-        "approve plan",
-    ),
-    on("s", &[Tab::Jobs], Act::StopJob, Ask::Confirm, "stop"),
+    // A job. `a` and `s` are a run's keys too: a key means one thing for
+    // the row it is pressed on, and `lookup` tells them apart by the row.
+    on("a", JOBS, Act::ApproveJob, Ask::Nothing, "approve plan"),
+    on("s", JOBS, Act::StopJob, Ask::Confirm, "stop"),
     // A workflow instance.
     on(
         "r",
-        &[Tab::Workflows],
+        &[Tab::Activity],
         Act::ResumeWorkflow,
         Ask::Nothing,
         "resume",
     ),
     on(
         "f",
-        &[Tab::Workflows],
+        &[Tab::Activity, Tab::Library],
         Act::StartWorkflow,
         Ask::Text("workflow target [--local] [--unattended]"),
-        "start",
+        "start workflow",
     ),
     on(
         "s",
-        &[Tab::Workflows],
+        &[Tab::Activity],
         Act::StopWorkflow,
         Ask::Confirm,
         "stop",
@@ -411,25 +407,45 @@ pub const BINDINGS: &[Binding] = &[
     // A campaign.
     on(
         "r",
-        &[Tab::Campaigns],
+        &[Tab::Library],
         Act::RunCampaign,
         Ask::Confirm,
-        "run",
+        "run campaign",
     ),
     // A note.
     on("e", &[Tab::Notes], Act::EditNote, Ask::Text("note"), "edit"),
     on("x", &[Tab::Notes], Act::RemoveNote, Ask::Confirm, "remove"),
 ];
 
-/// The binding `key` has on `tab`. One applying to that tab alone wins over
-/// one applying everywhere.
-pub fn lookup(key: &str, tab: Tab) -> Option<&'static Binding> {
+/// The binding `key` has on `tab` for a row about `pick`. One applying to
+/// that tab alone wins over one applying everywhere; among those, an act
+/// that fits the row wins, then a command that is not an act, then the
+/// first, so a key for the wrong row says what it needs.
+pub fn lookup(key: &str, tab: Tab, pick: &Pick) -> Option<&'static Binding> {
     let fits = |b: &&Binding| b.key == key;
-    BINDINGS
+    let on_tab: Vec<&Binding> = BINDINGS
         .iter()
         .filter(fits)
-        .find(|b| b.tabs.contains(&tab))
-        .or_else(|| BINDINGS.iter().filter(fits).find(|b| b.tabs.is_empty()))
+        .filter(|b| b.tabs.contains(&tab))
+        .collect();
+    let candidates = match on_tab.is_empty() {
+        false => on_tab,
+        true => BINDINGS
+            .iter()
+            .filter(fits)
+            .filter(|b| b.tabs.is_empty())
+            .collect(),
+    };
+    candidates
+        .iter()
+        .find(|b| matches!(b.command, Command::Act(a) if screen::fits(a, pick)))
+        .or_else(|| {
+            candidates
+                .iter()
+                .find(|b| !matches!(b.command, Command::Act(_)))
+        })
+        .or_else(|| candidates.first())
+        .copied()
 }
 
 /// The bindings that apply on `tab`, for a help screen.
@@ -466,18 +482,66 @@ mod tests {
         );
     }
 
-    /// One key means one thing on a tab: two bindings for the same tab, or a
-    /// tab binding that hides an everywhere binding, would make it ambiguous.
+    /// One key means one thing for a row: two bindings for the same key on
+    /// one tab must be acts on rows, and no row can fit both. A tab binding
+    /// hiding an everywhere binding would make it ambiguous too.
     #[test]
-    fn no_key_means_two_things_on_one_tab() {
+    fn no_key_means_two_things_for_one_row() {
+        let samples = [
+            Pick::Nothing,
+            Pick::Task {
+                project: "p".into(),
+                target: "p:1".into(),
+                retry: false,
+            },
+            Pick::Manual {
+                project: "p".into(),
+            },
+            Pick::Run {
+                id: 1,
+                clean: true,
+                state: "ready".into(),
+                project: "p".into(),
+            },
+            Pick::Job {
+                id: 1,
+                awaiting: true,
+            },
+            Pick::Instance {
+                id: 1,
+                workflow: "w".into(),
+                open: true,
+            },
+            Pick::Note {
+                id: 1,
+                text: "t".into(),
+            },
+            Pick::Campaign { name: "c".into() },
+        ];
         for tab in Tab::ALL {
-            let keys: Vec<&str> = on_tab(tab).iter().map(|b| b.key).collect();
+            let on = on_tab(tab);
+            let keys: Vec<&str> = on.iter().map(|b| b.key).collect();
             for k in &keys {
-                assert_eq!(
-                    keys.iter().filter(|x| *x == k).count(),
-                    1,
-                    "`{k}` is bound twice on {tab:?}"
+                let same: Vec<&&Binding> = on.iter().filter(|b| b.key == *k).collect();
+                if same.len() == 1 {
+                    continue;
+                }
+                assert!(
+                    same.iter().all(|b| b.tabs.contains(&tab)),
+                    "`{k}` on {tab:?} is bound for the tab and for everywhere"
                 );
+                for pick in &samples {
+                    let fitting = same
+                        .iter()
+                        .filter(|b| {
+                            matches!(b.command, Command::Act(a) if a.on_row() && screen::fits(a, pick))
+                        })
+                        .count();
+                    assert!(
+                        fitting <= 1,
+                        "`{k}` on {tab:?} means two things for {pick:?}"
+                    );
+                }
             }
         }
     }
@@ -494,18 +558,37 @@ mod tests {
     }
 
     #[test]
-    fn lookup_prefers_the_tab() {
+    fn lookup_prefers_the_tab_then_the_row() {
+        let job = Pick::Job {
+            id: 1,
+            awaiting: true,
+        };
+        let run = Pick::Run {
+            id: 1,
+            clean: true,
+            state: "ready".into(),
+            project: "p".into(),
+        };
         assert_eq!(
-            lookup("a", Tab::Jobs).map(|b| b.command),
+            lookup("a", Tab::Activity, &Pick::Nothing).map(|b| b.command),
             Some(Command::Act(Act::ApproveJob))
         );
         assert_eq!(
-            lookup("a", Tab::Runs).map(|b| b.command),
+            lookup("a", Tab::Inbox, &run).map(|b| b.command),
             Some(Command::Act(Act::ApproveRun))
         );
-        assert!(lookup("a", Tab::Next).is_none());
         assert_eq!(
-            lookup("c", Tab::Notes).map(|b| b.command),
+            lookup("a", Tab::Inbox, &job).map(|b| b.command),
+            Some(Command::Act(Act::ApproveJob))
+        );
+        assert_eq!(
+            lookup("a", Tab::Inbox, &Pick::Nothing).map(|b| b.command),
+            Some(Command::Act(Act::ApproveRun)),
+            "the first, so the error names a run"
+        );
+        assert!(lookup("a", Tab::Notes, &run).is_none());
+        assert_eq!(
+            lookup("c", Tab::Notes, &Pick::Nothing).map(|b| b.command),
             Some(Command::Act(Act::Scan))
         );
     }

@@ -4,6 +4,9 @@
 
 ## High
 
+- [ ] Admin from the TUI and the web
+  Still CLI-only: project tier, tags, verify command, sandbox and roots; `pma config` keys; routes, presets and agents; campaign creation; deps refresh; history; lint; prune. Each needs an `Action` or `Query` in `pma-core` and a key, as the operating acts have (`docs/dev/frontends.md`).
+
 - [x] `pma report` counts `applied` runs as neither accepted nor landed
   21 runs in state `applied` (`--local` workflow fixes on `xtgen` and `argdec`) are missing from the headline, which reads "25% of 8 decided runs accepted, 2 landed". Count `applied` as landed, or give it its own column, and name it in the headline. (REVIEW.md U2)
 
@@ -23,6 +26,9 @@
   deps covers `cargo`, `uv` and `go` (`crates/pma-core/src/deps.rs:24-26`). Without `uv.lock`, verify detection picks `python3 -m pytest` (`crates/pma-core/src/agent.rs:263-268`), likely without the project's dependencies (unverified). The README's Requirements now state what is supported. (REVIEW.md U7)
 
 ## Medium
+
+- [ ] Click through the web page after the drawer removal #manual
+  The 2026-10-26 rewrite (toolbar acts, in-place detail, chooser, toasts with Open) had a syntax check and the server tests only; no Chrome on the machine. Try run, the chooser, a run detail, a toast's Open button, and the 1100 px and 720 px widths.
 
 - [ ] Show open pull requests and issues opened by others as signal tasks
   `scan` reads only CI from GitHub (`crates/pma-core/src/scan.rs:680`), and `sync` lists issues by others as untriaged but ranks none. A project with unanswered contributor pull requests shows as `clear`. Read them with `gh pr list` and `gh issue list` during `scan`, rank them by age, and do not make them dispatchable by default. (REVIEW.md U6)
@@ -61,6 +67,12 @@
   `Worker::resumes` is stored, settable and listed by `pma agent`, but no dispatch path reads it (`crates/pma-core/src/worker.rs:210`). `opencode()` sets it `true`, so the listing claims a feature pma lacks. A `{session}` placeholder in worker args (`claude --session-id <uuid>`, as wallfacer does) plus a session column on the run would let a rework continue the earlier session instead of re-prompting, and let `pma review N --open` hand the terminal to `claude --resume <id>` in the worktree. Takeover must run under the `agent::restrict` environment, or it gains push credentials. Open: does a `-p` session resume interactively; does a `sanduk` transcript survive its container; what is opencode's flag. If neither use is wanted, delete the field.
 
 ## Low
+
+- [ ] The TUI footer names only the last transition of a batch #agent
+  `App::noticed` keeps the last of what one `Watch::poll` returned. Three runs reaching review within a second name one. Queue them, or name the count.
+
+- [ ] A CLI command that opens a task in full #agent
+  `Query::Task` serves the TUI and the web only. `pma project show` lists tasks one line each. A `pma task <project:line>` would print what the detail shows.
 
 - [ ] Mark commands without a recorded pilot as experimental in `--help` and the README
   34 top-level commands; routes and campaigns have no recorded runs. (REVIEW.md U11)

@@ -25,19 +25,30 @@ pub fn current() -> Option<i64> {
 }
 
 /// Queues this invocation, less `--detach`, and makes sure a runner will
-/// take it.
-pub fn enqueue(store: &Store) -> Result<()> {
+/// take it. `targets` are the command's project arguments; one names the
+/// job's project, for that project's view.
+pub fn enqueue(store: &Store, targets: &[String]) -> Result<()> {
     let args: Vec<String> = std::env::args()
         .skip(1)
         .filter(|a| a != "--detach")
         .collect();
-    let id = queue(store, &args, &std::env::current_dir()?)?;
+    let project = match targets {
+        [one] => Some(one.split(':').next().unwrap_or(one)),
+        _ => None,
+    };
+    let id = queue(store, &args, &std::env::current_dir()?, project)?;
     println!("job {id} queued; `pma job` lists jobs and `pma job log {id}` shows its output");
     Ok(())
 }
 
-pub fn queue(store: &Store, args: &[String], cwd: &std::path::Path) -> Result<i64> {
-    let id = store.add_job(args, cwd)?;
+/// `project` is the one the command is about, for the project's view.
+pub fn queue(
+    store: &Store,
+    args: &[String],
+    cwd: &std::path::Path,
+    project: Option<&str>,
+) -> Result<i64> {
+    let id = store.add_job(args, cwd, project)?;
     spawn_runner()?;
     Ok(id)
 }
@@ -53,7 +64,7 @@ pub fn approve(store: &Store, id: i64) -> Result<String> {
     if !store.approve_job(id)? {
         return Err(format!("job {id} was approved already").into());
     }
-    let next = queue(store, &args, &job.cwd)?;
+    let next = queue(store, &args, &job.cwd, job.project.as_deref())?;
     Ok(format!("job {next} queued: pma {}", args.join(" ")))
 }
 

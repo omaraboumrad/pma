@@ -260,8 +260,10 @@ enum Command {
         /// Run a bulk selection without stopping at its plan.
         #[arg(long, conflicts_with = "dry_run")]
         yes: bool,
-        /// For `fix-ci` and `deps-upgrade`: leave each edit in `pma review`
-        /// instead of writing it into the clone.
+        /// With `--worktree`, or `workspace = worktree`: leave each edit of
+        /// `fix-ci` and `deps-upgrade` in `pma review` instead of writing it
+        /// into the clone. A run in the clone waits in `pma review` either
+        /// way.
         #[arg(long)]
         review: bool,
         /// Edit in a worktree of the remote default branch rather than in
@@ -962,9 +964,11 @@ fn main() -> ExitCode {
             worktree,
             push,
         }),
-        Command::Dispatch { detach: true, .. } => {
-            Store::open_default().and_then(|store| jobs::enqueue(&store))
-        }
+        Command::Dispatch {
+            detach: true,
+            targets,
+            ..
+        } => Store::open_default().and_then(|store| jobs::enqueue(&store, &targets)),
         Command::Dispatch {
             targets,
             agent,
@@ -3041,7 +3045,7 @@ fn workflow_command(action: Option<WorkflowAction>) -> Result<()> {
             preset,
         } => {
             if detach {
-                return jobs::enqueue(&Store::open_default()?);
+                return jobs::enqueue(&Store::open_default()?, &projects);
             }
             let store = Store::open_default()?;
             // A pass runs agents and edits worktrees, so it holds the session
@@ -4030,7 +4034,70 @@ fn render(view: View) -> String {
             now,
         } => watch::screen(&state, &jobs, &runs, now),
         View::Jobs(all) => jobs::list(&all),
-        View::JobLog { id, text } => {
+        // The front ends' composite views, as their parts print.
+        View::Inbox {
+            header,
+            lists,
+            state,
+            jobs,
+            runs,
+            now,
+        } => format!(
+            "{}\n{}",
+            render(View::Next {
+                header,
+                lists,
+                limit: None
+            }),
+            watch::screen(&state, &jobs, &runs, now)
+        ),
+        View::Activity {
+            state,
+            jobs,
+            instances,
+            runs,
+            now,
+        } => format!(
+            "{}\n{}",
+            watch::screen(&state, &jobs, &runs, now),
+            render(View::Workflows {
+                revisions: Vec::new(),
+                instances
+            })
+        ),
+        View::Library {
+            revisions,
+            campaigns,
+        } => format!(
+            "{}\n{}",
+            render(View::Workflows {
+                revisions,
+                instances: Vec::new()
+            }),
+            render(View::Campaigns(campaigns))
+        ),
+        // A task in full, as the front ends' detail reads.
+        task @ View::Task { .. } => {
+            let pma_core::screen::Body::Detail(d) = pma_core::screen::screen(task).body else {
+                unreachable!("a task is a detail");
+            };
+            let mut out = format!(
+                "{}  {}\n",
+                d.title,
+                d.badge.map(|b| b.text).unwrap_or_default()
+            );
+            let rows: Vec<Vec<String>> = d
+                .fields
+                .into_iter()
+                .map(|(k, v)| vec![format!("  {k}"), v])
+                .collect();
+            out.push_str(&report::table(&rows, ""));
+            for (title, _, text) in d.sections {
+                out.push_str(&format!("\n{title}\n{text}\n"));
+            }
+            out
+        }
+        View::JobLog { id, text, .. } => {
             text.unwrap_or_else(|| format!("job {id} has no output yet\n"))
         }
         View::Notes(notes) => {
@@ -4141,6 +4208,7 @@ fn render(view: View) -> String {
             placed,
             today,
             runs,
+            ..
         } => {
             let mut out = format!("{name}  {}\n", path.display());
             match status {

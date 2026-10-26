@@ -9,6 +9,7 @@ compile_error!("pma supports Linux and macOS only");
 pub mod accept;
 pub mod agent;
 pub mod api;
+pub mod catalog;
 pub mod class;
 pub mod complexity;
 pub mod config;
