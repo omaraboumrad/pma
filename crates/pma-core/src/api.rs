@@ -12,7 +12,8 @@ use std::path::{Path, PathBuf};
 use crate::config::Config;
 use crate::keys::Act;
 use crate::store::{
-    Attempt, Campaign, Job, Note, Run, RunState, Session, Store, WorkflowInstance, WorkflowRevision,
+    Attempt, Campaign, Job, Note, Preset, RouteRevision, Run, RunState, Session, Store,
+    WorkflowInstance, WorkflowRevision,
 };
 use crate::{dates, dispatch, jobs, next, publish, rank, report_runs, screen, store, todo};
 
@@ -85,6 +86,16 @@ pub enum Query {
         project: String,
         line: Option<i64>,
         key: Option<String>,
+    },
+    /// Settings, roots, agents, presets and route revisions.
+    Settings,
+    /// One recorded scan and what it changed.
+    Scan {
+        id: i64,
+    },
+    /// One route revision's policy document.
+    RouteDoc {
+        revision: i64,
     },
 }
 
@@ -220,6 +231,26 @@ pub enum View {
         jobs: Vec<Job>,
         /// The state directory, where agent logs are read from.
         state: PathBuf,
+        /// What `pma lint` and `pma prune` would say of its TODO.md; `None`
+        /// when it has none.
+        todo: Option<Vec<TodoNote>>,
+    },
+    Settings {
+        /// Each setting: key, value, and `set`, `default` or `unknown`.
+        settings: Vec<(String, String, &'static str)>,
+        roots: Vec<PathBuf>,
+        agents: Vec<crate::worker::Worker>,
+        default_agent: String,
+        presets: Vec<Preset>,
+        default_preset: Option<String>,
+        routes: Vec<RouteRevision>,
+    },
+    Scan {
+        scan: crate::history::Scan,
+        changes: Vec<crate::history::ProjectChange>,
+    },
+    RouteDoc {
+        revision: RouteRevision,
     },
     Task {
         placed: rank::Placed,
@@ -234,6 +265,60 @@ pub enum View {
         /// Runs on it that are not final.
         held_by: Vec<Run>,
     },
+}
+
+/// One line of a project's TODO.md that lint or prune would name.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TodoNote {
+    pub line: i64,
+    /// `error`, `warning`, `done`, `done section` or `kept`.
+    pub kind: &'static str,
+    pub text: String,
+}
+
+/// What lint and prune say of a TODO.md: its diagnostics, then what prune
+/// would remove or keep. A file with errors gets its diagnostics alone.
+pub fn todo_notes(text: &str) -> Vec<TodoNote> {
+    let mut parsed = todo::parse(text);
+    parsed.diagnostics.sort_by_key(|d| d.line);
+    let mut out: Vec<TodoNote> = parsed
+        .diagnostics
+        .iter()
+        .map(|d| TodoNote {
+            line: d.line as i64,
+            kind: match d.severity {
+                todo::Severity::Error => "error",
+                todo::Severity::Warning => "warning",
+            },
+            text: d.message.clone(),
+        })
+        .collect();
+    if parsed.has_errors() {
+        return out;
+    }
+    let pruned = todo::prune(text);
+    for done in &pruned.done_sections {
+        out.push(TodoNote {
+            line: done.first as i64,
+            kind: "done section",
+            text: format!("`## Done`, lines {}-{}", done.first, done.last),
+        });
+    }
+    for item in &pruned.items {
+        out.push(TodoNote {
+            line: item.line as i64,
+            kind: "done",
+            text: item.text.clone(),
+        });
+    }
+    for (item, open) in &pruned.held {
+        out.push(TodoNote {
+            line: item.line as i64,
+            kind: "kept",
+            text: format!("{}: line {open} under it is open", item.text),
+        });
+    }
+    out
 }
 
 /// The worker a queued action names, as `-a`, `-m` and `-p` do.
@@ -343,6 +428,74 @@ pub enum Action {
     },
     Verify {
         of: Selection,
+    },
+
+    // Configuring, in place. Each is a `pma` command the CLI also has.
+    /// `pma config <key> <value>`, including `projects.<name>.*` keys.
+    SetConfig {
+        key: String,
+        value: String,
+    },
+    ResetConfig {
+        key: String,
+    },
+    AddRoot {
+        path: String,
+    },
+    RemoveRoot {
+        path: String,
+    },
+    /// `pma agent set <name> <field> <value>`.
+    SetAgentField {
+        name: String,
+        field: String,
+        value: String,
+    },
+    RemoveAgent {
+        name: String,
+    },
+    SetPreset {
+        name: String,
+        agent: String,
+        model: Option<String>,
+        args: Vec<String>,
+    },
+    RemovePreset {
+        name: String,
+    },
+    ActivateRoute {
+        revision: i64,
+    },
+    /// Stores the policy document at `path` as a draft revision.
+    ProposeRoute {
+        path: String,
+    },
+    AddCampaign {
+        name: String,
+        text: String,
+        projects: Vec<String>,
+        class: Option<String>,
+    },
+    RemoveCampaign {
+        name: String,
+    },
+    SetTier {
+        project: String,
+        tier: Option<u8>,
+    },
+    Tag {
+        project: String,
+        tag: String,
+        add: bool,
+    },
+    /// Removes finished items and `Done` sections from the project's
+    /// TODO.md, as `pma prune --apply` does.
+    Prune {
+        project: String,
+    },
+    /// Queued: `pma deps refresh <path>` over the project's clone.
+    RefreshDeps {
+        project: String,
     },
 }
 
@@ -773,6 +926,25 @@ pub fn choices(store: &Store, act: Act) -> Result<Choices> {
                 },
             ],
         }),
+        Act::ScanProject => {
+            let choice = |name: &str, about: &str| crate::catalog::Choice {
+                name: name.into(),
+                reads: "project".into(),
+                about: about.into(),
+            };
+            Ok(Choices {
+                options: vec![
+                    choice("scan", "Read its TODO.md, git state and CI again"),
+                    choice("deps", "Scan, and measure its dependency locks too"),
+                    choice("offline", "Scan without GitHub: TODO.md and git only"),
+                    choice(
+                        "refresh-deps",
+                        "Move each lock within its constraints, in the clone (`pma deps refresh`)",
+                    ),
+                ],
+                flags: Vec::new(),
+            })
+        }
         other => Err(format!("{other:?} offers no list").into()),
     }
 }
@@ -940,6 +1112,57 @@ pub fn query(store: &Store, q: Query) -> Result<View> {
             runs: store.runs()?,
         },
         Query::Task { project, line, key } => task_view(store, &project, line, key.as_deref())?,
+        Query::Settings => {
+            let rows = store.config_rows()?;
+            let cfg = Config::with_overrides(rows.iter().map(|(k, v)| (k.as_str(), v.as_str())))?;
+            let mut settings: Vec<(String, String, &'static str)> = Config::keys()
+                .into_iter()
+                .map(|key| {
+                    let set = rows.iter().any(|(k, _)| *k == key);
+                    let value = cfg.get(&key).unwrap_or_default();
+                    (key, value, if set { "set" } else { "default" })
+                })
+                .collect();
+            settings.extend(
+                rows.iter()
+                    .filter(|(k, _)| k.starts_with("projects."))
+                    .map(|(k, v)| (k.clone(), v.clone(), "set")),
+            );
+            settings.extend(
+                rows.iter()
+                    .filter(|(k, _)| {
+                        Config::default().get(k).is_none() && !k.starts_with("projects.")
+                    })
+                    .map(|(k, v)| (k.clone(), v.clone(), "unknown")),
+            );
+            View::Settings {
+                settings,
+                roots: store.roots()?,
+                agents: store.agents()?,
+                default_agent: cfg.agent.clone(),
+                presets: store.presets()?,
+                default_preset: cfg.preset.clone(),
+                routes: store.route_revisions()?,
+            }
+        }
+        Query::Scan { id } => {
+            let scan = store
+                .scans(crate::history::KEPT as usize)?
+                .into_iter()
+                .find(|s| s.id == id)
+                .ok_or_else(|| format!("no scan {id}"))?;
+            View::Scan {
+                scan,
+                changes: store.scan_changes(id)?,
+            }
+        }
+        Query::RouteDoc { revision } => View::RouteDoc {
+            revision: store
+                .route_revisions()?
+                .into_iter()
+                .find(|r| r.revision == revision)
+                .ok_or_else(|| format!("no route revision {revision}"))?,
+        },
         Query::Project { name } => {
             let row = store
                 .project(&name)?
@@ -973,8 +1196,14 @@ pub fn query(store: &Store, q: Query) -> Result<View> {
                 .into_iter()
                 .filter(|j| j.project.as_deref() == Some(name.as_str()))
                 .collect();
+            let todo = row
+                .has_todo
+                .then(|| std::fs::read_to_string(row.path.join("TODO.md")).ok())
+                .flatten()
+                .map(|text| todo_notes(&text));
             View::Project {
                 jobs,
+                todo,
                 state: store::state_home()?,
                 scanned_at: row.scanned_at,
                 path: row.path,
@@ -1215,6 +1444,188 @@ pub fn act(store: &Store, a: Action) -> Result<Outcome> {
             }
             Outcome::default()
         }
+        Action::SetConfig { key, value } => {
+            Config::default()
+                .set(&key, &value)
+                .map_err(|e| format!("{key}: {e}"))?;
+            store.set_config(&key, value.trim())?;
+            Outcome::said(format!("{key} = {}", value.trim()))
+        }
+        Action::ResetConfig { key } => match store.reset_config(&key)? {
+            true => Outcome::said(format!("{key} is at its default")),
+            false => Outcome::said(format!("{key} was not set")),
+        },
+        Action::AddRoot { path } => {
+            let dir = PathBuf::from(&path);
+            let dir = dir
+                .canonicalize()
+                .map_err(|e| format!("{}: {e}", dir.display()))?;
+            if !dir.is_dir() {
+                return Err(format!("{} is not a directory", dir.display()).into());
+            }
+            match store.add_root(&dir)? {
+                true => Outcome::said(format!("{} is a root; `c` scans it", dir.display())),
+                false => Outcome::said(format!("{} is already a root", dir.display())),
+            }
+        }
+        Action::RemoveRoot { path } => {
+            let dir = PathBuf::from(&path);
+            let canonical = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+            if !store.remove_root(&canonical)? && !store.remove_root(&dir)? {
+                return Err(format!("{} is not a root", dir.display()).into());
+            }
+            Outcome::said(format!(
+                "{} removed; the next full scan marks its projects absent",
+                dir.display()
+            ))
+        }
+        Action::SetAgentField { name, field, value } => {
+            let mut w = store
+                .agent(&name)
+                .unwrap_or_else(|_| crate::worker::blank(&name));
+            crate::worker::set_field(&mut w, &field, value)?;
+            store.set_agent(&w)?;
+            Outcome::said(format!("{name}: {field} set"))
+        }
+        Action::RemoveAgent { name } => {
+            if !store.remove_agent(&name)? {
+                return Err(format!("unknown agent `{name}`").into());
+            }
+            Outcome::default()
+        }
+        Action::SetPreset {
+            name,
+            agent,
+            model,
+            args,
+        } => {
+            if !store.agents()?.iter().any(|w| w.name == agent) {
+                return Err(format!("unknown agent `{agent}`; the agents list names them").into());
+            }
+            store.set_preset(&Preset {
+                name: name.clone(),
+                agent: agent.clone(),
+                model: model.clone().filter(|m| !m.is_empty()),
+                args,
+            })?;
+            Outcome::said(format!(
+                "preset `{name}`: {agent}{}",
+                model.map(|m| format!(" at {m}")).unwrap_or_default()
+            ))
+        }
+        Action::RemovePreset { name } => {
+            if !store.remove_preset(&name)? {
+                return Err(format!("unknown preset `{name}`").into());
+            }
+            Outcome::default()
+        }
+        Action::ActivateRoute { revision } => {
+            store.activate_route(revision, &whoami(), false)?;
+            Outcome::said(format!("route revision {revision} is in effect"))
+        }
+        Action::ProposeRoute { path } => {
+            let text = std::fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?;
+            crate::route::Policy::parse(&text)?;
+            let n = store.add_route_revision(&text, &whoami())?;
+            Outcome::said(format!("route revision {n} stored as a draft"))
+        }
+        Action::AddCampaign {
+            name,
+            text,
+            projects,
+            class,
+        } => {
+            let known = store.projects()?;
+            for p in &projects {
+                if !known.iter().any(|r| &r.name == p) {
+                    return Err(format!("unknown project `{p}`; run `pma scan`").into());
+                }
+            }
+            let class = match class.as_deref() {
+                None => crate::class::Class::Specified,
+                Some(c) => crate::class::Class::parse(c)
+                    .ok_or_else(|| format!("unknown class `{c}`; expected A, A-, B, C or D"))?,
+            };
+            if !class.dispatchable() {
+                return Err(format!("class {} is never dispatched", class.name()).into());
+            }
+            let mut members: Vec<(String, Option<i64>)> =
+                projects.iter().map(|p| (p.clone(), None)).collect();
+            members.sort();
+            members.dedup();
+            store.add_campaign(&Campaign {
+                name: name.clone(),
+                text,
+                description: String::new(),
+                class,
+                created_at: dates::now(),
+                members,
+            })?;
+            Outcome::said(format!("campaign `{name}` defined; `r` runs it"))
+        }
+        Action::RemoveCampaign { name } => {
+            if !store.remove_campaign(&name)? {
+                return Err(format!("unknown campaign `{name}`").into());
+            }
+            Outcome::default()
+        }
+        Action::SetTier { project, tier } => {
+            let row = store
+                .project(&project)?
+                .ok_or_else(|| format!("unknown project `{project}`"))?;
+            store.set_tier(&project, &row.path, tier)?;
+            Outcome::said(match tier {
+                Some(t) => format!("{project}: tier {t}"),
+                None => format!("{project}: untiered"),
+            })
+        }
+        Action::Tag { project, tag, add } => {
+            let tag = crate::projects::normal_tag(&tag)?;
+            store
+                .project(&project)?
+                .ok_or_else(|| format!("unknown project `{project}`"))?;
+            Outcome::said(match add {
+                true if store.add_project_tag(&project, &tag)? => format!("{project}: #{tag}"),
+                true => format!("{project} already carries `{tag}`"),
+                false if store.remove_project_tag(&project, &tag)? => {
+                    format!("{project}: `{tag}` removed")
+                }
+                false => format!("{project} does not carry `{tag}`"),
+            })
+        }
+        Action::Prune { project } => {
+            let row = store
+                .project(&project)?
+                .ok_or_else(|| format!("unknown project `{project}`"))?;
+            let file = row.path.join("TODO.md");
+            let text =
+                std::fs::read_to_string(&file).map_err(|e| format!("{}: {e}", file.display()))?;
+            if todo::parse(&text).has_errors() {
+                return Err(format!("{}: lint errors; fix them first", file.display()).into());
+            }
+            let pruned = todo::prune(&text);
+            let removals = pruned.done_sections.len() + pruned.items.len();
+            if removals == 0 {
+                return Ok(Outcome::said("nothing to prune"));
+            }
+            todo::save(&file, &pruned.text).map_err(|e| format!("{}: {e}", file.display()))?;
+            Outcome::said(format!(
+                "{removals} removals made in {}; the edit is uncommitted",
+                file.display()
+            ))
+        }
+        Action::RefreshDeps { project } => {
+            let row = store
+                .project(&project)?
+                .ok_or_else(|| format!("unknown project `{project}`"))?;
+            let args = vec![
+                "deps".to_string(),
+                "refresh".into(),
+                row.path.to_string_lossy().into_owned(),
+            ];
+            let id = jobs::queue(store, &args, &std::env::current_dir()?, Some(&project))?;
+            Outcome::said(format!("job {id} queued: pma {}", args.join(" ")))
+        }
         Action::Scan {
             offline: true,
             deps: true,
@@ -1384,7 +1795,24 @@ pub fn command_line(a: &Action) -> Option<Vec<String>> {
         | Action::StopWorkflow { .. }
         | Action::AddNote { .. }
         | Action::EditNote { .. }
-        | Action::RemoveNote { .. } => return None,
+        | Action::RemoveNote { .. }
+        | Action::SetConfig { .. }
+        | Action::ResetConfig { .. }
+        | Action::AddRoot { .. }
+        | Action::RemoveRoot { .. }
+        | Action::SetAgentField { .. }
+        | Action::RemoveAgent { .. }
+        | Action::SetPreset { .. }
+        | Action::RemovePreset { .. }
+        | Action::ActivateRoute { .. }
+        | Action::ProposeRoute { .. }
+        | Action::AddCampaign { .. }
+        | Action::RemoveCampaign { .. }
+        | Action::SetTier { .. }
+        | Action::Tag { .. }
+        | Action::Prune { .. }
+        // Queued by `act` itself, with the project's path resolved.
+        | Action::RefreshDeps { .. } => return None,
     }
     Some(v)
 }

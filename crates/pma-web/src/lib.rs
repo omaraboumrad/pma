@@ -263,6 +263,9 @@ fn route(req: &Request, ctx: &Ctx) -> Response {
                 Some(Pick::Task {
                     project, target, ..
                 }) => api::Query::task(&project, &target),
+                Some(Pick::Scan { id }) => api::Query::Scan { id },
+                Some(Pick::Route { revision, .. }) => api::Query::RouteDoc { revision },
+                Some(Pick::Campaign { name }) => api::Query::Campaign { name },
                 _ => return Response::status(400),
             };
             answer(ctx, |store| {
@@ -507,6 +510,21 @@ fn pick_json(p: &Pick) -> Value {
         }
         Pick::Note { id, text } => json!({ "kind": "note", "id": id, "text": text }),
         Pick::Campaign { name } => json!({ "kind": "campaign", "name": name }),
+        Pick::Setting { key, value } => json!({ "kind": "setting", "key": key, "value": value }),
+        Pick::Root { path } => json!({ "kind": "root", "path": path }),
+        Pick::Agent { name } => json!({ "kind": "agent", "name": name }),
+        Pick::Preset {
+            name,
+            agent,
+            model,
+            args,
+        } => {
+            json!({ "kind": "preset", "name": name, "agent": agent, "model": model, "args": args })
+        }
+        Pick::Route { revision, active } => {
+            json!({ "kind": "route", "revision": revision, "active": active })
+        }
+        Pick::Scan { id } => json!({ "kind": "scan", "id": id }),
     }
 }
 
@@ -546,6 +564,30 @@ fn pick_from(v: &Value) -> Option<Pick> {
             text: s("text")?,
         },
         "campaign" => Pick::Campaign { name: s("name")? },
+        "setting" => Pick::Setting {
+            key: s("key")?,
+            value: s("value")?,
+        },
+        "root" => Pick::Root { path: s("path")? },
+        "agent" => Pick::Agent { name: s("name")? },
+        "preset" => Pick::Preset {
+            name: s("name")?,
+            agent: s("agent")?,
+            model: match &v["model"] {
+                Value::Null => None,
+                m => Some(m.as_str()?.to_string()),
+            },
+            args: v["args"]
+                .as_array()?
+                .iter()
+                .map(|a| a.as_str().map(String::from))
+                .collect::<Option<Vec<_>>>()?,
+        },
+        "route" => Pick::Route {
+            revision: n("revision")?,
+            active: b("active")?,
+        },
+        "scan" => Pick::Scan { id: n("id")? },
         _ => return None,
     })
 }

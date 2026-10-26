@@ -14,6 +14,7 @@ const TABS = {
   library: { label: "Library", about: "Workflow revisions and campaigns: what can be run." },
   report: { label: "Report", about: "What dispatching produced." },
   notes: { label: "Notes", about: "Notes that belong to no one project." },
+  settings: { label: "Settings", about: "Settings, roots, agents, presets and route revisions." },
   project: { label: "Project", about: "" },
 };
 
@@ -241,8 +242,11 @@ function openProject(name) {
 
 // Opens the run or job `pick` names over the tab, from a row, a toast or a
 // key.
+// Row kinds a detail opens for anywhere; a task opens in its project.
+const OPENABLE = ["run", "job", "scan", "route", "campaign"];
+
 async function openDetail(pick) {
-  if (pick.kind !== "run" && pick.kind !== "job") return;
+  if (!OPENABLE.includes(pick.kind) && pick.kind !== "task") return;
   try {
     const screen = await api("/api/open", { pick });
     const d = screen.body.detail;
@@ -310,13 +314,14 @@ function draw() {
     const proj = onTab().find((b) => b.command.kind === "OpenProject");
     const open = onTab().find((b) => b.command.kind === "Open");
     const named = sel.item.pick.project;
-    const openable = sel.item.pick.kind === "run" || sel.item.pick.kind === "job";
+    const openable = OPENABLE.includes(sel.item.pick.kind) || (sel.item.pick.kind === "task" && S.tab === "project");
     if (own.length || (proj && named && S.tab !== "project") || (open && openable)) {
       toolbar.append(el("span", { class: "sep", "aria-hidden": "true" }));
     }
     if (open && openable) {
+      const what = { run: "Open run", job: "Open log", task: "Open task" }[sel.item.pick.kind] || "Open";
       toolbar.append(el("button", { class: "button primary", type: "button", onclick: () => run(open) },
-        sel.item.pick.kind === "run" ? "Open run" : "Open log", el("kbd", {}, "Enter")));
+        what, el("kbd", {}, "Enter")));
     }
     for (const b of own) toolbar.append(button(b));
     if (proj && named && S.tab !== "project") {
@@ -622,7 +627,8 @@ async function run(b) {
     case "Quit": toast("Close the browser tab to leave. pma web runs until Ctrl-C in its terminal.", "accent"); break;
     case "Open": {
       const pick = currentPick();
-      if (pick.kind === "run" || pick.kind === "job") return openDetail(pick);
+      if (OPENABLE.includes(pick.kind)) return openDetail(pick);
+      if (pick.kind === "task" && S.tab === "project") return openDetail(pick);
       if (pick.project) return openProject(pick.project);
       break;
     }

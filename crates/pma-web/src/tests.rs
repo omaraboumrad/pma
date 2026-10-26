@@ -33,6 +33,29 @@ fn picks_round_trip_through_json() {
             text: "t".into(),
         },
         Pick::Campaign { name: "c".into() },
+        Pick::Setting {
+            key: "agent".into(),
+            value: "claude".into(),
+        },
+        Pick::Root { path: "/r".into() },
+        Pick::Agent { name: "a".into() },
+        Pick::Preset {
+            name: "p".into(),
+            agent: "a".into(),
+            model: Some("m".into()),
+            args: vec!["--x".into()],
+        },
+        Pick::Preset {
+            name: "q".into(),
+            agent: "a".into(),
+            model: None,
+            args: vec![],
+        },
+        Pick::Route {
+            revision: 2,
+            active: false,
+        },
+        Pick::Scan { id: 9 },
     ] {
         assert_eq!(pick_from(&pick_json(&p)), Some(p));
     }

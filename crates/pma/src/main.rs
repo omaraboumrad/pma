@@ -3583,63 +3583,8 @@ fn agent_command(action: Option<AgentAction>) -> Result<()> {
             }
         }
         AgentAction::Set { name, field, value } => {
-            let mut w = store.agent(&name).unwrap_or_else(|_| worker::Worker {
-                name: name.clone(),
-                command: String::new(),
-                args: Vec::new(),
-                allow: None,
-                parse: worker::Parser::TextTail,
-                reports_cost: false,
-                enforces_budget: false,
-                sandbox: false,
-                resumes: false,
-                env: std::collections::BTreeMap::new(),
-            });
-            let flag = |v: &str| match v {
-                "true" | "yes" => Ok(true),
-                "false" | "no" => Ok(false),
-                _ => Err(format!("expected true or false, not `{v}`")),
-            };
-            match field.as_str() {
-                "command" => w.command = value,
-                "args" => {
-                    w.args = serde_json::from_str(&value)
-                        .map_err(|e| format!("args must be a JSON array of strings: {e}"))?;
-                }
-                "allow" => w.allow = (!value.is_empty()).then_some(value),
-                "parse" => {
-                    w.parse = worker::Parser::parse(&value).ok_or_else(|| {
-                        format!(
-                            "unknown parser `{value}`; expected {}",
-                            worker::Parser::names()
-                        )
-                    })?;
-                }
-                "reports-cost" => w.reports_cost = flag(&value)?,
-                "enforces-budget" => w.enforces_budget = flag(&value)?,
-                "sandbox" => w.sandbox = flag(&value)?,
-                "resumes" => w.resumes = flag(&value)?,
-                "model" => {
-                    return Err(format!(
-                        "a worker no longer names a model: \
-                         `pma preset set <name> {name} {value}`"
-                    )
-                    .into());
-                }
-                "env" => {
-                    w.env = serde_json::from_str(&value)
-                        .map_err(|e| format!("env must be a JSON object of name to value: {e}"))?;
-                }
-                _ => {
-                    let names: Vec<&str> = worker::FIELDS.iter().map(|(n, _)| *n).collect();
-                    return Err(
-                        format!("unknown field `{field}`; expected {}", names.join(", ")).into(),
-                    );
-                }
-            }
-            if w.command.is_empty() {
-                return Err(format!("set `command` for `{name}` first").into());
-            }
+            let mut w = store.agent(&name).unwrap_or_else(|_| worker::blank(&name));
+            worker::set_field(&mut w, &field, value)?;
             store.set_agent(&w)?;
         }
     }
@@ -4076,6 +4021,40 @@ fn render(view: View) -> String {
             }),
             render(View::Campaigns(campaigns))
         ),
+        View::Settings {
+            settings,
+            roots,
+            agents,
+            presets,
+            routes,
+            ..
+        } => {
+            let mut out = String::new();
+            for (k, v, source) in settings {
+                out.push_str(&format!("{k} = {v}  ({source})\n"));
+            }
+            out.push_str(&format!(
+                "\nroots: {}\nagents: {}\npresets: {}\nroute revisions: {}\n",
+                roots.len(),
+                agents.len(),
+                presets.len(),
+                routes.len()
+            ));
+            out
+        }
+        View::Scan { scan, changes } => format!(
+            "scan {}, {}: {} projects, CI failing in {}, {} open items\n{}",
+            scan.id,
+            report::ago(dates::now() - scan.at),
+            scan.projects,
+            scan.failing,
+            scan.open,
+            match changes.is_empty() {
+                true => "no change since the scan before\n".to_string(),
+                false => report::changes(&changes),
+            }
+        ),
+        View::RouteDoc { revision } => revision.document,
         // A task in full, as the front ends' detail reads.
         task @ View::Task { .. } => {
             let pma_core::screen::Body::Detail(d) = pma_core::screen::screen(task).body else {

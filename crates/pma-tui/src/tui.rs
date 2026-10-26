@@ -470,6 +470,11 @@ impl App {
                     } if self.tab == Tab::Project => {
                         Some(Request::Load(Query::task(&project, &target)))
                     }
+                    Pick::Scan { id } => Some(Request::Load(Query::Scan { id })),
+                    Pick::Route { revision, .. } => {
+                        Some(Request::Load(Query::RouteDoc { revision }))
+                    }
+                    Pick::Campaign { name } => Some(Request::Load(Query::Campaign { name })),
                     other => other.project().map(|p| self.open_project(p.to_string())),
                 };
             }
@@ -698,7 +703,14 @@ impl App {
             .filter(|b| match b.command {
                 Command::Act(a) => a.on_row() && screen::fits(a, &pick),
                 Command::Open => {
-                    matches!(pick, Pick::Run { .. } | Pick::Job { .. }) || pick.project().is_some()
+                    matches!(
+                        pick,
+                        Pick::Run { .. }
+                            | Pick::Job { .. }
+                            | Pick::Scan { .. }
+                            | Pick::Route { .. }
+                            | Pick::Campaign { .. }
+                    ) || pick.project().is_some()
                 }
                 Command::OpenProject => pick.project().is_some(),
                 _ => false,
@@ -1581,7 +1593,26 @@ mod tests {
             screen_text(&mut app).contains(" a "),
             "the title bar names it"
         );
-        let Some(Request::Act(Action::Scan { of, .. })) = app.key("r") else {
+        // `r` lists what a rescan can do; the first choice is a plain scan
+        // of that project, not the portfolio.
+        let Some(Request::Choose { act, .. }) = app.key("r") else {
+            panic!("a rescan list");
+        };
+        assert_eq!(act, Act::ScanProject);
+        app.offered(
+            Act::ScanProject,
+            Pick::Nothing,
+            "rescan",
+            Ok(api::Choices {
+                options: vec![pma_core::catalog::Choice {
+                    name: "scan".into(),
+                    reads: "project".into(),
+                    about: "again".into(),
+                }],
+                flags: vec![],
+            }),
+        );
+        let Some(Request::Act(Action::Scan { of, .. })) = app.key("Enter") else {
             panic!("a rescan");
         };
         app.loaded(Ok(View::Project {
@@ -1615,6 +1646,7 @@ mod tests {
             runs: vec![],
             jobs: vec![],
             state: std::env::temp_dir(),
+            todo: None,
         }));
         assert_eq!(
             app.key("Enter"),

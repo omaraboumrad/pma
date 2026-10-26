@@ -4,8 +4,8 @@
 
 ## High
 
-- [ ] Admin from the TUI and the web
-  Still CLI-only: project tier, tags, verify command, sandbox and roots; `pma config` keys; routes, presets and agents; campaign creation; deps refresh; history; lint; prune. Each needs an `Action` or `Query` in `pma-core` and a key, as the operating acts have (`docs/dev/frontends.md`).
+- [x] Admin from the TUI and the web
+  Done 2026-10-26: a settings tab (keys, roots, agents, presets, routes), project tier, tags, verify and sandbox from the project view, prune, campaign add and remove, rescan with dependencies or offline, deps refresh, scan history and route documents. Still CLI-only: `project export`, `import`, `forget` and `clone`, `route replay`, `lint --ids` (`docs/dev/frontends.md`).
 
 - [x] `pma report` counts `applied` runs as neither accepted nor landed
   21 runs in state `applied` (`--local` workflow fixes on `xtgen` and `argdec`) are missing from the headline, which reads "25% of 8 decided runs accepted, 2 landed". Count `applied` as landed, or give it its own column, and name it in the headline. (REVIEW.md U2)

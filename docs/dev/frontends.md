@@ -57,6 +57,14 @@ Phase 6, parity:
 - Races: a front end's approve or reject carries the state its row showed (`seen`), and is refused once the run has left it. Rejecting now writes its state conditionally before it removes the worktree, so a reject from a stale view no longer overwrites an approval. Tested between the web and the CLI on one run, one plan and one job.
 - The page's JavaScript has no unit tests. It was driven in headless Chrome against a scratch store and a real one: tabs, a prompt, a confirmation, help, run detail, and no console errors.
 
+Configuring from the front ends, 2026-10-26:
+
+- An eighth tab, settings on `8` (`Query::Settings`): every `pma config` key with its value and whether it is set, the roots, the agents, the presets and the route revisions. On a row: `e` edits a setting's value, an agent's field (`field value`, as `pma agent set`) or a preset (`agent[:model] args`); `x` resets a setting or removes a root, an agent or a preset; `a` makes an agent or a preset the default, or activates a draft route. Without a row: `r` adds a root, `p` a preset, `f` proposes a route from a file. Enter on a route shows its policy.
+- On a project: `e` reads one setting a line, `tier 3`, `tag +name`, `tag -name`, `verify make test` or `sandbox on`, and `f` prunes its finished items after a confirm. The view's TODO.md pane lists what lint and prune would say, so the prune is read before it is confirmed. `r` lists what a rescan can do: scan, with dependencies, offline, or `pma deps refresh` in the clone, which queues as a job.
+- On the library: `a` adds a campaign from `name project,project text [--class=A]`, `x` removes one, Enter shows its members. On projects: Enter on a scan shows what it changed (`Query::Scan`).
+- Still CLI-only: `project export`, `import`, `forget` and `clone`, `route replay` and `show` of a file, `lint --ids`, and `agent show`'s raw fields. Each is a file or a bulk operation that a terminal fits better.
+- The agent field setter moved to `worker::set_field`, so the CLI and `api::act` validate the same way. Every configuring action runs in place; only `deps refresh` is queued, with the project's path resolved by `act` rather than written into the command line.
+
 ## Goal
 
 Three ways to run `pma`:
@@ -65,7 +73,7 @@ Three ways to run `pma`:
 2. `pma tui`: a terminal UI. Used over SSH, so it must not lag the web view.
 3. `pma web`: a local web UI, opened in the browser with a token.
 
-The TUI and the web view have operating parity: anything one shows or does, the other shows or does. They differ only in the view. Configuring is out of parity scope: it is done in `~/.config/pma/settings.toml`.
+The TUI and the web view have operating parity: anything one shows or does, the other shows or does. They differ only in the view. Configuring was out of parity scope until 2026-10-26; see the note above.
 
 ## Scope
 

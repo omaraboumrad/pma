@@ -8,7 +8,7 @@ Upgrading from 0.8:
 
 - The database moves from schema 40 to 42 on first open. 0.8 refuses it afterwards; copy `~/.config/pma/projects.db` first if you may go back.
 
-- The TUI and the web have seven tabs on `1` to `7`, not ten on `0` to `9`: inbox, projects, activity, matrix, library, report, notes. `0`, `8` and `9` do nothing.
+- The TUI and the web have eight tabs on `1` to `8`, not ten on `0` to `9`: inbox, projects, activity, matrix, library, report, notes, settings. `0` and `9` do nothing.
 
 - Runs edit your clone by default. `pma config workspace worktree` restores the previous behaviour for every run, `--worktree` for one.
 
@@ -32,6 +32,13 @@ pma run fix-ci spore --push   # approve and push when the gates are clean
 **`run` from the TUI and the web.** `z` on a project, or on a row naming one, lists the `pma run` names with what each does; `p` and `w` (checkboxes in the web) add `--push` and `--worktree`. The job it queues shows in the project's view as it runs.
 
 **Seven tabs, and one place per thing.** Inbox: what waits on you (runs in review, plans awaiting approval), what is under way (running agents with what their log last showed, queued jobs), and the tasks, marked for an agent or for you. Projects: the status view. Activity: every job, running agent and workflow instance. Library: workflow revisions and campaigns. Matrix, report and notes as before. A project's view lists its runs and jobs in one Activity pane, under way first. Chosen over keeping ten tabs because a run in review showed on three of them, a running agent on three, and one CI fix took six views to follow from `z` to pushed. `docs/dev/frontends.md`.
+
+**Configuring from the TUI and the web.** A settings tab lists every `pma config` key, the roots, the agents, the presets and the route revisions, and edits them in place: `e` edits, `x` resets or removes, `a` makes a default or activates a route, `r` adds a root, `p` a preset, `f` proposes a route from a file. On a project, `e` sets its tier, a tag, its verify command or its sandbox from one typed line, `f` prunes its finished items, and a TODO.md pane shows what lint and prune would say. `r` on a project lists a plain, dependency or offline rescan and `pma deps refresh`. On the library, `a` adds a campaign and `x` removes one. Enter opens a scan's changes, a campaign's members and a route's policy. Chosen over leaving configuring to `settings.toml` because the stated goal is a front end that needs no terminal; `project export`, `import`, `forget` and `clone` stay CLI-only as file and bulk operations. `docs/dev/frontends.md`.
+
+```
+8          settings: keys, roots, agents, presets, routes
+e          on a project: tier 2 | tag +oss | verify make test | sandbox on
+```
 
 **One confirm from review to the branch.** `u` on a ready run approves it and pushes; `m` and `p` likewise commit or open a pull request. `a` still approves alone. In the TUI the acts apply inside a run's detail, after reading the diff. A run that reaches review, fails or is pushed, and a job that ends or waits for approval, is named in the TUI's footer with Enter to open it, and in a web toast with an Open button.
 

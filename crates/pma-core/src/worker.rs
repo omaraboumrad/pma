@@ -219,6 +219,68 @@ pub struct Worker {
 }
 
 /// The fields `pma agent set` accepts, with what each one takes.
+/// A worker with `command` unset, for `set_field` to fill.
+pub fn blank(name: &str) -> Worker {
+    Worker {
+        name: name.to_string(),
+        command: String::new(),
+        args: Vec::new(),
+        allow: None,
+        parse: Parser::TextTail,
+        reports_cost: false,
+        enforces_budget: false,
+        sandbox: false,
+        resumes: false,
+        env: std::collections::BTreeMap::new(),
+    }
+}
+
+/// Sets one field from its text form, as `pma agent set` reads it.
+pub fn set_field(w: &mut Worker, field: &str, value: String) -> Result<(), String> {
+    let flag = |v: &str| match v {
+        "true" | "yes" => Ok(true),
+        "false" | "no" => Ok(false),
+        _ => Err(format!("expected true or false, not `{v}`")),
+    };
+    match field {
+        "command" => w.command = value,
+        "args" => {
+            w.args = serde_json::from_str(&value)
+                .map_err(|e| format!("args must be a JSON array of strings: {e}"))?;
+        }
+        "allow" => w.allow = (!value.is_empty()).then_some(value),
+        "parse" => {
+            w.parse = Parser::parse(&value)
+                .ok_or_else(|| format!("unknown parser `{value}`; expected {}", Parser::names()))?;
+        }
+        "reports-cost" => w.reports_cost = flag(&value)?,
+        "enforces-budget" => w.enforces_budget = flag(&value)?,
+        "sandbox" => w.sandbox = flag(&value)?,
+        "resumes" => w.resumes = flag(&value)?,
+        "model" => {
+            return Err(format!(
+                "a worker no longer names a model: `pma preset set <name> {} {value}`",
+                w.name
+            ));
+        }
+        "env" => {
+            w.env = serde_json::from_str(&value)
+                .map_err(|e| format!("env must be a JSON object of name to value: {e}"))?;
+        }
+        _ => {
+            let names: Vec<&str> = FIELDS.iter().map(|(n, _)| *n).collect();
+            return Err(format!(
+                "unknown field `{field}`; expected {}",
+                names.join(", ")
+            ));
+        }
+    }
+    if w.command.is_empty() {
+        return Err(format!("set `command` for `{}` first", w.name));
+    }
+    Ok(())
+}
+
 pub const FIELDS: [(&str, &str); 9] = [
     ("command", "the program to run"),
     ("args", "a JSON array of arguments"),

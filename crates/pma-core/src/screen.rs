@@ -49,6 +49,30 @@ pub enum Pick {
     Campaign {
         name: String,
     },
+    /// A setting, with the value it shows.
+    Setting {
+        key: String,
+        value: String,
+    },
+    Root {
+        path: String,
+    },
+    Agent {
+        name: String,
+    },
+    Preset {
+        name: String,
+        agent: String,
+        model: Option<String>,
+        args: Vec<String>,
+    },
+    Route {
+        revision: i64,
+        active: bool,
+    },
+    Scan {
+        id: i64,
+    },
 }
 
 /// What a value means, for a front end to colour: its palette, one meaning.
@@ -128,8 +152,15 @@ pub fn fits(act: Act, pick: &Pick) -> bool {
         Act::StopJob => matches!(pick, Pick::Job { .. }),
         Act::StopWorkflow => matches!(pick, Pick::Instance { open: true, .. }),
         Act::ResumeWorkflow => matches!(pick, Pick::Instance { open: true, .. }),
-        Act::RunCampaign => matches!(pick, Pick::Campaign { .. }),
+        Act::RunCampaign | Act::RemoveCampaign => matches!(pick, Pick::Campaign { .. }),
         Act::EditNote | Act::RemoveNote => matches!(pick, Pick::Note { .. }),
+        Act::EditSetting | Act::ResetSetting => matches!(pick, Pick::Setting { .. }),
+        Act::RemoveRoot => matches!(pick, Pick::Root { .. }),
+        Act::EditAgent | Act::RemoveAgent | Act::UseAgent => matches!(pick, Pick::Agent { .. }),
+        Act::EditPreset | Act::RemovePreset | Act::UsePreset => {
+            matches!(pick, Pick::Preset { .. })
+        }
+        Act::ActivateRoute => matches!(pick, Pick::Route { active: false, .. }),
         _ => !act.on_row(),
     }
 }
@@ -194,7 +225,7 @@ pub struct Detail {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Body {
     Panes(Vec<Pane>),
-    Detail(Detail),
+    Detail(Box<Detail>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -773,6 +804,45 @@ fn revisions_pane(revisions: &[crate::store::WorkflowRevision]) -> Pane {
     }
 }
 
+/// What lint and prune say of a project's TODO.md, a line each.
+fn todo_pane(todo: Option<Vec<crate::api::TodoNote>>) -> Pane {
+    let (items, empty) = match todo {
+        None => (Vec::new(), "No TODO.md."),
+        Some(notes) => (
+            notes
+                .into_iter()
+                .map(|n| Item {
+                    cells: vec![
+                        muted(n.line.to_string()),
+                        cell(
+                            n.kind,
+                            match n.kind {
+                                "error" => Tone::Bad,
+                                "warning" => Tone::Warn,
+                                "kept" => Tone::Muted,
+                                _ => Tone::Accent,
+                            },
+                        ),
+                        plain(n.text),
+                    ],
+                    pick: Pick::Nothing,
+                })
+                .collect(),
+            "TODO.md is clean: no lint problem, nothing to prune.",
+        ),
+    };
+    Pane {
+        title: "TODO.md".into(),
+        columns: vec![
+            col("line", Kind::Text),
+            col("kind", Kind::Badge),
+            col("what", Kind::Wide),
+        ],
+        items,
+        empty,
+    }
+}
+
 fn campaigns_pane(all: &[crate::store::Campaign]) -> Pane {
     let items = all
         .iter()
@@ -862,6 +932,7 @@ fn changes_pane(
 }
 
 fn scans_pane(scans: Vec<history::Scan>, now: i64) -> Pane {
+    let pick = |s: &history::Scan| Pick::Scan { id: s.id };
     let count = |n: i64, tone: Tone| match n {
         0 => muted("0"),
         n => cell(n.to_string(), tone),
@@ -913,7 +984,7 @@ fn scans_pane(scans: Vec<history::Scan>, now: i64) -> Pane {
                     count(s.other, Tone::Plain),
                 ])
                 .collect(),
-                pick: Pick::Nothing,
+                pick: pick(&s),
             })
             .collect(),
         empty: "No scan recorded yet.",
@@ -977,7 +1048,7 @@ pub fn screen(view: View) -> Screen {
         tab,
         header,
         summary: Vec::new(),
-        body: Body::Detail(d),
+        body: Body::Detail(Box::new(d)),
     };
     let now = dates::now();
     match view {
@@ -1431,6 +1502,7 @@ pub fn screen(view: View) -> Screen {
             runs,
             jobs,
             state,
+            todo,
         } => {
             let mut summary: Vec<(String, Cell)> = Vec::new();
             match &status {
@@ -1531,8 +1603,251 @@ pub fn screen(view: View) -> Screen {
                         empty: "No open task in its TODO.md.",
                     },
                     activity_pane(&state, &runs, &jobs, now, false),
+                    todo_pane(todo),
                 ]),
             }
+        }
+        View::Settings {
+            settings,
+            roots,
+            agents,
+            default_agent,
+            presets,
+            default_preset,
+            routes,
+        } => panes(
+            Tab::Settings,
+            None,
+            vec![
+                Pane {
+                    title: "Settings".into(),
+                    columns: vec![
+                        col("key", Kind::Text),
+                        col("value", Kind::Wide),
+                        col("source", Kind::Badge),
+                    ],
+                    items: settings
+                        .into_iter()
+                        .map(|(key, value, source)| Item {
+                            cells: vec![
+                                plain(key.clone()),
+                                plain(value.clone()),
+                                cell(
+                                    source,
+                                    match source {
+                                        "set" => Tone::Accent,
+                                        "unknown" => Tone::Warn,
+                                        _ => Tone::Muted,
+                                    },
+                                ),
+                            ],
+                            pick: Pick::Setting { key, value },
+                        })
+                        .collect(),
+                    empty: "No settings.",
+                },
+                Pane {
+                    title: "Roots".into(),
+                    columns: vec![col("directory", Kind::Wide)],
+                    items: roots
+                        .into_iter()
+                        .map(|r| {
+                            let path = r.to_string_lossy().into_owned();
+                            Item {
+                                cells: vec![plain(path.clone())],
+                                pick: Pick::Root { path },
+                            }
+                        })
+                        .collect(),
+                    empty: "No root. `r` adds a directory whose git repositories are projects.",
+                },
+                Pane {
+                    title: "Agents".into(),
+                    columns: vec![
+                        col("agent", Kind::Text),
+                        col("default", Kind::Badge),
+                        col("command", Kind::Text),
+                        col("parse", Kind::Text),
+                        col("flags", Kind::Wide),
+                    ],
+                    items: agents
+                        .iter()
+                        .map(|w| {
+                            let flags: Vec<&str> = [
+                                (w.reports_cost, "cost"),
+                                (w.enforces_budget, "budget"),
+                                (w.sandbox, "sandbox"),
+                                (w.allow.is_some(), "allowlist"),
+                                (w.resumes, "resumes"),
+                            ]
+                            .into_iter()
+                            .filter_map(|(on, name)| on.then_some(name))
+                            .collect();
+                            Item {
+                                cells: vec![
+                                    plain(w.name.clone()),
+                                    match w.name == default_agent {
+                                        true => cell("default", Tone::Accent),
+                                        false => plain(""),
+                                    },
+                                    muted(w.command.clone()),
+                                    muted(w.parse.name()),
+                                    muted(flags.join(", ")),
+                                ],
+                                pick: Pick::Agent {
+                                    name: w.name.clone(),
+                                },
+                            }
+                        })
+                        .collect(),
+                    empty: "No agent. `pma agent set <name> command <program>` adds one.",
+                },
+                Pane {
+                    title: "Presets".into(),
+                    columns: vec![
+                        col("preset", Kind::Text),
+                        col("default", Kind::Badge),
+                        col("agent", Kind::Text),
+                        col("model", Kind::Text),
+                        col("args", Kind::Wide),
+                    ],
+                    items: presets
+                        .iter()
+                        .map(|p| Item {
+                            cells: vec![
+                                plain(p.name.clone()),
+                                match default_preset.as_deref() == Some(p.name.as_str()) {
+                                    true => cell("default", Tone::Accent),
+                                    false => plain(""),
+                                },
+                                match agents.iter().any(|w| w.name == p.agent) {
+                                    true => plain(p.agent.clone()),
+                                    false => {
+                                        cell(format!("{} (no such agent)", p.agent), Tone::Bad)
+                                    }
+                                },
+                                muted(p.model.clone().unwrap_or_else(|| "its own".into())),
+                                muted(p.args.join(" ")),
+                            ],
+                            pick: Pick::Preset {
+                                name: p.name.clone(),
+                                agent: p.agent.clone(),
+                                model: p.model.clone(),
+                                args: p.args.clone(),
+                            },
+                        })
+                        .collect(),
+                    empty: "No preset. `p` names a worker, a model and its arguments.",
+                },
+                Pane {
+                    title: "Route revisions".into(),
+                    columns: vec![
+                        col("revision", Kind::Text),
+                        col("status", Kind::Badge),
+                        col("routes", Kind::Number),
+                        col("proposed by", Kind::Text),
+                        col("age", Kind::Text),
+                    ],
+                    items: routes
+                        .iter()
+                        .map(|r| {
+                            let (state, tone) = match (r.activated_at, r.shadow) {
+                                (None, _) => ("draft".to_string(), Tone::Muted),
+                                (Some(_), true) => ("shadow".to_string(), Tone::Warn),
+                                (Some(_), false) => ("active".to_string(), Tone::Good),
+                            };
+                            Item {
+                                cells: vec![
+                                    muted(r.revision.to_string()),
+                                    cell(state, tone),
+                                    plain(
+                                        r.policy().map(|p| p.routes.len()).unwrap_or(0).to_string(),
+                                    ),
+                                    muted(r.proposed_by.clone()),
+                                    muted(report::ago(now - r.created_at)),
+                                ],
+                                pick: Pick::Route {
+                                    revision: r.revision,
+                                    active: r.activated_at.is_some() && !r.shadow,
+                                },
+                            }
+                        })
+                        .collect(),
+                    empty: "No routing policy: dispatch uses the default agent and each task's class. `f` proposes one from a file.",
+                },
+            ],
+        ),
+        View::Scan { scan: sc, changes } => {
+            let mut fields = vec![
+                ("when".into(), report::ago(now - sc.at)),
+                (
+                    "kind".into(),
+                    if sc.full { "full" } else { "partial" }.into(),
+                ),
+                ("projects".into(), sc.projects.to_string()),
+                ("CI failing".into(), sc.failing.to_string()),
+            ];
+            for (f, n) in scan::Fault::ALL.iter().zip(sc.faults) {
+                if n > 0 {
+                    fields.push((f.name().to_string(), n.to_string()));
+                }
+            }
+            fields.push(("open items".into(), sc.open.to_string()));
+            fields.push((
+                "changed".into(),
+                format!(
+                    "{} opened, {} closed, {} other",
+                    sc.opened, sc.closed, sc.other
+                ),
+            ));
+            detail(
+                None,
+                None,
+                Detail {
+                    title: format!("Scan #{}", sc.id),
+                    pick: Pick::Scan { id: sc.id },
+                    badge: None,
+                    notice: None,
+                    fields,
+                    sections: vec![(
+                        "Changes since the scan before".into(),
+                        Section::Log,
+                        match changes.is_empty() {
+                            true => "No change.".into(),
+                            false => report::changes(&changes),
+                        },
+                    )],
+                },
+            )
+        }
+        View::RouteDoc { revision: r } => {
+            let (state, tone) = match (r.activated_at, r.shadow) {
+                (None, _) => ("draft", Tone::Muted),
+                (Some(_), true) => ("shadow", Tone::Warn),
+                (Some(_), false) => ("active", Tone::Good),
+            };
+            let mut fields = vec![
+                ("proposed by".into(), r.proposed_by.clone()),
+                ("proposed".into(), report::ago(now - r.created_at)),
+            ];
+            if let Some(by) = &r.activated_by {
+                fields.push(("activated by".into(), by.clone()));
+            }
+            detail(
+                None,
+                None,
+                Detail {
+                    title: format!("Route revision {}", r.revision),
+                    pick: Pick::Route {
+                        revision: r.revision,
+                        active: r.activated_at.is_some() && !r.shadow,
+                    },
+                    badge: Some(cell(state, tone)),
+                    notice: None,
+                    fields,
+                    sections: vec![("Policy".into(), Section::Log, r.document.clone())],
+                },
+            )
         }
         View::Task {
             placed,
@@ -1674,6 +1989,24 @@ pub fn screen(view: View) -> Screen {
 pub fn initial_input(act: Act, pick: &Pick) -> String {
     match (act, pick) {
         (Act::EditNote, Pick::Note { text, .. }) => text.clone(),
+        (Act::EditSetting, Pick::Setting { value, .. }) => value.clone(),
+        (
+            Act::EditPreset,
+            Pick::Preset {
+                agent, model, args, ..
+            },
+        ) => {
+            let mut line = agent.clone();
+            if let Some(m) = model {
+                line.push(':');
+                line.push_str(m);
+            }
+            for a in args {
+                line.push(' ');
+                line.push_str(a);
+            }
+            line
+        }
         _ => String::new(),
     }
 }
@@ -1686,6 +2019,11 @@ pub fn question(act: Act, pick: &Pick) -> String {
         Pick::Run { id, .. } | Pick::Job { id, .. } | Pick::Note { id, .. } => format!("#{id}"),
         Pick::Instance { id, .. } => format!("instance {id}"),
         Pick::Campaign { name } => name.clone(),
+        Pick::Setting { key, .. } => key.clone(),
+        Pick::Root { path } => path.clone(),
+        Pick::Agent { name } | Pick::Preset { name, .. } => name.clone(),
+        Pick::Route { revision, .. } => format!("route revision {revision}"),
+        Pick::Scan { id } => format!("scan {id}"),
         Pick::Nothing => String::new(),
     };
     // Publishing a ready run approves it first (`api::act`); the question
@@ -1704,8 +2042,15 @@ pub fn question(act: Act, pick: &Pick) -> String {
         Act::StopJob | Act::StopWorkflow => "stop",
         Act::RemoveNote => "remove note",
         Act::RunCampaign => "run campaign",
+        Act::RemoveCampaign => "remove campaign",
         Act::ApproveRuns => "approve every clean run",
         Act::Sync => "sync critical items to GitHub issues",
+        Act::ResetSetting => "reset to its default:",
+        Act::RemoveRoot => "remove root",
+        Act::RemoveAgent => "remove agent",
+        Act::RemovePreset => "remove preset",
+        Act::ActivateRoute => "put in effect:",
+        Act::Prune => "remove finished items from TODO.md in the project in view",
         _ => "do this to",
     };
     format!("{verb} {what}?").replace(" ?", "?")
@@ -1739,13 +2084,30 @@ pub fn action_in(
             if project.is_empty() {
                 return Err("open a project first".into());
             }
-            Action::Scan {
-                of: Selection {
-                    projects: vec![project.to_string()],
-                    tags: Vec::new(),
+            let of = Selection {
+                projects: vec![project.to_string()],
+                tags: Vec::new(),
+            };
+            match input {
+                "" | "scan" => Action::Scan {
+                    of,
+                    offline: false,
+                    deps: false,
                 },
-                offline: false,
-                deps: false,
+                "deps" => Action::Scan {
+                    of,
+                    offline: false,
+                    deps: true,
+                },
+                "offline" => Action::Scan {
+                    of,
+                    offline: true,
+                    deps: false,
+                },
+                "refresh-deps" => Action::RefreshDeps {
+                    project: project.to_string(),
+                },
+                other => return Err(format!("unknown choice `{other}`")),
             }
         }
         (Act::Sync, _) => Action::Sync {
@@ -1828,6 +2190,175 @@ pub fn action_in(
                 },
             }
         }
+        (Act::Configure, pick) => {
+            let project = match pick.project() {
+                Some(p) => p.to_string(),
+                None if !project.is_empty() => project.to_string(),
+                None => return Err("open a project first".into()),
+            };
+            let (what, value) = input
+                .split_once(char::is_whitespace)
+                .map(|(w, v)| (w, v.trim()))
+                .unwrap_or((input, ""));
+            match what {
+                "tier" => Action::SetTier {
+                    tier: match value {
+                        "none" => None,
+                        t => Some(
+                            t.parse::<u8>()
+                                .ok()
+                                .filter(|t| (1..=5).contains(t))
+                                .ok_or("tier must be 1 to 5, or none")?,
+                        ),
+                    },
+                    project,
+                },
+                "tag" => match value.split_at_checked(1) {
+                    Some(("+", tag)) if !tag.is_empty() => Action::Tag {
+                        project,
+                        tag: tag.to_string(),
+                        add: true,
+                    },
+                    Some(("-", tag)) if !tag.is_empty() => Action::Tag {
+                        project,
+                        tag: tag.to_string(),
+                        add: false,
+                    },
+                    _ => return Err("`tag +name` adds a tag, `tag -name` removes one".into()),
+                },
+                "verify" | "sandbox" => Action::SetConfig {
+                    key: format!("projects.{project}.{what}"),
+                    value: value.to_string(),
+                },
+                _ => {
+                    return Err(
+                        "type `tier 1-5|none`, `tag +name|-name`, `verify <command>` or \
+                         `sandbox on|off`"
+                            .into(),
+                    );
+                }
+            }
+        }
+        (Act::Prune, pick) => match pick.project() {
+            Some(p) => Action::Prune {
+                project: p.to_string(),
+            },
+            None if !project.is_empty() => Action::Prune {
+                project: project.to_string(),
+            },
+            None => return Err("open a project first".into()),
+        },
+        (Act::EditSetting, Pick::Setting { key, .. }) => {
+            if input.is_empty() {
+                return Err("type a value; `x` resets the setting".into());
+            }
+            Action::SetConfig {
+                key: key.clone(),
+                value: input.to_string(),
+            }
+        }
+        (Act::ResetSetting, Pick::Setting { key, .. }) => Action::ResetConfig { key: key.clone() },
+        (Act::EditSetting | Act::ResetSetting, _) => return need("a setting"),
+        (Act::AddRoot, _) => {
+            if input.is_empty() {
+                return Err("type a directory".into());
+            }
+            Action::AddRoot {
+                path: input.to_string(),
+            }
+        }
+        (Act::RemoveRoot, Pick::Root { path }) => Action::RemoveRoot { path: path.clone() },
+        (Act::RemoveRoot, _) => return need("a root"),
+        (Act::EditAgent, Pick::Agent { name }) => {
+            let (field, value) = input
+                .split_once(char::is_whitespace)
+                .ok_or("type a field and its value, such as `sandbox true`")?;
+            Action::SetAgentField {
+                name: name.clone(),
+                field: field.to_string(),
+                value: value.trim().to_string(),
+            }
+        }
+        (Act::RemoveAgent, Pick::Agent { name }) => Action::RemoveAgent { name: name.clone() },
+        (Act::UseAgent, Pick::Agent { name }) => Action::SetConfig {
+            key: "agent".into(),
+            value: name.clone(),
+        },
+        (Act::EditAgent | Act::RemoveAgent | Act::UseAgent, _) => return need("an agent"),
+        (Act::EditPreset, Pick::Preset { name, .. }) => {
+            let (agent, model, args) = preset_words(input)?;
+            Action::SetPreset {
+                name: name.clone(),
+                agent,
+                model,
+                args,
+            }
+        }
+        (Act::AddPreset, _) => {
+            let (name, rest) = input
+                .split_once(char::is_whitespace)
+                .ok_or("type a name, then the agent: `fast claude:haiku`")?;
+            let (agent, model, args) = preset_words(rest.trim())?;
+            Action::SetPreset {
+                name: name.to_string(),
+                agent,
+                model,
+                args,
+            }
+        }
+        (Act::RemovePreset, Pick::Preset { name, .. }) => {
+            Action::RemovePreset { name: name.clone() }
+        }
+        (Act::UsePreset, Pick::Preset { name, .. }) => Action::SetConfig {
+            key: "preset".into(),
+            value: name.clone(),
+        },
+        (Act::EditPreset | Act::RemovePreset | Act::UsePreset, _) => return need("a preset"),
+        (Act::ActivateRoute, Pick::Route { revision, .. }) => Action::ActivateRoute {
+            revision: *revision,
+        },
+        (Act::ActivateRoute, _) => return need("a draft route revision"),
+        (Act::ProposeRoute, _) => {
+            if input.is_empty() {
+                return Err("type the policy file's path".into());
+            }
+            Action::ProposeRoute {
+                path: input.to_string(),
+            }
+        }
+        (Act::AddCampaign, _) => {
+            let mut words = input.split_whitespace();
+            let name = words
+                .next()
+                .ok_or("type a name, the projects, then the task")?;
+            let projects: Vec<String> = words
+                .next()
+                .ok_or("name the projects, separated by commas")?
+                .split(',')
+                .filter(|p| !p.is_empty())
+                .map(String::from)
+                .collect();
+            let (mut class, mut text) = (None, Vec::new());
+            for w in words {
+                match w.strip_prefix("--class=") {
+                    Some(c) => class = Some(c.to_string()),
+                    None => text.push(w),
+                }
+            }
+            if projects.is_empty() || text.is_empty() {
+                return Err("a campaign needs projects and a task text".into());
+            }
+            Action::AddCampaign {
+                name: name.to_string(),
+                text: text.join(" "),
+                projects,
+                class,
+            }
+        }
+        (Act::RemoveCampaign, Pick::Campaign { name }) => {
+            Action::RemoveCampaign { name: name.clone() }
+        }
+        (Act::RemoveCampaign, _) => return need("a campaign"),
         (Act::ApproveRuns, _) => {
             let ids: Vec<i64> = pane
                 .iter()
@@ -1947,6 +2478,19 @@ pub fn action_in(
         (Act::RemoveNote, Pick::Note { id, .. }) => Action::RemoveNote { id: *id },
         (Act::EditNote | Act::RemoveNote, _) => return need("a note"),
     })
+}
+
+/// `agent[:model] [args...]`, as `pma preset set` reads it after the name.
+fn preset_words(input: &str) -> Result<(String, Option<String>, Vec<String>), String> {
+    let mut words = input.split_whitespace();
+    let first = words
+        .next()
+        .ok_or("name the agent, with its model after a colon: `claude:haiku`")?;
+    let (agent, model) = match first.split_once(':') {
+        Some((a, m)) => (a.to_string(), Some(m.to_string()).filter(|m| !m.is_empty())),
+        None => (first.to_string(), None),
+    };
+    Ok((agent, model, words.map(String::from).collect()))
 }
 
 #[cfg(test)]
@@ -2203,6 +2747,91 @@ mod tests {
             project: "p".into(),
         };
         assert_eq!(question(Act::Push, &ready), "approve and push #7?");
+    }
+
+    /// `e` on a project reads one setting a line: a tier, a tag, the
+    /// verify command or the sandbox; a campaign and a preset read their
+    /// words as the CLI does.
+    #[test]
+    fn typed_settings_build_their_actions() {
+        let none = Pick::Nothing;
+        assert_eq!(
+            action_in(Act::Configure, &none, &[], "tier 2", "argdec"),
+            Ok(Action::SetTier {
+                project: "argdec".into(),
+                tier: Some(2)
+            })
+        );
+        assert_eq!(
+            action_in(Act::Configure, &none, &[], "tag +oss", "argdec"),
+            Ok(Action::Tag {
+                project: "argdec".into(),
+                tag: "oss".into(),
+                add: true
+            })
+        );
+        assert_eq!(
+            action_in(Act::Configure, &none, &[], "verify make test", "argdec"),
+            Ok(Action::SetConfig {
+                key: "projects.argdec.verify".into(),
+                value: "make test".into()
+            })
+        );
+        assert!(action_in(Act::Configure, &none, &[], "tier 9", "argdec").is_err());
+        assert!(action_in(Act::Configure, &none, &[], "colour red", "argdec").is_err());
+        assert!(
+            action(Act::Configure, &none, &[], "tier 1").is_err(),
+            "no project"
+        );
+        assert_eq!(
+            action(
+                Act::AddCampaign,
+                &none,
+                &[],
+                "c a,b --class=B fix the thing"
+            ),
+            Ok(Action::AddCampaign {
+                name: "c".into(),
+                text: "fix the thing".into(),
+                projects: vec!["a".into(), "b".into()],
+                class: Some("B".into()),
+            })
+        );
+        assert_eq!(
+            action(Act::AddPreset, &none, &[], "fast claude:haiku --x"),
+            Ok(Action::SetPreset {
+                name: "fast".into(),
+                agent: "claude".into(),
+                model: Some("haiku".into()),
+                args: vec!["--x".into()],
+            })
+        );
+        let preset = Pick::Preset {
+            name: "fast".into(),
+            agent: "claude".into(),
+            model: Some("haiku".into()),
+            args: vec!["--x".into()],
+        };
+        assert_eq!(initial_input(Act::EditPreset, &preset), "claude:haiku --x");
+        assert_eq!(
+            action(Act::UsePreset, &preset, &[], ""),
+            Ok(Action::SetConfig {
+                key: "preset".into(),
+                value: "fast".into()
+            })
+        );
+        assert_eq!(
+            action_in(Act::ScanProject, &none, &[], "refresh-deps", "argdec"),
+            Ok(Action::RefreshDeps {
+                project: "argdec".into()
+            })
+        );
+        let Ok(Action::Scan { deps, .. }) =
+            action_in(Act::ScanProject, &none, &[], "deps", "argdec")
+        else {
+            panic!("a scan");
+        };
+        assert!(deps);
     }
 
     #[test]

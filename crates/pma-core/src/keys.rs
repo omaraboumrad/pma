@@ -22,13 +22,15 @@ pub enum Tab {
     Library,
     Report,
     Notes,
+    /// Settings, roots, agents, presets and route revisions.
+    Settings,
     /// One project, opened from a row that names it. It has no key of its
     /// own: which project is the front end's to remember.
     Project,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 8] = [
+    pub const ALL: [Tab; 9] = [
         Tab::Inbox,
         Tab::Projects,
         Tab::Activity,
@@ -36,6 +38,7 @@ impl Tab {
         Tab::Library,
         Tab::Report,
         Tab::Notes,
+        Tab::Settings,
         Tab::Project,
     ];
 
@@ -48,6 +51,7 @@ impl Tab {
             Tab::Library => "library",
             Tab::Report => "report",
             Tab::Notes => "notes",
+            Tab::Settings => "settings",
             Tab::Project => "project",
         }
     }
@@ -74,6 +78,7 @@ impl Tab {
             Tab::Library => Query::Library,
             Tab::Report => Query::Report { by },
             Tab::Notes => Query::Notes,
+            Tab::Settings => Query::Settings,
             Tab::Project => Query::Project {
                 name: project.to_string(),
             },
@@ -114,10 +119,35 @@ pub enum Act {
     /// `pma run <name>` over the project in view or the selected row's,
     /// from a typed `<name> [--review] [--worktree] [--push]`.
     Run,
+    // Configuring.
+    EditSetting,
+    ResetSetting,
+    AddRoot,
+    RemoveRoot,
+    /// `pma agent set <name> <field> <value>`, from a typed `field value`.
+    EditAgent,
+    RemoveAgent,
+    /// Makes the selected agent `pma config agent`.
+    UseAgent,
+    EditPreset,
+    AddPreset,
+    RemovePreset,
+    /// Makes the selected preset `pma config preset`.
+    UsePreset,
+    ActivateRoute,
+    ProposeRoute,
+    AddCampaign,
+    RemoveCampaign,
+    /// The project in view: its tier, a tag, its verify command or its
+    /// sandbox, from a typed `tier 3`, `tag +name`, `verify make test` or
+    /// `sandbox on`.
+    Configure,
+    /// Removes finished items from the project in view's TODO.md.
+    Prune,
 }
 
 impl Act {
-    pub const ALL: [Act; 25] = [
+    pub const ALL: [Act; 42] = [
         Act::ApproveRun,
         Act::ApproveRuns,
         Act::RejectRun,
@@ -143,6 +173,23 @@ impl Act {
         Act::Sync,
         Act::Verify,
         Act::Run,
+        Act::EditSetting,
+        Act::ResetSetting,
+        Act::AddRoot,
+        Act::RemoveRoot,
+        Act::EditAgent,
+        Act::RemoveAgent,
+        Act::UseAgent,
+        Act::EditPreset,
+        Act::AddPreset,
+        Act::RemovePreset,
+        Act::UsePreset,
+        Act::ActivateRoute,
+        Act::ProposeRoute,
+        Act::AddCampaign,
+        Act::RemoveCampaign,
+        Act::Configure,
+        Act::Prune,
     ];
 
     pub fn name(self) -> String {
@@ -162,6 +209,12 @@ impl Act {
                 | Act::ApproveRuns
                 | Act::StartWorkflow
                 | Act::Run
+                | Act::AddRoot
+                | Act::AddPreset
+                | Act::ProposeRoute
+                | Act::AddCampaign
+                | Act::Configure
+                | Act::Prune
         )
     }
 
@@ -169,10 +222,18 @@ impl Act {
     /// discards or publishes something that cannot be called back.
     pub fn weight(self) -> &'static str {
         match self {
-            Act::ApproveRun | Act::ApproveJob | Act::Dispatch => "primary",
-            Act::RejectRun | Act::StopJob | Act::StopWorkflow | Act::RemoveNote | Act::Push => {
-                "danger"
-            }
+            Act::ApproveRun | Act::ApproveJob | Act::Dispatch | Act::ActivateRoute => "primary",
+            Act::RejectRun
+            | Act::StopJob
+            | Act::StopWorkflow
+            | Act::RemoveNote
+            | Act::Push
+            | Act::ResetSetting
+            | Act::RemoveRoot
+            | Act::RemoveAgent
+            | Act::RemovePreset
+            | Act::RemoveCampaign
+            | Act::Prune => "danger",
             _ => "default",
         }
     }
@@ -201,6 +262,26 @@ impl Act {
             Action::RunCampaign { .. } => &[Act::RunCampaign],
             Action::Sync { .. } => &[Act::Sync],
             Action::Verify { .. } => &[Act::Verify],
+            Action::SetConfig { .. } => &[
+                Act::EditSetting,
+                Act::UseAgent,
+                Act::UsePreset,
+                Act::Configure,
+            ],
+            Action::ResetConfig { .. } => &[Act::ResetSetting],
+            Action::AddRoot { .. } => &[Act::AddRoot],
+            Action::RemoveRoot { .. } => &[Act::RemoveRoot],
+            Action::SetAgentField { .. } => &[Act::EditAgent],
+            Action::RemoveAgent { .. } => &[Act::RemoveAgent],
+            Action::SetPreset { .. } => &[Act::EditPreset, Act::AddPreset],
+            Action::RemovePreset { .. } => &[Act::RemovePreset],
+            Action::ActivateRoute { .. } => &[Act::ActivateRoute],
+            Action::ProposeRoute { .. } => &[Act::ProposeRoute],
+            Action::AddCampaign { .. } => &[Act::AddCampaign],
+            Action::RemoveCampaign { .. } => &[Act::RemoveCampaign],
+            Action::SetTier { .. } | Action::Tag { .. } => &[Act::Configure],
+            Action::Prune { .. } => &[Act::Prune],
+            Action::RefreshDeps { .. } => &[Act::ScanProject],
         }
     }
 }
@@ -297,6 +378,7 @@ pub const BINDINGS: &[Binding] = &[
     bind("5", Command::Tab(Tab::Library), "library"),
     bind("6", Command::Tab(Tab::Report), "report"),
     bind("7", Command::Tab(Tab::Notes), "notes"),
+    bind("8", Command::Tab(Tab::Settings), "settings"),
     bind("j", Command::Down, "down"),
     bind("ArrowDown", Command::Down, "down"),
     bind("k", Command::Up, "up"),
@@ -317,13 +399,16 @@ pub const BINDINGS: &[Binding] = &[
         tabs: PANES,
         ..bind("h", Command::PrevPane, "previous list")
     },
-    // A run or a job in full; a task's project.
+    // A run, a job, a scan, a campaign or a route in full; a task's
+    // project, or in its project the task itself.
     Binding {
         tabs: &[
             Tab::Inbox,
             Tab::Projects,
             Tab::Activity,
             Tab::Matrix,
+            Tab::Library,
+            Tab::Settings,
             Tab::Project,
         ],
         ..bind("Enter", Command::Open, "open")
@@ -347,8 +432,22 @@ pub const BINDINGS: &[Binding] = &[
         "r",
         &[Tab::Project],
         Act::ScanProject,
-        Ask::Nothing,
+        Ask::Choose("rescan"),
         "rescan project",
+    ),
+    on(
+        "e",
+        &[Tab::Project],
+        Act::Configure,
+        Ask::Text("tier 1-5|none, tag +name|-name, verify <command>, or sandbox on|off"),
+        "project settings",
+    ),
+    on(
+        "f",
+        &[Tab::Project],
+        Act::Prune,
+        Ask::Confirm,
+        "prune done items",
     ),
     // A project: the one in view, or the selected row's.
     on(
@@ -412,9 +511,115 @@ pub const BINDINGS: &[Binding] = &[
         Ask::Confirm,
         "run campaign",
     ),
+    on(
+        "a",
+        &[Tab::Library],
+        Act::AddCampaign,
+        Ask::Text("name project,project text... [--class=A]"),
+        "add campaign",
+    ),
+    on(
+        "x",
+        &[Tab::Library],
+        Act::RemoveCampaign,
+        Ask::Confirm,
+        "remove",
+    ),
     // A note.
     on("e", &[Tab::Notes], Act::EditNote, Ask::Text("note"), "edit"),
     on("x", &[Tab::Notes], Act::RemoveNote, Ask::Confirm, "remove"),
+    // Settings. `e`, `x` and `a` each mean one thing per row kind.
+    on(
+        "e",
+        &[Tab::Settings],
+        Act::EditSetting,
+        Ask::Text("value"),
+        "edit",
+    ),
+    on(
+        "e",
+        &[Tab::Settings],
+        Act::EditAgent,
+        Ask::Text("field value"),
+        "set field",
+    ),
+    on(
+        "e",
+        &[Tab::Settings],
+        Act::EditPreset,
+        Ask::Text("agent[:model] [args...]"),
+        "edit",
+    ),
+    on(
+        "x",
+        &[Tab::Settings],
+        Act::ResetSetting,
+        Ask::Confirm,
+        "reset",
+    ),
+    on(
+        "x",
+        &[Tab::Settings],
+        Act::RemoveRoot,
+        Ask::Confirm,
+        "remove",
+    ),
+    on(
+        "x",
+        &[Tab::Settings],
+        Act::RemoveAgent,
+        Ask::Confirm,
+        "remove",
+    ),
+    on(
+        "x",
+        &[Tab::Settings],
+        Act::RemovePreset,
+        Ask::Confirm,
+        "remove",
+    ),
+    on(
+        "a",
+        &[Tab::Settings],
+        Act::UseAgent,
+        Ask::Nothing,
+        "make default",
+    ),
+    on(
+        "a",
+        &[Tab::Settings],
+        Act::UsePreset,
+        Ask::Nothing,
+        "make default",
+    ),
+    on(
+        "a",
+        &[Tab::Settings],
+        Act::ActivateRoute,
+        Ask::Confirm,
+        "activate",
+    ),
+    on(
+        "r",
+        &[Tab::Settings],
+        Act::AddRoot,
+        Ask::Text("directory"),
+        "add root",
+    ),
+    on(
+        "p",
+        &[Tab::Settings],
+        Act::AddPreset,
+        Ask::Text("name agent[:model] [args...]"),
+        "add preset",
+    ),
+    on(
+        "f",
+        &[Tab::Settings],
+        Act::ProposeRoute,
+        Ask::Text("policy file"),
+        "propose route",
+    ),
 ];
 
 /// The binding `key` has on `tab` for a row about `pick`. One applying to
@@ -517,6 +722,23 @@ mod tests {
                 text: "t".into(),
             },
             Pick::Campaign { name: "c".into() },
+            Pick::Setting {
+                key: "k".into(),
+                value: "v".into(),
+            },
+            Pick::Root { path: "/r".into() },
+            Pick::Agent { name: "a".into() },
+            Pick::Preset {
+                name: "p".into(),
+                agent: "a".into(),
+                model: None,
+                args: vec![],
+            },
+            Pick::Route {
+                revision: 1,
+                active: false,
+            },
+            Pick::Scan { id: 1 },
         ];
         for tab in Tab::ALL {
             let on = on_tab(tab);

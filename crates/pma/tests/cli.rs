@@ -4382,6 +4382,77 @@ fn a_task_opens_in_full_from_its_project() {
     drop(child);
 }
 
+/// Settings are edited from the web as the CLI edits them: a key, a
+/// project's tier and a campaign, each visible to the CLI afterwards.
+#[test]
+fn settings_are_edited_from_the_web() {
+    let s = Scratch::new("websettings");
+    let (env, _origin, _alpha) = dispatch_env(&s, &[("claude", FAKE_CLAUDE)]);
+    let (child, port, cookie) = start_web(&env);
+    let act = |tab: &str, act: &str, pick: serde_json::Value, input: &str, project: &str| {
+        web(
+            port,
+            &cookie,
+            "/api/act",
+            Some(serde_json::json!({
+                "tab": tab, "act": act, "pick": pick, "input": input, "project": project,
+            })),
+        )
+    };
+    let (status, screen) = web(port, &cookie, "/api/screen?tab=settings", None);
+    assert_eq!(status, 200, "{screen}");
+    let panes = screen["body"]["panes"].as_array().unwrap();
+    let titles: Vec<&str> = panes.iter().map(|p| p["title"].as_str().unwrap()).collect();
+    assert_eq!(
+        titles,
+        ["Settings", "Roots", "Agents", "Presets", "Route revisions"]
+    );
+    let setting = panes[0]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["pick"]["key"] == "batch_budget")
+        .expect("batch_budget")["pick"]
+        .clone();
+    let (status, body) = act("settings", "EditSetting", setting, "9", "");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(env.ok(&["config", "batch_budget"]).trim(), "9");
+
+    let (status, body) = act(
+        "project",
+        "Configure",
+        serde_json::json!({ "kind": "nothing" }),
+        "tier 2",
+        "alpha",
+    );
+    assert_eq!(status, 200, "{body}");
+    assert!(env.ok(&["project"]).contains("tier 2"));
+    let (status, body) = act(
+        "project",
+        "Configure",
+        serde_json::json!({ "kind": "nothing" }),
+        "tier 9",
+        "alpha",
+    );
+    assert_eq!(status, 400, "{body}");
+
+    let (status, body) = act(
+        "library",
+        "AddCampaign",
+        serde_json::json!({ "kind": "nothing" }),
+        "greet alpha say hello",
+        "",
+    );
+    assert_eq!(status, 200, "{body}");
+    assert!(env.ok(&["campaign"]).contains("greet"), "the CLI lists it");
+    let (_, library) = web(port, &cookie, "/api/screen?tab=library", None);
+    assert!(
+        library.to_string().contains("\"kind\":\"campaign\""),
+        "{library}"
+    );
+    drop(child);
+}
+
 /// Every act the key table binds is one the web server takes by name: asked
 /// about with no row selected, it answers with a question or with the reason
 /// it cannot apply, never with a request it could not read.
