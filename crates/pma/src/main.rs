@@ -468,6 +468,9 @@ enum Command {
         /// Every approved run instead of named ones.
         #[arg(long, conflicts_with = "ids")]
         all_approved: bool,
+        /// The commit's subject line, for one run; the task text by default.
+        #[arg(long, conflicts_with = "all_approved")]
+        subject: Option<String>,
     },
     /// Push each run named to the default branch, committing first.
     ///
@@ -1052,15 +1055,19 @@ fn main() -> ExitCode {
         Command::Preset { action } => preset_command(action),
         Command::Agent { action } => agent_command(action),
         Command::Report { by } => run_report(by.as_deref()),
-        Command::Pr { ids, all_approved } => run_publish(&ids, all_approved, publish::Target::Pr),
+        Command::Pr { ids, all_approved } => {
+            run_publish(&ids, all_approved, publish::Target::Pr, None)
+        }
         Command::Stage { ids, all_approved } => {
-            run_publish(&ids, all_approved, publish::Target::Stage)
+            run_publish(&ids, all_approved, publish::Target::Stage, None)
         }
-        Command::Commit { ids, all_approved } => {
-            run_publish(&ids, all_approved, publish::Target::Commit)
-        }
+        Command::Commit {
+            ids,
+            all_approved,
+            subject,
+        } => run_publish(&ids, all_approved, publish::Target::Commit, subject),
         Command::Push { ids, all_approved } => {
-            run_publish(&ids, all_approved, publish::Target::Push)
+            run_publish(&ids, all_approved, publish::Target::Push, None)
         }
         Command::Verify { projects, tags } => run_verify(&projects, &tags),
         Command::Sync {
@@ -2344,6 +2351,7 @@ fn push_clean(
         cfg,
         approved,
         publish::Target::Push,
+        None,
         |run, outcome| match outcome {
             Ok(said) => println!("#{} {}: {said}", run.id, run.project),
             Err(e) => println!("#{} {}: not pushed: {e}", run.id, run.project),
@@ -3726,7 +3734,21 @@ fn run_verify(projects: &[String], tags: &[String]) -> Result<()> {
 /// Publishes the named runs one way: `pma pr` or `pma push`. Every run is
 /// checked before any is published, so a list with one run that is not
 /// approved changes nothing. `all` takes every approved run instead.
-fn run_publish(ids: &[i64], all: bool, target: publish::Target) -> Result<()> {
+fn run_publish(
+    ids: &[i64],
+    all: bool,
+    target: publish::Target,
+    subject: Option<String>,
+) -> Result<()> {
+    let subject = subject.map(|s| s.trim().to_string());
+    if let Some(s) = &subject {
+        if ids.len() != 1 {
+            return Err("--subject names one run".into());
+        }
+        if s.is_empty() || s.contains('\n') {
+            return Err("--subject is one line of text".into());
+        }
+    }
     let store = Store::open_default()?;
     let _session = Session::acquire(&store::home()?)?;
     let cfg = api::config(&store)?;
@@ -3767,6 +3789,7 @@ fn run_publish(ids: &[i64], all: bool, target: publish::Target) -> Result<()> {
         &cfg,
         runs,
         target,
+        subject.as_deref(),
         |run, outcome| match outcome {
             Ok(o) => println!("#{} {}: {o}", run.id, run.project),
             Err(e) => {
@@ -4420,11 +4443,19 @@ mod tests {
                 ids: vec![],
                 all_approved: true,
                 target: publish::Target::Push,
+                subject: None,
             },
             Action::Publish {
                 ids: vec![4, 5],
                 all_approved: false,
                 target: publish::Target::Pr,
+                subject: None,
+            },
+            Action::Publish {
+                ids: vec![4],
+                all_approved: false,
+                target: publish::Target::Commit,
+                subject: Some("--fix: the parser".into()),
             },
             Action::RunCampaign {
                 name: "c".into(),

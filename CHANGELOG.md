@@ -12,9 +12,29 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - Task rows in the inbox, the matrix and a project's view carry the issue a task tracks, as `#N`, linked to its page in the web when the scan recorded the repository. A run's detail shows it too, and `pma review <id>` prints the number.
 
+- The web page keeps its view in the address: `?tab=project&project=alpha&open=run:52`. A reload returns to it, and Back and Forward move between views. The query string rather than the fragment, which carries the launch token. No client router: the page has no build step.
+
+- `m` asks for the commit's subject, starting from the task text, in the TUI and the web; `pma commit <id> --subject=<text>` sets it from the CLI. The trailers stay.
+
+- A pull request's body names the run, then the agent's summary, the verify result and the trailers. It was the commit message less its subject, so empty for most runs.
+
+- `pma review <id> --reject` and both front ends say what a rejection did: `Run #52 rejected; reverted 2 files in ~/projects/alpha.`
+
+- `/` in the TUI's run list filters it by name; the web's list has a filter box, and the arrows move among what it keeps. The web's names and descriptions line up in columns.
+
 ### Changed
 
+- A command already queued or running from the same directory is refused as a job: `job 12 is queued already: pma verify alpha`. A second click on verify queued a second verify. It applies to `--detach` too.
+
+- One click on a web row with a detail (a run, a job, a scan, a route, a campaign, a task in its project) opens it. Other rows are selected, as before. It took a double-click.
+
 - The TUI footer queues transitions: three runs reaching review within a second name the first with "2 more", and each Enter opens the next. Before, only the last was named.
+
+### Fixed
+
+- The web page opened blank, with its footer on "Connecting" and no projects in the sidebar. `app.js` still named the tabs `next` and `status` from before the tabs were merged; the first draw threw before the event stream was opened, so no live update arrived either.
+
+- Enter in a web prompt cancelled it. The dialog's first button, Cancel, was the form's default button.
 
 ## [0.9.0]
 

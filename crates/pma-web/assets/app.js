@@ -20,16 +20,17 @@ const TABS = {
 
 const S = {
   keys: null,
-  tab: "next",
+  tab: "inbox",
   by: 1,
   screens: {},
   pane: {},
   sel: {},
   detail: null, // an open run or job: { screen, pick, acts }, over the tab
   project: "", // the project the project view shows
-  previous: "next", // the view it was opened from
+  previous: "inbox", // the view it was opened from
   projects: [], // every project, worst first: { name, tier, state, tone }
   filter: "",
+  restoring: false, // the view is being set from the address
 };
 
 const $ = (id) => document.getElementById(id);
@@ -138,6 +139,71 @@ function currentActs() {
   return s ? s.item.acts : [];
 }
 
+// ---------------------------------------------------------------- address
+
+// The view lives in the address, so a reload or Back returns to it:
+// `?tab=project&project=x&open=run:52`. Not in the fragment, which carries
+// the launch token.
+function address() {
+  const q = new URLSearchParams({ tab: S.tab });
+  if (S.tab === "project") q.set("project", S.project);
+  if (S.tab === "report" && S.by) q.set("by", S.keys.by[S.by]);
+  const p = S.detail && S.detail.pick;
+  const open = p && { run: p.id, job: p.id, scan: p.id, route: p.revision, campaign: p.name, task: p.target }[p.kind];
+  if (open !== undefined && open !== null) q.set("open", `${p.kind}:${open}`);
+  return `/?${q}`;
+}
+
+// Each new view is a history entry. Not while the address is being read:
+// that would add entries on a reload and drop the forward ones on Back.
+function remember() {
+  if (S.restoring) return;
+  const url = address();
+  if (url !== location.pathname + location.search) history.pushState(null, "", url);
+}
+
+// The pick `open=kind:value` names, with only what /api/open reads; the
+// detail it returns carries the full pick.
+function pickNamed(open) {
+  const i = open.indexOf(":");
+  const kind = open.slice(0, i);
+  const v = open.slice(i + 1);
+  const n = Number(v);
+  if (i < 0 || !v) return null;
+  if (["run", "job", "scan"].includes(kind) && !Number.isInteger(n)) return null;
+  return {
+    run: { kind, id: n, clean: false, state: "", project: "" },
+    job: { kind, id: n, awaiting: false },
+    scan: { kind, id: n },
+    route: { kind, revision: n, active: false },
+    campaign: { kind, name: v },
+    task: { kind, project: v.split(":")[0], target: v, retry: false },
+  }[kind] || null;
+}
+
+// Sets the view from the address; unknown values fall back to the inbox.
+async function restore() {
+  const q = new URLSearchParams(location.search);
+  const tab = q.get("tab");
+  const tabs = S.keys.tabs;
+  S.tab = tab && tabs.includes(tab) && TABS[tab] ? tab : "inbox";
+  S.project = q.get("project") || "";
+  if (S.tab === "project" && !S.project) S.tab = "inbox";
+  const by = S.keys.by.indexOf(q.get("by"));
+  S.by = by >= 0 ? by : 1;
+  S.detail = null;
+  const open = q.get("open") && pickNamed(q.get("open"));
+  S.restoring = true;
+  try {
+    await Promise.all([load(), loadProjects()]);
+    if (open) await openDetail(open);
+  } finally {
+    S.restoring = false;
+  }
+  // What could not be shown, such as a run since removed, leaves the address.
+  history.replaceState(null, "", address());
+}
+
 // ---------------------------------------------------------------- loading
 
 async function load() {
@@ -218,7 +284,7 @@ function drawProjects() {
 // Every project for the sidebar, from the status view: worst first.
 async function loadProjects() {
   try {
-    const s = await api("/api/screen?tab=status");
+    const s = await api("/api/screen?tab=projects");
     const items = (s.body.panes && s.body.panes[0] ? s.body.panes[0].items : []);
     S.projects = items.map((it) => ({
       name: it.cells[0].text,
@@ -244,6 +310,10 @@ function openProject(name) {
 // key.
 // Row kinds a detail opens for anywhere; a task opens in its project.
 const OPENABLE = ["run", "job", "scan", "route", "campaign"];
+
+function opens(pick) {
+  return OPENABLE.includes(pick.kind) || (pick.kind === "task" && S.tab === "project");
+}
 
 async function openDetail(pick) {
   if (!OPENABLE.includes(pick.kind) && pick.kind !== "task") return;
@@ -284,6 +354,7 @@ function draw() {
     ? (S.tab === "project" ? s.header.replace(`${S.project}  `, "") : s.header)
     : meta.about;
   document.title = `${title} - pma`;
+  remember();
   drawProjects();
 
   const toolbar = $("toolbar");
@@ -314,7 +385,7 @@ function draw() {
     const proj = onTab().find((b) => b.command.kind === "OpenProject");
     const open = onTab().find((b) => b.command.kind === "Open");
     const named = sel.item.pick.project;
-    const openable = OPENABLE.includes(sel.item.pick.kind) || (sel.item.pick.kind === "task" && S.tab === "project");
+    const openable = opens(sel.item.pick);
     if (own.length || (proj && named && S.tab !== "project") || (open && openable)) {
       toolbar.append(el("span", { class: "sep", "aria-hidden": "true" }));
     }
@@ -425,10 +496,10 @@ function card(p, pi) {
   p.items.forEach((item, ii) => {
     const sel = focused && ii === S.sel[S.tab][pi];
     const total = item.cells.every((c) => c.tone === "strong");
+    // A row with a detail opens on one click; any other row is selected.
     const tr = el("tr", {
       "aria-selected": String(sel),
-      onclick: () => select(pi, ii),
-      ondblclick: () => { select(pi, ii); run(lookup("Enter")); },
+      onclick: () => { select(pi, ii); if (opens(item.pick)) run(lookup("Enter")); },
     }, shown.map((i) => el("td", { class: p.columns[i].kind }, cellNode(item.cells[i], p.columns[i]))));
     (total ? foot : body).append(tr);
     if (sel) requestAnimationFrame(() => tr.scrollIntoView({ block: "nearest" }));
@@ -476,16 +547,43 @@ function toast(text, tone, open) {
 function chooser(asked, name) {
   const box = el("div", { class: "chooser" });
   const list = el("div", { class: "options", role: "radiogroup", "aria-label": name });
-  asked.options.forEach((o, i) => list.append(el("label", { class: "option" },
+  asked.options.forEach((o, i) => list.append(el("label", { class: "option", "data-name": o.name.toLowerCase() },
     el("input", { type: "radio", name: "choice", value: o.name, checked: i === 0 }),
     el("span", { class: "option-name" }, o.name),
     el("span", { class: "option-about" }, ...inline(o.about)))));
+  const rows = [...list.children];
+  const shown = () => rows.filter((r) => !r.hidden);
+  const choose = (r) => {
+    if (!r) return;
+    r.querySelector("input").checked = true;
+    r.scrollIntoView({ block: "nearest" });
+  };
+  // Typing filters by name; the arrows move among what is shown.
+  const filter = el("input", {
+    type: "search",
+    class: "filter",
+    placeholder: "Filter by name",
+    "aria-label": "Filter by name",
+    oninput: () => {
+      const f = filter.value.toLowerCase();
+      for (const r of rows) r.hidden = !r.dataset.name.includes(f);
+      const c = box.querySelector("input[name=choice]:checked");
+      if (!c || c.closest(".option").hidden) choose(shown()[0]);
+    },
+    onkeydown: (e) => {
+      if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+      e.preventDefault();
+      const v = shown();
+      const at = v.findIndex((r) => r.querySelector("input").checked);
+      choose(v[Math.max(0, Math.min(v.length - 1, at + (e.key === "ArrowDown" ? 1 : -1)))]);
+    },
+  });
   const flags = el("div", { class: "flags" }, asked.flags.map((f) => el("label", { class: "flag" },
     el("input", { type: "checkbox", value: f.arg }), f.label)));
-  box.append(list, flags);
+  box.append(filter, list, flags);
   box.read = () => {
     const chosen = box.querySelector("input[name=choice]:checked");
-    if (!chosen) return null;
+    if (!chosen || chosen.closest(".option").hidden) return null;
     const on = [...box.querySelectorAll(".flags input:checked")].map((i) => i.value);
     return [chosen.value, ...on].join(" ");
   };
@@ -510,7 +608,9 @@ function dialog({ title, text, field, input, ok, okClass, cancel, read }) {
   okb.className = `button ${okClass || "primary"}`;
   d.returnValue = "";
   d.showModal();
+  const search = t.querySelector("input[type=search]");
   if (field !== undefined) $("dialog-input").focus();
+  else if (search) search.focus();
   else okb.focus();
   return new Promise((resolve) => {
     d.addEventListener("close", () => {
@@ -669,7 +769,7 @@ async function start() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ token }),
     });
-    history.replaceState(null, "", "/");
+    history.replaceState(null, "", location.pathname + location.search);
   }
   try {
     S.keys = await api("/api/keys");
@@ -682,7 +782,15 @@ async function start() {
   drawNav();
   $("help-button").addEventListener("click", () => run(lookup("?")));
   document.addEventListener("keydown", onKey);
-  await Promise.all([load(), loadProjects()]);
+  // Enter in a field submits with OK. Left to the browser, the form's
+  // default button is the first one, Cancel.
+  $("dialog-form").addEventListener("keydown", (e) => {
+    if (e.key !== "Enter" || !(e.target instanceof HTMLInputElement)) return;
+    e.preventDefault();
+    $("dialog-form").requestSubmit($("dialog-ok"));
+  });
+  window.addEventListener("popstate", () => { if (!$("dialog").open) restore(); });
+  await restore();
   const events = new EventSource("/api/events");
   const heard = (e) => {
     let d = {};

@@ -232,7 +232,7 @@ fn route(req: &Request, ctx: &Ctx) -> Response {
                 }
                 let mut out = json!({
                     "question": screen::question(act, &pick),
-                    "input": screen::initial_input(act, &pick),
+                    "input": api::initial_input(store, act, &pick)?,
                 });
                 let chooses = keys::BINDINGS
                     .iter()

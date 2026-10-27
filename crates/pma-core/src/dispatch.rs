@@ -1816,9 +1816,9 @@ pub fn approve(store: &Store, run: &mut Run, by: &str) -> Result<()> {
 /// `keep` accepts hooks or settings the run found changed as the user's own.
 /// Without it, such a run is rejected only once the clone matches its
 /// snapshot again, so rejecting does not quietly lift what `clone_unchanged`
-/// holds.
-pub fn reject(store: &Store, run: &mut Run, keep: bool, infra: bool) -> Result<()> {
-    discard(store, run, keep)?;
+/// holds. Returns how many files the run's change held.
+pub fn reject(store: &Store, run: &mut Run, keep: bool, infra: bool) -> Result<usize> {
+    let files = discard(store, run, keep)?;
     run.infra = infra;
     store.update_run(run)?;
     let attempts = store.attempts(Some(run.id))?;
@@ -1834,14 +1834,14 @@ pub fn reject(store: &Store, run: &mut Run, keep: bool, infra: bool) -> Result<(
         // verify made of it. A run that never started has no work to judge.
         store.consume_attempt(&run.project, &attempt_key(run))?;
     }
-    Ok(())
+    Ok(files)
 }
 
 /// Removes a run's worktree and marks it rejected, consuming no attempt: what
 /// `reject` does before a reviewer's judgement is counted. A local edit that
 /// failed verify was counted by verify; one that did not apply was judged by
-/// no one.
-pub fn discard(store: &Store, run: &mut Run, keep: bool) -> Result<()> {
+/// no one. Returns how many files the change held.
+pub fn discard(store: &Store, run: &mut Run, keep: bool) -> Result<usize> {
     let read = run.state;
     if run.state == RunState::PrOpen {
         return Err(format!(
@@ -1877,17 +1877,30 @@ pub fn discard(store: &Store, run: &mut Run, keep: bool) -> Result<()> {
     }
     // The patch stays in the run's log directory either way.
     let patch = keep_patch(run);
+    let files = patch.as_deref().map_or(0, patch_files);
     if run.workspace == Workspace::Clone {
         revert(run, patch.as_deref())?;
         run.enter(RunState::Rejected);
-        return store.update_run_from(run, read);
+        store.update_run_from(run, read)?;
+        return Ok(files);
     }
     // Written first, and only over the state that was read: a run another
     // front end approved meanwhile is refused with its worktree intact.
     run.enter(RunState::Rejected);
     store.update_run_from(run, read)?;
     remove_worktree(&run.repo, &run.worktree, &run.branch)
-        .map_err(|e| format!("run #{} is rejected, but its worktree stays: {e}", run.id).into())
+        .map_err(|e| format!("run #{} is rejected, but its worktree stays: {e}", run.id))?;
+    Ok(files)
+}
+
+/// How many files a patch from `git diff` touches; none when it cannot be
+/// read.
+fn patch_files(patch: &Path) -> usize {
+    std::fs::read(patch).map_or(0, |b| {
+        b.split(|&c| c == b'\n')
+            .filter(|l| l.starts_with(b"diff --git "))
+            .count()
+    })
 }
 
 /// Writes the run's change to `runs/<id>/change.patch`, best effort: a run

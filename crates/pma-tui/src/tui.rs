@@ -42,6 +42,12 @@ pub enum Request {
         pick: Pick,
         label: &'static str,
     },
+    /// A prompt whose text starts from the store (`api::drafts`).
+    Prompt {
+        act: Act,
+        pick: Pick,
+        label: &'static str,
+    },
     Quit,
 }
 
@@ -64,7 +70,8 @@ enum Mode {
         input: String,
         pick: Pick,
     },
-    /// A list to choose from, with flags to toggle, for an act.
+    /// A list to choose from, with flags to toggle, for an act. `at` is a
+    /// place among the options `filter` keeps; `/` starts the filter.
     Choose {
         act: Act,
         label: &'static str,
@@ -72,6 +79,7 @@ enum Mode {
         choices: api::Choices,
         at: usize,
         on: Vec<bool>,
+        filter: Option<String>,
     },
 }
 
@@ -294,7 +302,29 @@ impl App {
                     choices,
                     at: 0,
                     on,
+                    filter: None,
                 };
+            }
+            Err(e) => self.say(e, Tone::Bad),
+        }
+    }
+
+    /// Opens the prompt `Request::Prompt` asked for, starting from `input`.
+    pub fn prompted(
+        &mut self,
+        act: Act,
+        pick: Pick,
+        label: &'static str,
+        input: std::result::Result<String, String>,
+    ) {
+        match input {
+            Ok(input) => {
+                self.mode = Mode::Prompt {
+                    act,
+                    label,
+                    input,
+                    pick,
+                }
             }
             Err(e) => self.say(e, Tone::Bad),
         }
@@ -390,39 +420,62 @@ impl App {
                 return None;
             }
             Mode::Choose {
-                choices, at, on, ..
+                choices,
+                at,
+                on,
+                filter,
+                ..
             } => {
-                let n = choices.options.len();
-                match key {
-                    "Escape" => {
+                let n = kept(choices, filter.as_deref()).len();
+                match (key, filter.as_mut()) {
+                    ("Escape", Some(_)) => {
+                        *filter = None;
+                        *at = 0;
+                    }
+                    ("Escape", None) => {
                         self.mode = Mode::Normal;
                         self.say("Cancelled.", Tone::Muted);
                     }
-                    "j" | "ArrowDown" => *at = (*at + 1).min(n.saturating_sub(1)),
-                    "k" | "ArrowUp" => *at = at.saturating_sub(1),
-                    "g" | "Home" => *at = 0,
-                    "G" | "End" => *at = n.saturating_sub(1),
-                    "Enter" => {
+                    ("ArrowDown", _) | ("j", None) => *at = (*at + 1).min(n.saturating_sub(1)),
+                    ("ArrowUp", _) | ("k", None) => *at = at.saturating_sub(1),
+                    ("Home", _) | ("g", None) => *at = 0,
+                    ("End", _) | ("G", None) => *at = n.saturating_sub(1),
+                    ("/", None) => *filter = Some(String::new()),
+                    ("Backspace", Some(f)) => {
+                        f.pop();
+                        *at = 0;
+                    }
+                    ("Enter", _) => {
                         let Mode::Choose {
                             act,
                             pick,
                             choices,
                             at,
                             on,
+                            filter,
                             ..
                         } = std::mem::replace(&mut self.mode, Mode::Normal)
                         else {
                             unreachable!("in a list");
                         };
-                        let input = choices.line(&choices.options[at].name, &on);
+                        let Some(&i) = kept(&choices, filter.as_deref()).get(at) else {
+                            self.say("Nothing matches.", Tone::Warn);
+                            return None;
+                        };
+                        let input = choices.line(&choices.options[i].name, &on);
                         let (_, pane) = self.pick();
                         return self.ask_done(act, &pick, &pane, &input);
                     }
-                    k => {
+                    (k, Some(f)) if k.chars().count() == 1 => {
+                        f.push_str(k);
+                        *at = 0;
+                    }
+                    (k, None) => {
                         if let Some(i) = choices.flags.iter().position(|f| f.key == k) {
                             on[i] = !on[i];
                         }
                     }
+                    _ => {}
                 }
                 return None;
             }
@@ -531,6 +584,7 @@ impl App {
     /// Starts an act on `pick`: asks what the binding asks, or does it.
     fn begin(&mut self, act: Act, ask: Ask, pick: Pick, pane: Vec<Item>) -> Option<Request> {
         match ask {
+            Ask::Text(label) if api::drafts(act) => Some(Request::Prompt { act, pick, label }),
             Ask::Text(label) => {
                 self.mode = Mode::Prompt {
                     act,
@@ -621,8 +675,9 @@ impl App {
                 choices,
                 at,
                 on,
+                filter,
                 ..
-            } => self.render_choose(frame, body, label, &choices, at, &on),
+            } => self.render_choose(frame, body, label, &choices, at, &on, filter.as_deref()),
             Mode::Normal => {}
         }
     }
@@ -683,8 +738,21 @@ impl App {
                 return hints(p, &[("Enter", "submit"), ("Esc", "cancel")]);
             }
             Mode::Confirm { .. } => return hints(p, &[("y", "yes"), ("any key", "no")]),
+            Mode::Choose {
+                filter: Some(_), ..
+            } => {
+                return hints(
+                    p,
+                    &[
+                        ("type", "filter"),
+                        ("Up/Down", "move"),
+                        ("Enter", "start"),
+                        ("Esc", "all"),
+                    ],
+                );
+            }
             Mode::Choose { choices, .. } => {
-                let mut pairs = vec![("j/k", "move")];
+                let mut pairs = vec![("j/k", "move"), ("/", "search")];
                 pairs.extend(choices.flags.iter().map(|f| (f.key, f.label)));
                 pairs.extend([("Enter", "start"), ("Esc", "cancel")]);
                 return hints(p, &pairs);
@@ -1077,6 +1145,7 @@ impl App {
 
     /// The list for an act: one line per option, its name and what it does,
     /// and the flags with their state.
+    #[allow(clippy::too_many_arguments)]
     fn render_choose(
         &self,
         frame: &mut Frame,
@@ -1085,6 +1154,7 @@ impl App {
         choices: &api::Choices,
         at: usize,
         on: &[bool],
+        filter: Option<&str>,
     ) {
         let p = self.palette;
         let width = choices
@@ -1093,26 +1163,33 @@ impl App {
             .map(|c| c.name.chars().count())
             .max()
             .unwrap_or(0);
-        let mut lines: Vec<Line> = choices
-            .options
-            .iter()
-            .enumerate()
-            .map(|(i, c)| {
-                let chosen = i == at;
-                let mark = match chosen {
-                    true => Span::styled("> ", p.accent().add_modifier(Modifier::BOLD)),
-                    false => Span::raw("  "),
-                };
-                let name = Span::styled(
-                    format!("{:<width$}  ", c.name),
-                    match chosen {
-                        true => p.accent().add_modifier(Modifier::BOLD),
-                        false => Style::new().add_modifier(Modifier::BOLD),
-                    },
-                );
-                Line::from(vec![mark, name, Span::styled(c.about.clone(), p.muted())])
-            })
-            .collect();
+        let mut lines: Vec<Line> = Vec::new();
+        if let Some(f) = filter {
+            lines.push(Line::from(vec![
+                Span::styled("/ ", p.accent().add_modifier(Modifier::BOLD)),
+                Span::raw(f.to_string()),
+            ]));
+        }
+        let kept = kept(choices, filter);
+        if kept.is_empty() {
+            lines.push(Line::styled("  Nothing matches.", p.muted()));
+        }
+        lines.extend(kept.iter().enumerate().map(|(i, &o)| {
+            let c = &choices.options[o];
+            let chosen = i == at;
+            let mark = match chosen {
+                true => Span::styled("> ", p.accent().add_modifier(Modifier::BOLD)),
+                false => Span::raw("  "),
+            };
+            let name = Span::styled(
+                format!("{:<width$}  ", c.name),
+                match chosen {
+                    true => p.accent().add_modifier(Modifier::BOLD),
+                    false => Style::new().add_modifier(Modifier::BOLD),
+                },
+            );
+            Line::from(vec![mark, name, Span::styled(c.about.clone(), p.muted())])
+        }));
         if !choices.flags.is_empty() {
             lines.push(Line::raw(""));
             let mut spans = Vec::new();
@@ -1315,6 +1392,15 @@ pub fn key_name(code: KeyCode) -> Option<String> {
     })
 }
 
+/// The options of `choices` whose name holds `filter`, ignoring case: every
+/// one without a filter.
+fn kept(choices: &api::Choices, filter: Option<&str>) -> Vec<usize> {
+    let f = filter.unwrap_or_default().to_lowercase();
+    (0..choices.options.len())
+        .filter(|&i| choices.options[i].name.to_lowercase().contains(&f))
+        .collect()
+}
+
 /// Sends a request through the API and gives the app the result. An action is
 /// followed by a reload of the tab, so the view shows what it changed.
 fn execute(store: &Store, app: &mut App, request: Request) {
@@ -1332,6 +1418,10 @@ fn execute(store: &Store, app: &mut App, request: Request) {
                 label,
                 api::choices(store, act).map_err(|e| e.to_string()),
             );
+        }
+        Request::Prompt { act, pick, label } => {
+            let input = api::initial_input(store, act, &pick).map_err(|e| e.to_string());
+            app.prompted(act, pick, label, input);
         }
         Request::Quit => {}
     }
@@ -1859,6 +1949,7 @@ mod tests {
                     },
                     at: 0,
                     on: vec![],
+                    filter: Some("rev".into()),
                 },
             ];
             for mode in modes {
@@ -1898,7 +1989,7 @@ mod tests {
                 label: "push when clean",
             }],
         };
-        app.offered(Act::Run, Pick::Nothing, "run", Ok(choices));
+        app.offered(Act::Run, Pick::Nothing, "run", Ok(choices.clone()));
         assert!(!app.idle());
         let out = screen_text(&mut app);
         assert!(
@@ -1921,6 +2012,21 @@ mod tests {
             (name.as_str(), project.as_str(), push),
             ("fix-ci", "spore", true)
         );
+
+        // `/` filters by name; letters then type rather than move or toggle.
+        app.offered(Act::Run, Pick::Nothing, "run", Ok(choices));
+        for k in ["/", "F", "i", "x"] {
+            app.key(k);
+        }
+        let out = screen_text(&mut app);
+        assert!(out.contains("/ Fix") && !out.contains("review"), "{out}");
+        app.key("q");
+        assert!(screen_text(&mut app).contains("Nothing matches."));
+        app.key("Backspace");
+        let Some(Request::Act(Action::Run { name, push, .. })) = app.key("Enter") else {
+            panic!("a run");
+        };
+        assert_eq!((name.as_str(), push), ("fix-ci", false));
         app.offered(Act::Run, Pick::Nothing, "run", Err("no store".into()));
         assert!(app.status.as_ref().unwrap().0.contains("no store"));
         assert!(app.idle());
@@ -1959,6 +2065,23 @@ mod tests {
             panic!("a push");
         };
         assert_eq!((ids, target), (vec![4], pma_core::publish::Target::Push));
+
+        // `m` asks for the commit's subject, which the store drafts.
+        let Some(Request::Prompt { act, pick, label }) = app.key("m") else {
+            panic!("a prompt from the store");
+        };
+        assert_eq!(act, Act::Commit);
+        app.prompted(act, pick, label, Ok("a run".into()));
+        assert!(screen_text(&mut app).contains("a run"));
+        app.key("!");
+        let Some(Request::Act(Action::Publish {
+            target, subject, ..
+        })) = app.key("Enter")
+        else {
+            panic!("a commit");
+        };
+        assert_eq!(target, pma_core::publish::Target::Commit);
+        assert_eq!(subject.as_deref(), Some("a run!"));
     }
 
     /// A run reaching review is named in the footer and Enter opens it;

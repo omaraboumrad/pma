@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::config::Config;
+use crate::config::{Config, Workspace};
 use crate::keys::Act;
 use crate::store::{
     Attempt, Campaign, Job, Note, Preset, RouteRevision, Run, RunState, Session, Store,
@@ -425,6 +425,8 @@ pub enum Action {
         ids: Vec<i64>,
         all_approved: bool,
         target: publish::Target,
+        /// Replaces the task text as the commit's subject.
+        subject: Option<String>,
     },
     RunCampaign {
         name: String,
@@ -922,6 +924,21 @@ impl Choices {
     }
 }
 
+/// Whether a prompt for `act` starts from what the store holds, so a front
+/// end asks `initial_input` rather than `screen::initial_input`.
+pub fn drafts(act: Act) -> bool {
+    act == Act::Commit
+}
+
+/// Text a prompt for `act` on `pick` starts with: a commit's subject starts
+/// as its run's task text.
+pub fn initial_input(store: &Store, act: Act, pick: &screen::Pick) -> Result<String> {
+    Ok(match (act, pick) {
+        (Act::Commit, screen::Pick::Run { id, .. }) => store.run(*id)?.text,
+        _ => screen::initial_input(act, pick),
+    })
+}
+
 /// What a front end lists for an act that asks `Ask::Choose`.
 pub fn choices(store: &Store, act: Act) -> Result<Choices> {
     match act {
@@ -1379,6 +1396,7 @@ pub fn act(store: &Store, a: Action) -> Result<Outcome> {
         ids,
         all_approved: false,
         target,
+        ..
     } = &a
         && *target != publish::Target::Stage
     {
@@ -1439,8 +1457,17 @@ pub fn act(store: &Store, a: Action) -> Result<Outcome> {
             store.fail_interrupted_runs(&session)?;
             let mut run = store.run(id)?;
             unmoved(&run, seen.as_deref())?;
-            dispatch::reject(store, &mut run, keep_git_changes, infra)?;
-            Outcome::default()
+            let files = dispatch::reject(store, &mut run, keep_git_changes, infra)?;
+            let plural = if files == 1 { "" } else { "s" };
+            Outcome::said(match run.workspace {
+                Workspace::Clone => format!(
+                    "Run #{id} rejected; reverted {files} file{plural} in {}.",
+                    run.repo.display()
+                ),
+                Workspace::Worktree => {
+                    format!("Run #{id} rejected; removed its worktree of {files} file{plural}.")
+                }
+            })
         }
         Action::AddReviewTime { id, minutes } => {
             store.run(id)?;
@@ -1837,10 +1864,12 @@ pub fn command_line(a: &Action) -> Option<Vec<String>> {
             ids,
             all_approved,
             target,
+            subject,
         } => {
             push(target.name());
             v.extend(ids.iter().map(i64::to_string));
             flag(&mut v, *all_approved, "--all-approved");
+            opt(&mut v, "--subject", subject);
         }
         Action::RunCampaign { name, count } => {
             v.extend(["campaign".to_string(), "run".into(), name.clone()]);
@@ -1972,7 +2001,8 @@ mod tests {
             line(Action::Publish {
                 ids: vec![4],
                 all_approved: false,
-                target: publish::Target::Pr
+                target: publish::Target::Pr,
+                subject: None,
             }),
             ["pr", "4"]
         );

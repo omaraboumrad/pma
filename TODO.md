@@ -4,6 +4,33 @@
 
 ## High
 
+- [x] The web page opens blank, its footer stays on "Connecting", and its project list is empty
+  Done 2026-10-27: `app.js` still named the tabs `next` and `status` from before the 2026-10-26 merge. The first draw threw on `TABS["next"]`, which stopped `start()` before it opened the event stream; `tab=status` got a 400. A test now holds that every tab `app.js` names is one the server parses.
+
+- [x] Enter in a web prompt cancelled it
+  Done 2026-10-27: the form's default button was its first, Cancel. Found driving the page in headless Chromium.
+
+- [x] Keep the web view in the URL, so a reload keeps it
+  Done 2026-10-27: `?tab=project&project=x&open=run:52`, each change a history entry. No React: the page has no build step by design. Not the fragment: the launch token is there.
+
+- [x] Say what a reject did: "Run #52 rejected; reverted 2 files."
+  Done 2026-10-27, in the CLI and both front ends.
+
+- [x] A pull request's body holds the agent's summary, the verify result and the run number
+  Done 2026-10-27. It was the commit message after its first blank line, empty when the message is one line.
+
+- [x] Show the commit message before committing, and let it be changed
+  Done 2026-10-27: `m` prompts for the subject, prefilled with the task text; `pma commit --subject`. The trailers (`Closes #N`, `Co-Authored-By`) stay and are not shown. A multi-line editor would need a new `Ask` kind in both front ends.
+
+- [x] Refuse a queued action already queued or running
+  Done 2026-10-27: the same command from the same directory is refused while one is queued or running, in one statement.
+
+- [x] One click opens a row's detail in the web
+  Done 2026-10-27: a row with a detail opens on one click, since the detail carries its acts; other rows select.
+
+- [x] `z` in both front ends filters by name as well as moving with the arrows; the web aligns names and descriptions as the TUI does
+  Done 2026-10-27: `/` filters in the TUI; a filter box in the web.
+
 - [x] Admin from the TUI and the web
   Done 2026-10-26: a settings tab (keys, roots, agents, presets, routes), project tier, tags, verify and sandbox from the project view, prune, campaign add and remove, rescan with dependencies or offline, deps refresh, scan history and route documents. Still CLI-only: `project export`, `import`, `forget` and `clone`, `route replay`, `lint --ids` (`docs/dev/frontends.md`).
 
@@ -26,6 +53,36 @@
   deps covers `cargo`, `uv` and `go` (`crates/pma-core/src/deps.rs:24-26`). Without `uv.lock`, verify detection picks `python3 -m pytest` (`crates/pma-core/src/agent.rs:263-268`), likely without the project's dependencies (unverified). The README's Requirements now state what is supported. (REVIEW.md U7)
 
 ## Medium
+
+- [ ] Retest live updates in the web after the blank-page fix #manual
+  The event stream existed but was never opened (see High). Many of the out-of-sync views reported on 2026-10-27 likely came from that. Retest before building more.
+
+- [ ] Group a row's acts under one menu in the web toolbar
+  They overflow even on a wide screen. Keep the primary act of the view and of the row visible; the rest under "More". Keys are unchanged.
+
+- [ ] Finished runs (rejected, pushed, merged) in the activity tab, with a filter by state
+  Activity lists only what is under way.
+
+- [ ] Say where to go after staging
+  After `s`, nothing says that `m` commits next. A toast naming the next act, with the run kept selected, may be enough.
+
+- [ ] Show a hint of a workflow's state machine when it is selected in `z`
+  The server would send a short form of the graph with each choice.
+
+- [ ] Project settings as one field per setting, not one typed line
+  Fields need a new `Ask` kind in `keys`, built in both front ends. Cheaper: one row per setting in the project view, each edited alone, as the settings tab does.
+
+- [ ] Make the worktree option easier to find
+  It exists: "edit in a worktree" in `z`, `--worktree`, and `pma config workspace worktree`. Colleagues asked to revisit the clone default; `docs/dev/clone-runs.md` holds why it was chosen. Ask which of its reasons fails for them before changing the default.
+
+- [ ] Re-run a failed task as it was, from the failed run
+  `Pick::Task` has `retry` (`crates/pma-core/src/screen.rs`); unverified whether a failed run's detail offers it.
+
+- [ ] Undo the last rework: return to the previous attempt rather than rejecting the run
+  Reject reverts every attempt. Attempts are append-only rows, but a clone run reverts one patch, so this needs each attempt's patch kept. Open: is the need "discard the latest rework, keep the earlier one approvable"?
+
+- [ ] Scheduled runs within a budget, finding issues and adding them to TODO.md with duplicates merged
+  Runs start by hand. `pma web` is not a daemon, so an in-process schedule needs a resident process. First try a cron or launchd entry running a read-only audit workflow under `workflow_budget`; the new part is merging duplicate findings. Tapping into an agent's session is the session-id item below.
 
 - [ ] Click through the web page after the drawer removal #manual
   The 2026-10-26 rewrite (toolbar acts, in-place detail, chooser, toasts with Open) had a syntax check and the server tests only; no Chrome on the machine. Try run, the chooser, a run detail, a toast's Open button, and the 1100 px and 720 px widths.

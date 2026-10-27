@@ -234,7 +234,7 @@ pma review 4 --approve          # or --reject, or --rework "feedback"
 pma review 4 --reject --infra   # the check or machine failed, not the agent
 pma review 4 5 6 --approve      # a batch; every run is checked before any is approved
 pma stage 4                     # into your clone's index, item ticked; no approval needed
-pma commit 4                    # stage if not yet staged, then commit in your clone
+pma commit 4                    # stage if not yet staged, then commit in your clone; --subject=<text>
 pma push 4                      # commit if not yet committed, then push the commit
 pma pr 4                        # or commit in the worktree and open a pull request
 pma push --all-approved         # every approved run; also on stage, commit and pr

@@ -1779,17 +1779,27 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Refuses a command already queued or running from the same directory,
+    /// in the same statement, so two clicks cannot both queue it.
     pub fn add_job(&self, args: &[String], cwd: &Path, project: Option<&str>) -> Result<i64> {
-        self.conn.execute(
+        let json = serde_json::to_string(args)?;
+        let cwd = cwd.to_string_lossy();
+        let added = self.conn.execute(
             "INSERT INTO jobs (args, cwd, state, created_at, project)
-             VALUES (?1, ?2, 'queued', ?3, ?4)",
-            params![
-                serde_json::to_string(args)?,
-                cwd.to_string_lossy(),
-                crate::dates::now(),
-                project
-            ],
+             SELECT ?1, ?2, 'queued', ?3, ?4
+             WHERE NOT EXISTS (SELECT 1 FROM jobs WHERE args = ?1 AND cwd = ?2
+                               AND state IN ('queued', 'running'))",
+            params![json, cwd, crate::dates::now(), project],
         )?;
+        if added == 0 {
+            let (id, state): (i64, String) = self.conn.query_row(
+                "SELECT id, state FROM jobs WHERE args = ?1 AND cwd = ?2
+                 AND state IN ('queued', 'running') ORDER BY id LIMIT 1",
+                params![json, cwd],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            return Err(format!("job {id} is {state} already: pma {}", args.join(" ")).into());
+        }
         Ok(self.conn.last_insert_rowid())
     }
 
@@ -3486,6 +3496,23 @@ mod tests {
             todo_unread: false,
             held: false,
         }
+    }
+
+    /// A command not yet finished is not queued twice from one directory.
+    #[test]
+    fn a_job_is_not_queued_twice() {
+        let dir = scratch("job-twice");
+        let store = Store::open(&dir.join("p.db")).unwrap();
+        let args = ["verify".to_string(), "a".into()];
+        let first = store.add_job(&args, &dir, Some("a")).unwrap();
+        let err = store.add_job(&args, &dir, Some("a")).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("job {first} is queued already: pma verify a")
+        );
+        store.add_job(&args, &dir.join("x"), Some("a")).unwrap();
+        store.finish_job(first, Some(0)).unwrap();
+        store.add_job(&args, &dir, Some("a")).unwrap();
     }
 
     #[test]

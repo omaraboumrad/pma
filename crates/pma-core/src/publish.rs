@@ -54,12 +54,14 @@ impl Target {
 /// Publishes runs in id order, project by project. A failure stops the rest
 /// of that project and leaves each run in the last state it reached; running
 /// the command again resumes them. `done` sees each run with its outcome.
+/// `subject` replaces the task text as the subject of a commit in the clone.
 pub fn publish(
     store: &Store,
     home: &std::path::Path,
     cfg: &Config,
     runs: Vec<Run>,
     target: Target,
+    subject: Option<&str>,
     mut done: impl FnMut(&Run, &std::result::Result<String, String>),
 ) -> Result<()> {
     let mut blocked: Vec<String> = Vec::new();
@@ -73,7 +75,7 @@ pub fn publish(
         }
         let result = match target {
             Target::Pr => open_pr(store, cfg, &mut run),
-            _ => to_clone(store, home, cfg, &mut run, target),
+            _ => to_clone(store, home, cfg, &mut run, target, subject),
         };
         match result {
             Ok(report) => done(&run, &Ok(report)),
@@ -124,6 +126,7 @@ fn to_clone(
     cfg: &Config,
     run: &mut Run,
     target: Target,
+    subject: Option<&str>,
 ) -> Result<String> {
     crate::dispatch::clone_unchanged(store, &run.repo)?;
     let mut said = Vec::new();
@@ -147,7 +150,7 @@ fn to_clone(
         step(run, RunState::Staged, outcome)?;
     }
     if target != Target::Stage && run.state == RunState::Staged {
-        let outcome = commit(home, cfg, run)?;
+        let outcome = commit(home, cfg, run, subject)?;
         step(run, RunState::Committed, outcome)?;
     }
     if target == Target::Push && run.state == RunState::Committed {
@@ -362,7 +365,12 @@ fn tick(home: &std::path::Path, run: &Run, tree: &str) -> Result<String> {
 
 /// Commits the staged change in the clone, with the user's hooks and
 /// identity.
-fn commit(home: &std::path::Path, cfg: &Config, run: &Run) -> Result<String> {
+fn commit(
+    home: &std::path::Path,
+    cfg: &Config,
+    run: &Run,
+    subject: Option<&str>,
+) -> Result<String> {
     crate::dispatch::unchanged_git(run)?;
     at_base(run)?;
     if git(&run.repo, &["write-tree"])? != staged_tree(home, run)? {
@@ -374,7 +382,10 @@ fn commit(home: &std::path::Path, cfg: &Config, run: &Run) -> Result<String> {
         )
         .into());
     }
-    git(&run.repo, &["commit", "--quiet", "-m", &message(cfg, run)])?;
+    git(
+        &run.repo,
+        &["commit", "--quiet", "-m", &message(cfg, run, subject)],
+    )?;
     let sha = git(&run.repo, &["rev-parse", "--short", "HEAD"])?;
     Ok(format!("committed {sha} in {}", run.repo.display()))
 }
@@ -574,7 +585,7 @@ fn publish_one(cfg: &Config, run: &Run) -> Result<String> {
     if approved == &wt_git(run, &["rev-parse", &format!("{}^{{tree}}", run.base)])? {
         return Err("nothing to publish: no changes".into());
     }
-    let message = message(cfg, run);
+    let message = message(cfg, run, None);
 
     // Every attempt builds one commit of the approved tree on the base. A
     // failed publish leaves its commits, and verify its output, in the
@@ -637,7 +648,8 @@ fn publish_one(cfg: &Config, run: &Run) -> Result<String> {
         ],
     )?;
     Ok(if open.is_empty() {
-        let (title, body) = message.split_once("\n\n").unwrap_or((&message, ""));
+        let (title, trailers) = message.split_once("\n\n").unwrap_or((&message, ""));
+        let body = pr_body(run, trailers);
         gh_in(
             wt,
             &[
@@ -650,12 +662,37 @@ fn publish_one(cfg: &Config, run: &Run) -> Result<String> {
                 "--title",
                 title,
                 "--body",
-                body,
+                &body,
             ],
         )?
     } else {
         open
     })
+}
+
+/// A pull request's body: the run, the agent's summary, the verify result,
+/// then the commit's trailers.
+fn pr_body(run: &Run, trailers: &str) -> String {
+    let mut parts = vec![format!("pma run #{}: {}", run.id, run.text)];
+    if let Some(s) = run
+        .summary
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        parts.push(format!("## Summary\n\n{s}"));
+    }
+    let verify = match (run.verify.as_deref(), run.verify_ok) {
+        (None, _) => "no verify command".to_string(),
+        (Some(c), Some(true)) => format!("`{c}` passed"),
+        (Some(c), Some(false)) => format!("`{c}` failed"),
+        (Some(c), None) => format!("`{c}` did not run"),
+    };
+    parts.push(format!("## Verify\n\n{verify}"));
+    if !trailers.is_empty() {
+        parts.push(trailers.to_string());
+    }
+    parts.join("\n\n")
 }
 
 /// Moves each `pr-open` run to `merged` when its pull request is merged, or
@@ -755,8 +792,10 @@ fn gh_in(dir: &std::path::Path, args: &[&str]) -> Result<String> {
     Ok(out.stdout.trim().to_string())
 }
 
-/// The task text as subject; `Closes #N` and the co-author trailer as body.
-fn message(cfg: &Config, run: &Run) -> String {
+/// The task text as subject, unless `subject` replaces it; `Closes #N` and
+/// the co-author trailer as body.
+fn message(cfg: &Config, run: &Run, subject: Option<&str>) -> String {
+    let subject = subject.unwrap_or(&run.text);
     let mut body = Vec::new();
     if let Some(n) = run.gh {
         body.push(format!("Closes #{n}"));
@@ -767,9 +806,9 @@ fn message(cfg: &Config, run: &Run) -> String {
         body.push("Co-Authored-By: Claude <noreply@anthropic.com>".into());
     }
     if body.is_empty() {
-        run.text.clone()
+        subject.to_string()
     } else {
-        format!("{}\n\n{}", run.text, body.join("\n\n"))
+        format!("{subject}\n\n{}", body.join("\n\n"))
     }
 }
 

@@ -2481,6 +2481,10 @@ pub fn action_in(
                 Act::Pr => publish::Target::Pr,
                 _ => publish::Target::Push,
             },
+            // Only commit prompts; a blank subject keeps the task text.
+            subject: Some(input)
+                .filter(|s| act == Act::Commit && !s.is_empty())
+                .map(str::to_string),
         },
         (
             Act::ApproveRun

@@ -47,6 +47,7 @@ Phase 5, the web:
 - Browsers do not separate cookies by port, so another server on 127.0.0.1 that the browser visits receives the session cookie. Only a local process can listen there, and one running as the user can already run `pma`.
 - `--app` opens the page in Chrome or Chromium with `--app=<url>`: a window with no browser controls. It is not a webview: the server and its checks are the same, and the token is still on that process's command line.
 - The event stream sends a `tick`, every 2 s while a job or run is under way and every 30 s otherwise, and the page reloads its tab. It does not push views.
+- The tab, the project and an open detail are in the query string, each change a history entry (2026-10-27). An open detail is named by kind and id, `open=run:52`; the page sends `/api/open` a pick with only that, and the detail returns the full pick.
 - The page has no drawer: the selected row's acts join the toolbar, and a run or a job opens in place of the tables, full width, with Back. The drawer of before repeated the row's cells beside the row and put the diff in a 920 px overlay.
 - `/api/ask` refuses an act that cannot apply to the selected row before the page asks to confirm it, as the TUI does.
 

@@ -138,3 +138,29 @@ fn the_page_handles_every_command() {
     }
     assert!(kinds.len() >= 12, "{kinds:?}");
 }
+
+/// Every tab the page names on its own is one the server parses. A stale
+/// name (`next`, `status`, after the tabs were merged) left the page blank.
+#[test]
+fn the_page_names_only_real_tabs() {
+    let named = |after: &str| -> Vec<String> {
+        SCRIPT
+            .match_indices(after)
+            .map(|(i, _)| {
+                SCRIPT[i + after.len()..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_lowercase())
+                    .collect()
+            })
+            .collect()
+    };
+    let names: Vec<String> = ["tab: \"", "previous: \"", "/api/screen?tab="]
+        .into_iter()
+        .flat_map(named)
+        .filter(|n| !n.is_empty())
+        .collect();
+    assert!(names.len() >= 3, "{names:?}");
+    for n in &names {
+        assert!(tab_named(n).is_some(), "app.js names no tab `{n}`");
+    }
+}

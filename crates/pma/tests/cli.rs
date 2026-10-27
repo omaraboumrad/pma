@@ -749,7 +749,11 @@ fn a_clone_run_edits_the_clone_and_waits_for_review() {
         fs::read_to_string(alpha.join("second.txt")).unwrap(),
         "two\n"
     );
-    env.ok(&["review", "2", "--reject"]);
+    let out = env.ok(&["review", "2", "--reject"]);
+    assert!(
+        out.starts_with("Run #2 rejected; reverted 1 file in "),
+        "{out}"
+    );
     assert!(
         !alpha.join("second.txt").exists(),
         "the rejection reverts it"
@@ -1053,6 +1057,7 @@ const FAKE_GH_PR: &str = r#"#!/bin/sh
 case "$1 $2" in
   "pr create")
     if [ -e "$PMA_HOME/pr-create-fails" ]; then echo "HTTP 502" >&2; exit 1; fi
+    printf '%s\n' "$@" > "$PMA_HOME/pr-create-args"
     echo "https://github.com/me/alpha/pull/1" ;;
   "pr list") if [ -e "$PMA_HOME/pr-list" ]; then cat "$PMA_HOME/pr-list"; fi ;;
   "pr view") cat "$PMA_HOME/pr-state" ;;
@@ -1070,6 +1075,16 @@ fn a_pull_request_holds_its_task_until_merged_or_closed() {
     env.ok(&["review", "1", "--approve"]);
     let out = env.ok(&["pr", "1"]);
     assert_eq!(out, "#1 alpha: https://github.com/me/alpha/pull/1\n");
+    // The body names the run and says what verify made of it.
+    let args = fs::read_to_string(env.home.join("pr-create-args")).unwrap();
+    let body = args
+        .split_once("--body\n")
+        .map(|(_, b)| b)
+        .unwrap_or_default();
+    assert!(
+        body.starts_with("pma run #1: add greeting") && body.contains("## Verify"),
+        "{args}"
+    );
     assert_eq!(
         git_out(&origin, &["branch", "--list", "pma/*"]),
         "  pma/add-greeting\n"
@@ -1344,11 +1359,13 @@ fn stage_commit_and_push_follow_git() {
     fs::write(alpha.join("hello.txt"), "hi\n").unwrap();
     git(&alpha, &["add", "hello.txt"], None);
 
-    let out = env.ok(&["commit", "1"]);
+    let (_, err, success) = env.run(&["commit", "1", "--subject= "]);
+    assert!(!success && err.contains("one line of text"), "{err}");
+    let out = env.ok(&["commit", "1", "--subject=Add the greeting"]);
     assert!(out.starts_with("#1 alpha: committed "), "{out}");
     assert_eq!(
         git_out(&alpha, &["log", "-1", "--format=%s"]),
-        "add greeting\n"
+        "Add the greeting\n"
     );
     assert_eq!(git_out(&origin, &["log", "--format=%s", "main"]), "init\n");
 
@@ -1363,7 +1380,7 @@ fn stage_commit_and_push_follow_git() {
     assert!(out.starts_with("#1 alpha: pushed "), "{out}");
     assert_eq!(
         git_out(&origin, &["log", "--format=%s", "main"]),
-        "add greeting\ninit\n"
+        "Add the greeting\ninit\n"
     );
 }
 
