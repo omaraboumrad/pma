@@ -20,11 +20,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - `pma review <id> --reject` and both front ends say what a rejection did: `Run #52 rejected; reverted 2 files in ~/projects/alpha.`
 
+- `pma review <id> --retry`, and `R` on a failed run in both front ends, rejects the run and dispatches its task again with the agent and model its last attempt ran, its used attempts reset. The task is found before the rejection, so one no longer in `TODO.md` leaves the run as it was.
+
+- The activity tab lists finished runs (rejected, pushed, merged, closed, applied), newest first, up to 100. `b` there cycles a filter by state; the web also has a button per state.
+
+- A run that is staged or committed is a notice in both front ends, naming the next step: `#4 alpha: staged in its clone, commit next`. `pma stage` and `pma commit` end their line with the command that comes next.
+
 - `/` in the TUI's run list filters it by name; the web's list has a filter box, and the arrows move among what it keeps. The web's names and descriptions line up in columns.
 
 ### Changed
 
 - A command already queued or running from the same directory is refused as a job: `job 12 is queued already: pma verify alpha`. A second click on verify queued a second verify. It applies to `--detach` too.
+
+- The web toolbar holds a view's own acts and the selected row's primary and danger acts, and the act that moves the row on from its state: commit for a staged run, push for a committed one. A row's other acts are under More; the TUI footer lists the next act first. Scan, sync and add note, which apply on every view, moved to the sidebar. At 1100 px the inbox toolbar went from 9 buttons over two lines to 6 on one, before a row's acts.
 
 - One click on a web row with a detail (a run, a job, a scan, a route, a campaign, a task in its project) opens it. Other rows are selected, as before. It took a double-click.
 

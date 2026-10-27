@@ -54,17 +54,20 @@
 
 ## Medium
 
+- [ ] Offer only the acts a run's state allows
+  `screen::fits` checks that a row is a run, not its state, so a pushed or rejected run still offers approve, reject and push in both front ends; each is refused only when tried. `screen::next_act` already maps state to the act that moves it on; `fits` could read the state the same way.
+
 - [ ] Retest live updates in the web after the blank-page fix #manual
   The event stream existed but was never opened (see High). Many of the out-of-sync views reported on 2026-10-27 likely came from that. Retest before building more.
 
-- [ ] Group a row's acts under one menu in the web toolbar
-  They overflow even on a wide screen. Keep the primary act of the view and of the row visible; the rest under "More". Keys are unchanged.
+- [x] Group a row's acts under one menu in the web toolbar
+  Done 2026-10-27: primary and danger acts stay visible, the rest go under More; scan, sync and add note moved to the sidebar. A ready run's detail at 1100 px: Back, Approve, Reject, Push, More, on one 35 px row.
 
-- [ ] Finished runs (rejected, pushed, merged) in the activity tab, with a filter by state
-  Activity lists only what is under way.
+- [x] Finished runs (rejected, pushed, merged) in the activity tab, with a filter by state
+  Done 2026-10-27: newest 100, `b` cycles the state.
 
-- [ ] Say where to go after staging
-  After `s`, nothing says that `m` commits next. A toast naming the next act, with the run kept selected, may be enough.
+- [x] Say where to go after staging
+  Done 2026-10-27: staged and committed runs are notices naming the next step; the CLI prints the next command.
 
 - [ ] Show a hint of a workflow's state machine when it is selected in `z`
   The server would send a short form of the graph with each choice.
@@ -75,8 +78,8 @@
 - [ ] Make the worktree option easier to find
   It exists: "edit in a worktree" in `z`, `--worktree`, and `pma config workspace worktree`. Colleagues asked to revisit the clone default; `docs/dev/clone-runs.md` holds why it was chosen. Ask which of its reasons fails for them before changing the default.
 
-- [ ] Re-run a failed task as it was, from the failed run
-  `Pick::Task` has `retry` (`crates/pma-core/src/screen.rs`); unverified whether a failed run's detail offers it.
+- [x] Re-run a failed task as it was, from the failed run
+  Done 2026-10-27: `pma review <id> --retry`, `R` in both front ends. A failed run held its task, so `retry` on the task pick did not reach it.
 
 - [ ] Undo the last rework: return to the previous attempt rather than rejecting the run
   Reject reverts every attempt. Attempts are append-only rows, but a clone run reverts one patch, so this needs each attempt's patch kept. Open: is the need "discard the latest rework, keep the earlier one approvable"?
@@ -84,8 +87,8 @@
 - [ ] Scheduled runs within a budget, finding issues and adding them to TODO.md with duplicates merged
   Runs start by hand. `pma web` is not a daemon, so an in-process schedule needs a resident process. First try a cron or launchd entry running a read-only audit workflow under `workflow_budget`; the new part is merging duplicate findings. Tapping into an agent's session is the session-id item below.
 
-- [ ] Click through the web page after the drawer removal #manual
-  The 2026-10-26 rewrite (toolbar acts, in-place detail, chooser, toasts with Open) had a syntax check and the server tests only; no Chrome on the machine. Try run, the chooser, a run detail, a toast's Open button, and the 1100 px and 720 px widths.
+- [x] Click through the web page after the drawer removal #manual
+  Done 2026-10-27 in headless Chromium (Playwright's cache), against a scratch store with two runs: tabs, the address, the chooser, prompts, a run's detail, the commit prompt and its notice's Open button, reject, the activity filter, More, and 1100 and 720 px. No console errors.
 
 - [ ] Show open pull requests and issues opened by others as signal tasks
   `scan` reads only CI from GitHub (`crates/pma-core/src/scan.rs:680`), and `sync` lists issues by others as untriaged but ranks none. A project with unanswered contributor pull requests shows as `clear`. Read them with `gh pr list` and `gh issue list` during `scan`, rank them by age, and do not make them dispatchable by default. (REVIEW.md U6)

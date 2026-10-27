@@ -22,6 +22,7 @@ const S = {
   keys: null,
   tab: "inbox",
   by: 1,
+  finished: 0, // the place in keys.finished the activity tab filters to
   screens: {},
   pane: {},
   sel: {},
@@ -114,6 +115,21 @@ function acts(row) {
   });
 }
 
+// A row's acts: the one that moves it on (`next`, from the server), the
+// primary and danger ones, then the rest under More, so a run's dozen acts
+// do not wrap the toolbar.
+function rowButtons(toolbar, own, next) {
+  const shown = (b) => b.command.act === next || ["primary", "danger"].includes(b.command.weight);
+  // The next act is drawn primary unless it is a danger one, such as push.
+  const lift = (b) => (b.command.act === next && b.command.weight === "default" ? "primary" : "");
+  for (const b of own.filter(shown)) toolbar.append(button(b, lift(b)));
+  const rest = own.filter((b) => !shown(b));
+  if (!rest.length) return;
+  toolbar.append(el("details", { class: "more" },
+    el("summary", { class: "button" }, "More"),
+    el("div", { class: "more-menu", role: "group", "aria-label": "More actions" }, rest.map((b) => button(b)))));
+}
+
 function panes() {
   const s = S.screens[S.tab];
   return s && s.body && s.body.panes ? s.body.panes : [];
@@ -148,6 +164,7 @@ function address() {
   const q = new URLSearchParams({ tab: S.tab });
   if (S.tab === "project") q.set("project", S.project);
   if (S.tab === "report" && S.by) q.set("by", S.keys.by[S.by]);
+  if (S.tab === "activity" && S.finished) q.set("finished", S.keys.finished[S.finished]);
   const p = S.detail && S.detail.pick;
   const open = p && { run: p.id, job: p.id, scan: p.id, route: p.revision, campaign: p.name, task: p.target }[p.kind];
   if (open !== undefined && open !== null) q.set("open", `${p.kind}:${open}`);
@@ -191,6 +208,7 @@ async function restore() {
   if (S.tab === "project" && !S.project) S.tab = "inbox";
   const by = S.keys.by.indexOf(q.get("by"));
   S.by = by >= 0 ? by : 1;
+  S.finished = Math.max(S.keys.finished.indexOf(q.get("finished")), 0);
   S.detail = null;
   const open = q.get("open") && pickNamed(q.get("open"));
   S.restoring = true;
@@ -209,8 +227,9 @@ async function restore() {
 async function load() {
   const by = S.keys.by[S.by];
   const project = encodeURIComponent(S.project);
+  const finished = S.keys.finished[S.finished];
   try {
-    S.screens[S.tab] = await api(`/api/screen?tab=${S.tab}&by=${by}&project=${project}`);
+    S.screens[S.tab] = await api(`/api/screen?tab=${S.tab}&by=${by}&project=${project}&finished=${finished}`);
   } catch (e) {
     S.screens[S.tab] = { error: e.message };
   }
@@ -247,6 +266,10 @@ function drawNav() {
     }, el("span", {}, meta.label), el("kbd", {}, b.key)));
   }
   nav.append(views);
+  // Acts that apply on every view live here rather than on each toolbar.
+  $("anywhere").replaceChildren(...S.keys.bindings
+    .filter((b) => b.command.kind === "act" && !b.command.row && b.tabs.length === 0)
+    .map((b) => button(b, "small")));
   const projects = el("div", { class: "nav-group projects" },
     el("h2", { id: "projects-heading" }, "Projects"),
     el("input", {
@@ -376,7 +399,17 @@ function draw() {
       }, `By ${name}`));
     });
   }
-  for (const b of acts(false)) toolbar.append(button(b));
+  if (S.tab === "activity") {
+    S.keys.finished.forEach((name, i) => {
+      toolbar.append(el("button", {
+        class: `button ${i === S.finished ? "primary" : ""}`,
+        type: "button",
+        "aria-pressed": String(i === S.finished),
+        onclick: () => { S.finished = i; load(); },
+      }, label(name)));
+    });
+  }
+  for (const b of acts(false).filter((b) => b.tabs.length)) toolbar.append(button(b));
   // The selected row's acts, after the view's: what the key would do to it.
   const sel = selected();
   if (sel) {
@@ -394,7 +427,7 @@ function draw() {
       toolbar.append(el("button", { class: "button primary", type: "button", onclick: () => run(open) },
         what, el("kbd", {}, "Enter")));
     }
-    for (const b of own) toolbar.append(button(b));
+    rowButtons(toolbar, own, sel.item.next);
     if (proj && named && S.tab !== "project") {
       // Enter opens it too, when the row is a task.
       toolbar.append(el("button", { class: `button ${openable ? "" : "primary"}`, type: "button", onclick: () => run(proj) },
@@ -443,7 +476,7 @@ function drawDetail(toolbar, content) {
   toolbar.append(el("button", { class: "button", type: "button", onclick: () => run(back) }, "Back", el("kbd", {}, "Esc")));
   const own = acts(true).filter((b) => S.detail.acts.includes(b.command.act));
   if (own.length) toolbar.append(el("span", { class: "sep", "aria-hidden": "true" }));
-  for (const b of own) toolbar.append(button(b));
+  rowButtons(toolbar, own, dt.next);
   const head = el("header", { class: "detail-head" },
     el("p", { class: "kicker" },
       dt.badge ? el("span", { class: `pill tone-${dt.badge.tone}` }, dt.badge.text) : null,
@@ -720,6 +753,9 @@ async function run(b) {
     }
     case "ReportBy":
       S.by = (S.by + 1) % S.keys.by.length;
+      return load();
+    case "Finished":
+      S.finished = (S.finished + 1) % S.keys.finished.length;
       return load();
     case "Help":
       await dialog({ title: "Keyboard shortcuts", text: shortcuts(), ok: "Close" });

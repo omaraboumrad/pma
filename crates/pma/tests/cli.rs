@@ -1141,6 +1141,40 @@ fn a_pull_request_holds_its_task_until_merged_or_closed() {
     assert!(env.ok(&["review", "3"]).starts_with("#3 merged  alpha"));
 }
 
+/// Gives up the first time it is run, then writes hello.txt.
+const GIVING_UP_CLAUDE: &str = r#"#!/bin/sh
+if [ ! -e "$PMA_HOME/tried" ]; then
+  touch "$PMA_HOME/tried"
+  printf '{"type":"result","subtype":"error","is_error":true,"result":"gave up","total_cost_usd":0.1}\n'
+  exit 0
+fi
+echo hi > hello.txt
+printf '{"type":"result","subtype":"success","is_error":false,"result":"did it","total_cost_usd":0.1}\n'
+"#;
+
+/// `--retry` rejects a failed run and dispatches its task again, with the
+/// agent the run had; a run that has not failed is refused.
+#[test]
+fn a_failed_run_is_retried_as_it_was() {
+    let s = Scratch::new("retry");
+    let (env, _origin, _alpha) = dispatch_env(&s, &[("claude", GIVING_UP_CLAUDE)]);
+    env.ok(&["dispatch", "alpha:5"]);
+    let shown = env.ok(&["review", "1"]);
+    assert!(shown.starts_with("#1 failed"), "{shown}");
+    let out = env.ok(&["review", "1", "--retry"]);
+    assert!(out.starts_with("Run #1 rejected;"), "{out}");
+    assert!(out.contains("#2 alpha: add greeting"), "{out}");
+    assert!(env.ok(&["review", "2"]).starts_with("#2 ready"));
+    assert!(env.ok(&["review", "1"]).starts_with("#1 rejected"));
+    let (_, err, success) = env.run(&["review", "2", "--retry", "--approve"]);
+    assert!(!success && err.contains("cannot be used with"), "{err}");
+    let (_, err, success) = env.run(&["review", "2", "--retry"]);
+    assert!(
+        !success && err.contains("--retry takes a failed run"),
+        "{err}"
+    );
+}
+
 /// A pull request closed without merging is a reviewer refusing the work, so
 /// it uses an attempt as a rejection does.
 #[test]
@@ -1334,6 +1368,7 @@ fn stage_commit_and_push_follow_git() {
     );
     let out = env.ok(&["stage", "1"]);
     assert!(out.starts_with("#1 alpha: staged in "), "{out}");
+    assert!(out.ends_with("; next: `pma commit 1`\n"), "{out}");
     assert!(!env.home.join("state/worktrees/alpha/add-greeting").exists());
     assert_eq!(
         git_out(&alpha, &["diff", "--cached", "--name-only"]),
@@ -1363,6 +1398,7 @@ fn stage_commit_and_push_follow_git() {
     assert!(!success && err.contains("one line of text"), "{err}");
     let out = env.ok(&["commit", "1", "--subject=Add the greeting"]);
     assert!(out.starts_with("#1 alpha: committed "), "{out}");
+    assert!(out.ends_with("; next: `pma push 1`\n"), "{out}");
     assert_eq!(
         git_out(&alpha, &["log", "-1", "--format=%s"]),
         "Add the greeting\n"

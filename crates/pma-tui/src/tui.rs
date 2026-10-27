@@ -130,6 +130,8 @@ pub struct App {
     project: String,
     previous: Tab,
     by: usize,
+    /// The place in `api::FINISHED` the activity tab filters to.
+    finished: usize,
     screens: Vec<Option<std::result::Result<Screen, String>>>,
     /// Per tab: the focused pane, and the selection in each pane.
     pane: Vec<usize>,
@@ -160,6 +162,7 @@ impl App {
             project: String::new(),
             previous: Tab::Inbox,
             by: 1,
+            finished: 0,
             screens: vec![None; n],
             pane: vec![0; n],
             selected: vec![Vec::new(); n],
@@ -173,7 +176,11 @@ impl App {
 
     /// The query that fills the current tab.
     pub fn query(&self) -> Query {
-        self.tab.query(By::ALL[self.by].1, &self.project)
+        self.tab.query(
+            By::ALL[self.by].1,
+            &self.project,
+            api::FINISHED[self.finished],
+        )
     }
 
     /// Whether a refresh may replace what is shown: not while a prompt, a
@@ -560,6 +567,10 @@ impl App {
                 self.by = (self.by + 1) % By::ALL.len();
                 return Some(Request::Load(self.query()));
             }
+            Command::Finished => {
+                self.finished = (self.finished + 1) % api::FINISHED.len();
+                return Some(Request::Load(self.query()));
+            }
             Command::Help => self.mode = Mode::Help,
             Command::Quit => return Some(Request::Quit),
             Command::Act(act) => {
@@ -762,13 +773,15 @@ impl App {
                     Body::Detail(d) => d.pick.clone(),
                     Body::Panes(_) => Pick::Nothing,
                 };
-                let mut pairs: Vec<(&str, &str)> = keys::on_tab(self.tab)
+                let mut fit: Vec<&keys::Binding> = keys::on_tab(self.tab)
                     .iter()
                     .filter(|b| {
                         matches!(b.command, Command::Act(a) if a.on_row() && screen::fits(a, &pick))
                     })
-                    .map(|b| (b.key, b.label))
+                    .copied()
                     .collect();
+                next_first(&mut fit, &pick);
+                let mut pairs: Vec<(&str, &str)> = fit.iter().map(|b| (b.key, b.label)).collect();
                 pairs.extend([("j/k", "scroll"), ("PgDn/PgUp", "page"), ("Esc", "close")]);
                 return hints(p, &pairs);
             }
@@ -780,7 +793,7 @@ impl App {
         }
         // The acts that fit the selected row, then the ones that need none.
         let pick = self.pick().0;
-        let mut pairs: Vec<(&str, &str)> = keys::on_tab(self.tab)
+        let mut fit: Vec<&keys::Binding> = keys::on_tab(self.tab)
             .iter()
             .filter(|b| match b.command {
                 Command::Act(a) => a.on_row() && screen::fits(a, &pick),
@@ -802,8 +815,10 @@ impl App {
                     .iter()
                     .filter(|b| matches!(b.command, Command::Act(a) if !a.on_row())),
             )
-            .map(|b| (b.key, b.label))
+            .copied()
             .collect();
+        next_first(&mut fit, &pick);
+        let mut pairs: Vec<(&str, &str)> = fit.iter().map(|b| (b.key, b.label)).collect();
         pairs.extend([("?", "keys"), ("q", "quit")]);
         hints(p, &pairs)
     }
@@ -1392,6 +1407,14 @@ pub fn key_name(code: KeyCode) -> Option<String> {
     })
 }
 
+/// Puts the act that moves `pick` on (`screen::next_act`) first, so a
+/// footer cut short at the terminal's width still shows it.
+fn next_first(bindings: &mut [&keys::Binding], pick: &Pick) {
+    if let Some(next) = screen::next_act(pick) {
+        bindings.sort_by_key(|b| b.command != Command::Act(next));
+    }
+}
+
 /// The options of `choices` whose name holds `filter`, ignoring case: every
 /// one without a filter.
 fn kept(choices: &api::Choices, filter: Option<&str>) -> Vec<usize> {
@@ -1615,7 +1638,7 @@ mod tests {
     #[test]
     fn tabs_load_and_keys_act_on_the_selection() {
         let mut app = App::new();
-        assert_eq!(app.query(), Tab::Inbox.query(By::Class, ""));
+        assert_eq!(app.query(), Tab::Inbox.query(By::Class, "", None));
         app.loaded(Ok(next_view()));
         let out = screen_text(&mut app);
         assert!(
@@ -1645,7 +1668,21 @@ mod tests {
             Some(Request::Load(Query::Run { id: 4 })),
             "opens the waiting run"
         );
-        assert_eq!(app.key("3"), Some(Request::Load(Query::Activity)));
+        assert_eq!(
+            app.key("3"),
+            Some(Request::Load(Query::Activity { finished: None }))
+        );
+        // `b` filters the finished runs to the next state, and back round.
+        assert_eq!(
+            app.key("b"),
+            Some(Request::Load(Query::Activity {
+                finished: Some(pma_core::store::RunState::Rejected)
+            }))
+        );
+        for _ in 1..api::FINISHED.len() {
+            app.key("b");
+        }
+        assert_eq!(app.query(), Query::Activity { finished: None });
         app.loaded(Ok(View::Jobs(vec![
             job(7, "awaiting-approval"),
             job(6, "done"),
@@ -2082,6 +2119,33 @@ mod tests {
         };
         assert_eq!(target, pma_core::publish::Target::Commit);
         assert_eq!(subject.as_deref(), Some("a run!"));
+    }
+
+    /// A staged run's footer offers commit first, so a narrow terminal
+    /// still shows the step that comes next.
+    #[test]
+    fn a_staged_run_offers_commit_first() {
+        let mut app = App::new();
+        app.loaded(Ok(next_view()));
+        app.key("Tab");
+        app.key("Enter");
+        app.loaded(Ok(View::Run {
+            run: Box::new(pma_core::store::Run {
+                id: 4,
+                project: "b".into(),
+                text: "a run".into(),
+                state: pma_core::store::RunState::Staged,
+                ..Default::default()
+            }),
+            attempts: vec![],
+            changelog: None,
+            diff: "+hi".into(),
+            moved: false,
+            repo: None,
+        }));
+        let text = screen_text(&mut app);
+        let footer = text.lines().last().unwrap_or_default();
+        assert!(footer.trim_start().starts_with("m commit"), "{footer}");
     }
 
     /// A run reaching review is named in the footer and Enter opens it;

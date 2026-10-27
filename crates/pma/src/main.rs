@@ -357,6 +357,10 @@ enum Command {
         /// Run the agent again in the same worktree with this feedback.
         #[arg(long, requires = "ids", value_name = "FEEDBACK")]
         rework: Option<String>,
+        /// Reject a failed run and dispatch its task again, with the same
+        /// agent and model, its used attempts reset.
+        #[arg(long, requires = "ids", conflicts_with_all = ["approve", "reject", "rework"])]
+        retry: bool,
         /// Minutes spent reviewing this run, added to the run's total.
         #[arg(long, requires = "ids", value_name = "N")]
         minutes: Option<u32>,
@@ -1024,6 +1028,12 @@ fn main() -> ExitCode {
             )
         }),
         Command::Review {
+            ids, retry: true, ..
+        } => match ids[..] {
+            [id] => retry_run(id),
+            _ => Err("--retry names one run".into()),
+        },
+        Command::Review {
             ids,
             approve,
             reject,
@@ -1031,6 +1041,7 @@ fn main() -> ExitCode {
             infra,
             rework,
             minutes,
+            retry: false,
         } => run_review(
             &ids,
             approve,
@@ -2622,6 +2633,69 @@ fn run_review(
     Ok(())
 }
 
+/// Rejects failed run `id` and dispatches its task again with the agent and
+/// model its last attempt ran. The target is found before the rejection, so
+/// a task that cannot be found leaves the run as it was.
+fn retry_run(id: i64) -> Result<()> {
+    let store = Store::open_default()?;
+    let run = store.run(id)?;
+    if run.state != RunState::Failed {
+        return Err(format!(
+            "run #{id} is {}; --retry takes a failed run",
+            run.state.name()
+        )
+        .into());
+    }
+    let target = if dispatch::is_signal(&run.task_key) {
+        format!("{}:{}", run.project, run.task_key)
+    } else if dispatch::without_item(&run.task_key) {
+        return Err(format!(
+            "run #{id} is part of `{}`; run that again instead",
+            run.task_key
+        )
+        .into());
+    } else {
+        let line = store
+            .tasks()?
+            .into_iter()
+            .find(|t| t.project == run.project && t.key == run.task_key)
+            .map(|t| t.line)
+            .ok_or_else(|| {
+                format!(
+                    "run #{id}'s item is not in {}'s TODO.md as last scanned; `pma scan` it",
+                    run.project
+                )
+            })?;
+        format!("{}:{line}", run.project)
+    };
+    say(api::act(
+        &store,
+        Action::RejectRun {
+            id,
+            keep_git_changes: false,
+            infra: false,
+            seen: Some(RunState::Failed.name().to_string()),
+        },
+    )?);
+    let model = store
+        .attempts(Some(id))?
+        .last()
+        .and_then(|a| a.model.clone());
+    run_dispatch(
+        &[target],
+        &[],
+        false,
+        None,
+        true,
+        dispatch_flags(false, run.workspace == config::Workspace::Worktree, false),
+        &dispatch::Overrides {
+            agent: Some(run.agent),
+            model,
+            preset: None,
+        },
+    )
+}
+
 fn show_stale(names: &[String], tags: &[String], count: Option<usize>) -> Result<()> {
     show(Query::Stale {
         of: selection(names, tags),
@@ -3791,7 +3865,18 @@ fn run_publish(
         target,
         subject.as_deref(),
         |run, outcome| match outcome {
-            Ok(o) => println!("#{} {}: {o}", run.id, run.project),
+            // A run left part way says what takes it on.
+            Ok(o) => match target {
+                publish::Target::Stage => println!(
+                    "#{} {}: {o}; next: `pma commit {}`",
+                    run.id, run.project, run.id
+                ),
+                publish::Target::Commit => println!(
+                    "#{} {}: {o}; next: `pma push {}`",
+                    run.id, run.project, run.id
+                ),
+                _ => println!("#{} {}: {o}", run.id, run.project),
+            },
             Err(e) => {
                 failed += 1;
                 println!("#{} {}: {e}", run.id, run.project);
@@ -4103,6 +4188,7 @@ fn render(view: View) -> String {
             instances,
             runs,
             now,
+            ..
         } => format!(
             "{}\n{}",
             watch::screen(&state, &jobs, &runs, now),
@@ -4439,6 +4525,7 @@ mod tests {
                 id: 4,
                 feedback: "--not a flag".into(),
             },
+            Action::RetryRun { id: 4 },
             Action::Publish {
                 ids: vec![],
                 all_approved: true,

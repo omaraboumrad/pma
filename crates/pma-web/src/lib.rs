@@ -197,10 +197,16 @@ fn route(req: &Request, ctx: &Ctx) -> Response {
                 .and_then(By::parse)
                 .unwrap_or(By::Class);
             let project = req.param("project").unwrap_or_default();
+            // A name `api::FINISHED` does not hold is every state.
+            let named = req.param("finished").unwrap_or_default();
+            let finished = api::FINISHED
+                .into_iter()
+                .flatten()
+                .find(|s| s.name() == named);
             answer(ctx, |store| {
                 Ok(screen_json(&screen::screen(api::query(
                     store,
-                    tab.query(by, &project),
+                    tab.query(by, &project, finished),
                 )?)))
             })
         }
@@ -310,7 +316,7 @@ fn rows(store: &Store, tab: Tab, act: Act, body: &Value) -> Result<Vec<Item>> {
     }
     let project = body["project"].as_str().unwrap_or("");
     Ok(
-        match screen::screen(api::query(store, tab.query(By::Class, project))?).body {
+        match screen::screen(api::query(store, tab.query(By::Class, project, None))?).body {
             Body::Panes(panes) => panes.into_iter().flat_map(|p| p.items).collect(),
             Body::Detail(_) => Vec::new(),
         },
@@ -422,6 +428,10 @@ fn keys_json() -> Value {
     json!({
         "tabs": Tab::ALL.iter().map(|t| t.title()).collect::<Vec<_>>(),
         "by": By::ALL.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+        "finished": api::FINISHED
+            .iter()
+            .map(|s| s.map_or("all", |s| s.name()))
+            .collect::<Vec<_>>(),
         "bindings": bindings,
     })
 }
@@ -436,6 +446,7 @@ fn screen_json(s: &Screen) -> Value {
             "title": d.title,
             "pick": pick_json(&d.pick),
             "acts": acts_json(&d.pick),
+            "next": screen::next_act(&d.pick).map(Act::name),
             "badge": d.badge.as_ref().map(cell_json),
             "notice": d.notice,
             "fields": d.fields,
@@ -466,6 +477,7 @@ fn screen_json(s: &Screen) -> Value {
                     "cells": i.cells.iter().map(cell_json).collect::<Vec<_>>(),
                     "pick": pick_json(&i.pick),
                     "acts": acts_json(&i.pick),
+                    "next": screen::next_act(&i.pick).map(Act::name),
                 })).collect::<Vec<_>>(),
             })).collect::<Vec<_>>(),
         }),

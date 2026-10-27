@@ -150,6 +150,7 @@ pub fn fits(act: Act, pick: &Pick) -> bool {
         | Act::Commit
         | Act::Pr
         | Act::Push => matches!(pick, Pick::Run { .. }),
+        Act::RetryRun => matches!(pick, Pick::Run { state, .. } if state == "failed"),
         Act::ApproveJob => matches!(pick, Pick::Job { awaiting: true, .. }),
         Act::StopJob => matches!(pick, Pick::Job { .. }),
         Act::StopWorkflow => matches!(pick, Pick::Instance { open: true, .. }),
@@ -164,6 +165,21 @@ pub fn fits(act: Act, pick: &Pick) -> bool {
         }
         Act::ActivateRoute => matches!(pick, Pick::Route { active: false, .. }),
         _ => !act.on_row(),
+    }
+}
+
+/// The act that moves a row on from the state it is in, which a front end
+/// keeps in view: a staged run commits next, a committed one pushes.
+pub fn next_act(pick: &Pick) -> Option<Act> {
+    match pick {
+        Pick::Run { state, .. } => match state.as_str() {
+            "ready" => Some(Act::ApproveRun),
+            "failed" => Some(Act::RetryRun),
+            "staged" => Some(Act::Commit),
+            "committed" | "approved" => Some(Act::Push),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -757,6 +773,55 @@ fn jobs_pane(jobs: &[Job], now: i64) -> Pane {
             })
             .collect(),
         empty: "No jobs. `--detach` on dispatch or workflow run queues one.",
+    }
+}
+
+/// Runs that reached a final state, newest decision first, in `only` alone
+/// when it is set.
+fn finished_pane(runs: &[Run], only: Option<RunState>, now: i64) -> Pane {
+    let when = |r: &Run| r.published_at.or(r.decided_at).unwrap_or(0);
+    let mut shown: Vec<&Run> = runs
+        .iter()
+        .filter(|r| r.state.is_final() && r.state != RunState::Done)
+        .filter(|r| only.is_none_or(|s| r.state == s))
+        .collect();
+    shown.sort_by_key(|r| std::cmp::Reverse((when(r), r.id)));
+    let total = shown.len();
+    shown.truncate(crate::api::FINISHED_SHOWN);
+    let items = shown
+        .into_iter()
+        .map(|r| Item {
+            cells: vec![
+                muted(format!("#{}", r.id)),
+                cell(r.state.name().to_string(), run_tone(r.state.name())),
+                plain(r.project.clone()),
+                plain(r.text.clone()),
+                muted(match when(r) {
+                    0 => String::new(),
+                    t => report::ago(now - t),
+                }),
+            ],
+            pick: run_pick(r),
+        })
+        .collect();
+    let of = only.map_or("every state".to_string(), |s| s.name().to_string());
+    Pane {
+        title: match total > crate::api::FINISHED_SHOWN {
+            true => format!(
+                "Finished runs: {of}, newest {} of {total}",
+                crate::api::FINISHED_SHOWN
+            ),
+            false => format!("Finished runs: {of}"),
+        },
+        columns: vec![
+            col("run", Kind::Text),
+            col("state", Kind::Badge),
+            col("project", Kind::Text),
+            col("task", Kind::Wide),
+            col("decided", Kind::Text),
+        ],
+        items,
+        empty: "No finished run in this state. Press b for another.",
     }
 }
 
@@ -1458,11 +1523,13 @@ pub fn screen(view: View) -> Screen {
             jobs,
             instances,
             runs,
+            finished,
             now: at,
         } => {
             let running: Vec<Run> = runs
-                .into_iter()
+                .iter()
                 .filter(|r| r.state == RunState::Running)
+                .cloned()
                 .collect();
             panes(
                 Tab::Activity,
@@ -1470,6 +1537,7 @@ pub fn screen(view: View) -> Screen {
                 vec![
                     activity_pane(&state, &running, &jobs, at, true),
                     instances_pane(&instances, at),
+                    finished_pane(&runs, finished, at),
                 ],
             )
         }
@@ -2086,6 +2154,7 @@ pub fn question(act: Act, pick: &Pick) -> String {
     let verb = match act {
         Act::Dispatch => "dispatch",
         Act::RejectRun => "reject",
+        Act::RetryRun => "retry the task of",
         Act::Stage => "stage in its clone",
         Act::Commit if ready => "approve and commit in its clone",
         Act::Commit => "commit in its clone",
@@ -2466,6 +2535,12 @@ pub fn action_in(
                 feedback: input.into(),
             }
         }
+        (Act::RetryRun, Pick::Run { id, state, .. }) if state == "failed" => {
+            Action::RetryRun { id: *id }
+        }
+        (Act::RetryRun, Pick::Run { id, .. }) => {
+            return Err(format!("run #{id} has not failed; reject or rework it"));
+        }
         (Act::AddReviewTime, Pick::Run { id, .. }) => Action::AddReviewTime {
             id: *id,
             minutes: input
@@ -2490,6 +2565,7 @@ pub fn action_in(
             Act::ApproveRun
             | Act::RejectRun
             | Act::ReworkRun
+            | Act::RetryRun
             | Act::AddReviewTime
             | Act::Stage
             | Act::Commit
@@ -2568,6 +2644,62 @@ mod tests {
                 project: "p".into(),
             },
         }
+    }
+
+    /// The act that moves a run on follows its state.
+    #[test]
+    fn a_run_names_the_act_that_moves_it_on() {
+        let run = |state: &str| Pick::Run {
+            id: 1,
+            clean: false,
+            state: state.into(),
+            project: "p".into(),
+        };
+        assert_eq!(next_act(&run("ready")), Some(Act::ApproveRun));
+        assert_eq!(next_act(&run("failed")), Some(Act::RetryRun));
+        assert_eq!(next_act(&run("staged")), Some(Act::Commit));
+        assert_eq!(next_act(&run("committed")), Some(Act::Push));
+        assert_eq!(next_act(&run("pushed")), None);
+        assert_eq!(next_act(&Pick::Nothing), None);
+        for state in ["ready", "failed", "staged", "committed", "approved"] {
+            let pick = run(state);
+            assert!(fits(next_act(&pick).unwrap(), &pick), "{state}");
+        }
+    }
+
+    /// Activity lists finished runs newest first, those in one state when
+    /// filtered; a run under way or a `done` node is not finished there.
+    #[test]
+    fn finished_runs_are_listed_newest_first() {
+        let run = |id: i64, state: RunState, at: i64| Run {
+            id,
+            project: "p".into(),
+            text: format!("task {id}"),
+            state,
+            decided_at: Some(at),
+            ..Default::default()
+        };
+        let runs = vec![
+            run(1, RunState::Rejected, 10),
+            run(2, RunState::Pushed, 30),
+            run(3, RunState::Rejected, 20),
+            run(4, RunState::Running, 40),
+            run(5, RunState::Done, 50),
+        ];
+        let ids = |only| -> Vec<String> {
+            finished_pane(&runs, only, 100)
+                .items
+                .iter()
+                .map(|i| i.cells[0].text.clone())
+                .collect()
+        };
+        assert_eq!(ids(None), ["#2", "#3", "#1"]);
+        assert_eq!(ids(Some(RunState::Rejected)), ["#3", "#1"]);
+        assert!(ids(Some(RunState::Merged)).is_empty());
+        assert_eq!(
+            finished_pane(&runs, Some(RunState::Rejected), 100).title,
+            "Finished runs: rejected"
+        );
     }
 
     #[test]

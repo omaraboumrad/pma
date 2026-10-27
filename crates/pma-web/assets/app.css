@@ -172,6 +172,13 @@ nav { display: flex; flex-direction: column; gap: 14px; }
 .heading p { margin: 2px 0 0; color: var(--text-3); font-size: 13px; }
 .toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
 .toolbar .sep { width: 1px; height: 22px; background: var(--border-strong); margin: 0 4px; }
+.more { position: relative; }
+.more summary { list-style: none; }
+.more summary::-webkit-details-marker { display: none; }
+.more-menu { position: absolute; right: 0; top: calc(100% + 4px); z-index: 5; display: flex; flex-direction: column; gap: 4px; padding: 6px; min-width: 180px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); box-shadow: var(--shadow-lg); }
+.more-menu .button { justify-content: space-between; box-shadow: none; }
+.anywhere { display: flex; flex-wrap: wrap; gap: 6px; }
+.button.small { padding: 4px 8px; font-size: 12px; }
 .content { flex: 1; overflow: auto; padding: 20px 28px 40px; display: flex; flex-direction: column; gap: 20px; }
 .content.grid { display: grid; grid-template-columns: 1fr 1fr; align-content: start; }
 

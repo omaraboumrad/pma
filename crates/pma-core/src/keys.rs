@@ -7,6 +7,7 @@
 use crate::api::{Action, Query, Selection};
 use crate::report_runs::By;
 use crate::screen::{self, Pick};
+use crate::store::RunState;
 
 /// A screen: one query, rendered as a list or as text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -57,8 +58,9 @@ impl Tab {
     }
 
     /// What the tab shows. Lists are not cut short: a front end scrolls.
-    /// `project` names the project the project tab shows.
-    pub fn query(self, by: By, project: &str) -> Query {
+    /// `project` names the project the project tab shows; `finished`, the
+    /// state the activity tab's finished runs are filtered to.
+    pub fn query(self, by: By, project: &str, finished: Option<RunState>) -> Query {
         let of = Selection::default();
         match self {
             Tab::Inbox => Query::Inbox { of },
@@ -69,7 +71,7 @@ impl Tab {
                 explain: false,
                 all: true,
             },
-            Tab::Activity => Query::Activity,
+            Tab::Activity => Query::Activity { finished },
             Tab::Matrix => Query::Matrix {
                 of,
                 quadrant: None,
@@ -109,6 +111,8 @@ pub enum Act {
     /// Starts an instance from a typed `<workflow> <target> [flags]`.
     StartWorkflow,
     ReworkRun,
+    /// A failed run: rejects it and dispatches its task again.
+    RetryRun,
     Stage,
     Commit,
     Pr,
@@ -148,7 +152,7 @@ pub enum Act {
 }
 
 impl Act {
-    pub const ALL: [Act; 42] = [
+    pub const ALL: [Act; 43] = [
         Act::ApproveRun,
         Act::ApproveRuns,
         Act::RejectRun,
@@ -166,6 +170,7 @@ impl Act {
         Act::ResumeWorkflow,
         Act::StartWorkflow,
         Act::ReworkRun,
+        Act::RetryRun,
         Act::Stage,
         Act::Commit,
         Act::Pr,
@@ -223,7 +228,11 @@ impl Act {
     /// discards or publishes something that cannot be called back.
     pub fn weight(self) -> &'static str {
         match self {
-            Act::ApproveRun | Act::ApproveJob | Act::Dispatch | Act::ActivateRoute => "primary",
+            Act::ApproveRun
+            | Act::ApproveJob
+            | Act::Dispatch
+            | Act::ActivateRoute
+            | Act::RetryRun => "primary",
             Act::RejectRun
             | Act::StopJob
             | Act::StopWorkflow
@@ -258,6 +267,7 @@ impl Act {
             Action::Dispatch { .. } => &[Act::Dispatch],
             Action::WorkflowRun { .. } => &[Act::ResumeWorkflow, Act::StartWorkflow],
             Action::ReworkRun { .. } => &[Act::ReworkRun],
+            Action::RetryRun { .. } => &[Act::RetryRun],
             Action::Run { .. } => &[Act::Run],
             Action::Publish { .. } => &[Act::Stage, Act::Commit, Act::Pr, Act::Push],
             Action::RunCampaign { .. } => &[Act::RunCampaign],
@@ -305,6 +315,9 @@ pub enum Command {
     Back,
     /// The report's next dimension.
     ReportBy,
+    /// Cycles the state the activity tab's finished runs are filtered to,
+    /// through `FINISHED`.
+    Finished,
     /// The project of the selected row.
     OpenProject,
     Help,
@@ -423,6 +436,10 @@ pub const BINDINGS: &[Binding] = &[
         tabs: &[Tab::Report],
         ..bind("b", Command::ReportBy, "by")
     },
+    Binding {
+        tabs: &[Tab::Activity],
+        ..bind("b", Command::Finished, "finished state")
+    },
     bind("?", Command::Help, "keys"),
     bind("q", Command::Quit, "quit"),
     // Anywhere.
@@ -466,6 +483,7 @@ pub const BINDINGS: &[Binding] = &[
     on("b", RUNS, Act::ApproveRuns, Ask::Confirm, "approve clean"),
     on("x", RUNS, Act::RejectRun, Ask::Confirm, "reject"),
     on("w", RUNS, Act::ReworkRun, Ask::Text("feedback"), "rework"),
+    on("R", RUNS, Act::RetryRun, Ask::Confirm, "retry as it was"),
     on(
         "t",
         RUNS,

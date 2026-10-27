@@ -56,8 +56,11 @@ pub enum Query {
     Inbox {
         of: Selection,
     },
-    /// Jobs, running agents and workflow instances.
-    Activity,
+    /// Jobs, running agents, workflow instances and finished runs, those
+    /// in `finished` alone when it is set.
+    Activity {
+        finished: Option<RunState>,
+    },
     /// Workflow revisions and campaigns.
     Library,
     /// One run, with its diff. Showing it records the tree shown, which an
@@ -174,6 +177,7 @@ pub enum View {
         jobs: Vec<Job>,
         instances: Vec<WorkflowInstance>,
         runs: Vec<Run>,
+        finished: Option<RunState>,
         now: i64,
     },
     Library {
@@ -412,6 +416,11 @@ pub enum Action {
         id: i64,
         feedback: String,
     },
+    /// Rejects a failed run and dispatches its task again with the same
+    /// agent and model.
+    RetryRun {
+        id: i64,
+    },
     /// `pma run <name> <project>`: a named job over one project.
     Run {
         name: String,
@@ -533,6 +542,20 @@ impl Outcome {
 
 /// Scans the status view lists.
 pub const SCANS_SHOWN: usize = 10;
+
+/// The states the activity tab filters finished runs to, in the order a
+/// key cycles them; `None` is every one. A `done` run changed no files.
+pub const FINISHED: [Option<RunState>; 6] = [
+    None,
+    Some(RunState::Rejected),
+    Some(RunState::Pushed),
+    Some(RunState::Merged),
+    Some(RunState::Closed),
+    Some(RunState::Applied),
+];
+
+/// Finished runs the activity tab lists, newest first.
+pub const FINISHED_SHOWN: usize = 100;
 
 /// What the last scan recorded, for tiered projects.
 pub struct Portfolio {
@@ -773,8 +796,11 @@ impl Transition {
                 "#{} {}: {}: {}",
                 self.id,
                 self.project,
+                // A staged or committed run waits on one more step.
                 match self.state.as_str() {
                     "ready" => "ready for review",
+                    "staged" => "staged in its clone, commit next",
+                    "committed" => "committed in its clone, push next",
                     s => s,
                 },
                 self.text
@@ -852,6 +878,8 @@ impl Watch {
                 r.state,
                 RunState::Ready
                     | RunState::Failed
+                    | RunState::Staged
+                    | RunState::Committed
                     | RunState::Pushed
                     | RunState::Merged
                     | RunState::Applied
@@ -1099,11 +1127,12 @@ pub fn query(store: &Store, q: Query) -> Result<View> {
                 now: dates::now(),
             }
         }
-        Query::Activity => View::Activity {
+        Query::Activity { finished } => View::Activity {
             state: store::state_home()?,
             jobs: store.jobs(50)?,
             instances: store.workflow_instances()?,
             runs: store.runs()?,
+            finished,
             now: dates::now(),
         },
         Query::Library => View::Library {
@@ -1460,6 +1489,7 @@ pub fn act(store: &Store, a: Action) -> Result<Outcome> {
             let files = dispatch::reject(store, &mut run, keep_git_changes, infra)?;
             let plural = if files == 1 { "" } else { "s" };
             Outcome::said(match run.workspace {
+                _ if files == 0 => format!("Run #{id} rejected; it changed no files."),
                 Workspace::Clone => format!(
                     "Run #{id} rejected; reverted {files} file{plural} in {}.",
                     run.repo.display()
@@ -1860,6 +1890,9 @@ pub fn command_line(a: &Action) -> Option<Vec<String>> {
                 format!("--rework={feedback}"),
             ]);
         }
+        Action::RetryRun { id } => {
+            v.extend(["review".to_string(), id.to_string(), "--retry".into()]);
+        }
         Action::Publish {
             ids,
             all_approved,
@@ -2057,6 +2090,17 @@ mod tests {
         writer.insert_run(&mut second).unwrap();
         assert_eq!(watch.poll(&reader).unwrap(), Some(Vec::new()));
         assert!(watch.busy);
+
+        // A staged run says what comes next.
+        run.state = RunState::Staged;
+        writer.update_run(&run).unwrap();
+        let moved = watch.poll(&reader).unwrap().expect("a commit was seen");
+        assert_eq!(moved.len(), 1);
+        assert!(
+            moved[0].line().contains("staged in its clone, commit next"),
+            "{}",
+            moved[0].line()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
