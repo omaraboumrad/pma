@@ -2776,6 +2776,17 @@ impl Store {
         Ok(())
     }
 
+    /// What a workflow instance's runs have cost, a run that reported no
+    /// cost counted at `unknown`.
+    pub fn instance_spend(&self, instance: i64, unknown: f64) -> Result<f64> {
+        Ok(self.conn.query_row(
+            "SELECT COALESCE(SUM(COALESCE(cost_usd, ?2)), 0) FROM runs
+             WHERE workflow_instance = ?1",
+            params![instance, unknown],
+            |r| r.get(0),
+        )?)
+    }
+
     /// Attempts consumed against a task revision, across every run of it.
     pub fn consumed_attempts(&self, project: &str, revision: &str) -> Result<i64> {
         Ok(self

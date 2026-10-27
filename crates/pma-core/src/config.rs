@@ -43,6 +43,10 @@ pub struct Config {
     /// The most a workflow revision's worst case may cost, per unit of input,
     /// before `pma workflow activate` refuses it.
     pub workflow_budget: f64,
+    /// USD one workflow instance may spend over every pass, after which an
+    /// unattended pass approves no further plan. `None`, set as `off`, is no
+    /// cap. Design: docs/dev/scheduling-work.md.
+    pub instance_budget: Option<f64>,
     /// Minutes an agent run, or a verify run, may take.
     pub timeout: i64,
     /// A shell command run when a detached job ends, with `PMA_JOB_ID`,
@@ -134,6 +138,7 @@ impl Default for Config {
             batch_budget: 5.0,
             agent_budget: 1.0,
             workflow_budget: 25.0,
+            instance_budget: None,
             timeout: 30,
             notify: None,
             workspace: Workspace::Clone,
@@ -146,6 +151,8 @@ impl Default for Config {
 enum Slot<'a> {
     /// A finite number of at least the given minimum.
     Number(&'a mut f64, f64),
+    /// A number as `Number`, or `off` for none.
+    OptNumber(&'a mut Option<f64>, f64),
     /// A whole number from the minimum to the maximum.
     Count(&'a mut i64, i64, i64),
     /// 1 to 5, or `never` for none.
@@ -260,6 +267,7 @@ impl Config {
                 "batch_budget",
                 "agent_budget",
                 "workflow_budget",
+                "instance_budget",
                 "timeout",
                 "notify",
                 "workspace",
@@ -290,7 +298,7 @@ impl Config {
     /// The kind of value `key` takes, so `settings.toml` stores it typed.
     pub fn kind(key: &str) -> Option<&'static str> {
         Some(match Config::default().slot(key)? {
-            Slot::Number(..) => "number",
+            Slot::Number(..) | Slot::OptNumber(..) => "number",
             Slot::Count(..) => "count",
             Slot::Tier(_) => "tier",
             Slot::List(_) => "list",
@@ -307,6 +315,7 @@ impl Config {
         let mut copy = self.clone();
         Some(match copy.slot(key)? {
             Slot::Number(v, _) => v.to_string(),
+            Slot::OptNumber(v, _) => v.map_or("off".into(), |n| n.to_string()),
             Slot::Count(v, ..) => v.to_string(),
             Slot::Tier(v) => v.map_or("never".into(), |n| n.to_string()),
             Slot::Priority(p) => p.name().into(),
@@ -340,6 +349,18 @@ impl Config {
                     .ok()
                     .filter(|n| n.is_finite() && *n >= min)
                     .ok_or_else(|| format!("expected a number >= {min}"))?;
+            }
+            Slot::OptNumber(v, min) => {
+                *v = match value {
+                    "off" => None,
+                    _ => Some(
+                        value
+                            .parse::<f64>()
+                            .ok()
+                            .filter(|n| n.is_finite() && *n >= min)
+                            .ok_or_else(|| format!("expected a number >= {min}, or `off`"))?,
+                    ),
+                };
             }
             Slot::Count(v, min, max) => {
                 *v = value
@@ -422,6 +443,7 @@ impl Config {
                 "batch_budget" => Slot::Number(&mut self.batch_budget, 0.0),
                 "agent_budget" => Slot::Number(&mut self.agent_budget, 0.0),
                 "workflow_budget" => Slot::Number(&mut self.workflow_budget, 0.0),
+                "instance_budget" => Slot::OptNumber(&mut self.instance_budget, 0.0),
                 // Four hours. Minutes become seconds, which must not overflow, and a
                 // value meant as seconds is refused.
                 "timeout" => Slot::Count(&mut self.timeout, 1, 240),
@@ -485,7 +507,7 @@ mod tests {
     #[test]
     fn every_key_reads_and_round_trips() {
         let keys = Config::keys();
-        assert_eq!(keys.len(), 34);
+        assert_eq!(keys.len(), 35);
         let defaults = Config::default();
         let mut copy = Config::default();
         for key in &keys {

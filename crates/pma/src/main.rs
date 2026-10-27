@@ -3360,6 +3360,14 @@ fn workflow_command(action: Option<WorkflowAction>) -> Result<()> {
                         units.len(),
                         estimate.cost
                     );
+                    if let Some(cap) = cfg.instance_budget
+                        && estimate.cost > cap
+                    {
+                        println!(
+                            "instance_budget is ${cap:.2}: an unattended pass stops approving \
+                             plans before it is passed"
+                        );
+                    }
                     (id, args)
                 }
             };
@@ -3414,6 +3422,9 @@ fn workflow_command(action: Option<WorkflowAction>) -> Result<()> {
                 return Ok(());
             }
             let plan = &outcome.plan;
+            if let Some(why) = &outcome.over_budget {
+                println!("{why}");
+            }
             let job = jobs::current();
             if let Some(job) = job {
                 let mut approve = vec![

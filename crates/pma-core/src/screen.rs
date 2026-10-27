@@ -142,15 +142,15 @@ pub fn fits(act: Act, pick: &Pick) -> bool {
     match act {
         Act::Dispatch => matches!(pick, Pick::Task { .. }),
         Act::Verify => matches!(pick, Pick::Task { .. } | Pick::Manual { .. }),
+        Act::AddReviewTime => matches!(pick, Pick::Run { .. }),
         Act::ApproveRun
         | Act::RejectRun
         | Act::ReworkRun
-        | Act::AddReviewTime
+        | Act::RetryRun
         | Act::Stage
         | Act::Commit
         | Act::Pr
-        | Act::Push => matches!(pick, Pick::Run { .. }),
-        Act::RetryRun => matches!(pick, Pick::Run { state, .. } if state == "failed"),
+        | Act::Push => matches!(pick, Pick::Run { state, .. } if run_allows(act, state)),
         Act::ApproveJob => matches!(pick, Pick::Job { awaiting: true, .. }),
         Act::StopJob => matches!(pick, Pick::Job { .. }),
         Act::StopWorkflow => matches!(pick, Pick::Instance { open: true, .. }),
@@ -166,6 +166,23 @@ pub fn fits(act: Act, pick: &Pick) -> bool {
         Act::ActivateRoute => matches!(pick, Pick::Route { active: false, .. }),
         _ => !act.on_row(),
     }
+}
+
+/// Whether a run in `state` takes `act`, as `dispatch` and `publish` check
+/// it. A ready run takes commit, pull request and push: `api::act`
+/// approves it first.
+fn run_allows(act: Act, state: &str) -> bool {
+    let takes: &[&str] = match act {
+        Act::ApproveRun => &["ready", "approved"],
+        Act::RejectRun => &["ready", "failed", "approved", "staged", "committed"],
+        Act::ReworkRun => &["ready", "failed", "approved"],
+        Act::RetryRun => &["failed"],
+        Act::Stage | Act::Pr => &["ready", "approved"],
+        Act::Commit => &["ready", "approved", "staged"],
+        Act::Push => &["ready", "approved", "staged", "committed"],
+        _ => return true,
+    };
+    takes.contains(&state)
 }
 
 /// The act that moves a row on from the state it is in, which a front end
@@ -2665,6 +2682,40 @@ mod tests {
             let pick = run(state);
             assert!(fits(next_act(&pick).unwrap(), &pick), "{state}");
         }
+    }
+
+    /// A run offers only what its state takes; a finished one, review time.
+    #[test]
+    fn a_run_offers_what_its_state_takes() {
+        let offered = |state: &str| -> Vec<Act> {
+            let pick = Pick::Run {
+                id: 1,
+                clean: false,
+                state: state.into(),
+                project: "p".into(),
+            };
+            Act::ALL
+                .into_iter()
+                .filter(|a| a.on_row() && fits(*a, &pick))
+                .collect()
+        };
+        assert_eq!(offered("pushed"), [Act::AddReviewTime]);
+        assert_eq!(offered("rejected"), [Act::AddReviewTime]);
+        assert_eq!(
+            offered("staged"),
+            [Act::RejectRun, Act::AddReviewTime, Act::Commit, Act::Push]
+        );
+        assert_eq!(
+            offered("failed"),
+            [
+                Act::RejectRun,
+                Act::AddReviewTime,
+                Act::ReworkRun,
+                Act::RetryRun
+            ]
+        );
+        assert!(!offered("ready").contains(&Act::RetryRun));
+        assert!(!offered("running").contains(&Act::RejectRun));
     }
 
     /// Activity lists finished runs newest first, those in one state when

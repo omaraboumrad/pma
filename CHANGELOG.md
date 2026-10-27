@@ -26,6 +26,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - A run that is staged or committed is a notice in both front ends, naming the next step: `#4 alpha: staged in its clone, commit next`. `pma stage` and `pma commit` end their line with the command that comes next.
 
+- **`instance_budget`** caps what one workflow instance may spend over every pass, in dollars; `off` by default. An unattended pass approves no plan that would take the instance's reported spend, plus the plan's worst case, past it, and prints why; the plan waits for approval by its id, which the cap does not hold. It admits plans rather than capping spend, since no built-in worker stops a run exactly at `agent_budget`. Before it, an unattended pass was bounded only by its worst case, $63 for `find-issues` over three projects. `docs/dev/scheduling-work.md`.
+
+```sh
+pma config instance_budget 10
+pma workflow run find-issues --tag nightly --unattended
+```
+
 - `/` in the TUI's run list filters it by name; the web's list has a filter box, and the arrows move among what it keeps. The web's names and descriptions line up in columns.
 
 ### Changed
@@ -33,6 +40,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - A command already queued or running from the same directory is refused as a job: `job 12 is queued already: pma verify alpha`. A second click on verify queued a second verify. It applies to `--detach` too.
 
 - The web toolbar holds a view's own acts and the selected row's primary and danger acts, and the act that moves the row on from its state: commit for a staged run, push for a committed one. A row's other acts are under More; the TUI footer lists the next act first. Scan, sync and add note, which apply on every view, moved to the sidebar. At 1100 px the inbox toolbar went from 9 buttons over two lines to 6 on one, before a row's acts.
+
+- A run offers only the acts its state takes, in both front ends: a pushed or rejected run no longer offers approve, reject or push, which were refused only once tried.
 
 - One click on a web row with a detail (a run, a job, a scan, a route, a campaign, a task in its project) opens it. Other rows are selected, as before. It took a double-click.
 

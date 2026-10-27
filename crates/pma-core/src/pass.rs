@@ -235,6 +235,9 @@ pub struct Outcome {
     pub ran: bool,
     /// Each edit of a local instance: applied to its clone, or discarded.
     pub landed: Vec<String>,
+    /// Why an unattended pass approved no further plan: the next one would
+    /// pass `instance_budget`.
+    pub over_budget: Option<String>,
 }
 
 pub fn root_units(
@@ -1003,13 +1006,30 @@ fn advance_inner(
         }
         let plan = plan_of(store, cfg, over, &ctx.policy, w, given.args, &ready)?;
         let id = plan.id();
-        let unattended = (given.unattended && !plan.is_empty()).then(|| {
-            println!(
-                "{}plan {id}: approved unattended",
-                describe(&plan.steps, "next: ")
-            );
-            id.clone()
-        });
+        // The cap holds unattended approval only: a plan approved by its id
+        // is the developer's call, with its price in view.
+        let mut over_budget = None;
+        if given.unattended
+            && !plan.is_empty()
+            && let Some(cap) = cfg.instance_budget
+        {
+            let spent = store.instance_spend(instance, cfg.agent_budget)?;
+            if spent + plan.cost() > cap + 1e-9 {
+                over_budget = Some(format!(
+                    "instance {instance} has spent ${spent:.2} of instance_budget ${cap:.2}; \
+                     the next plan, at most ${:.2}, would pass it",
+                    plan.cost()
+                ));
+            }
+        }
+        let unattended =
+            (given.unattended && !plan.is_empty() && over_budget.is_none()).then(|| {
+                println!(
+                    "{}plan {id}: approved unattended",
+                    describe(&plan.steps, "next: ")
+                );
+                id.clone()
+            });
         match approve.take().or(unattended) {
             Some(given) if !plan.is_empty() && given == id => {
                 for step in &plan.steps {
@@ -1050,6 +1070,7 @@ fn advance_inner(
                     refused: ctx.refused.take(),
                     ran,
                     landed: ctx.landed.take(),
+                    over_budget,
                 });
             }
         }

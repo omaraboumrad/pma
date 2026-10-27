@@ -3757,6 +3757,87 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"ok","total
     assert!(!env.push_log.exists(), "no push was attempted");
 }
 
+/// `instance_budget` stops unattended approval before a plan would pass it,
+/// counting what the instance's runs reported; a plan approved by its id is
+/// not held, and `off` lifts the cap.
+#[test]
+fn an_unattended_instance_stops_at_its_budget() {
+    let s = Scratch::new("wfbudget");
+    let worker = r#"#!/bin/sh
+case "$2" in
+  *"findings to "*)
+    out=$(printf '%s' "$2" | sed -n 's/.*findings to //p')
+    printf '[{"title":"a"},{"title":"b"},{"title":"c"},{"title":"d"}]' > "$out" ;;
+  *"Confirm into "*)
+    out=$(printf '%s' "$2" | sed -n 's/.*Confirm into //p')
+    printf '[]' > "$out" ;;
+esac
+echo '{"type":"result","subtype":"success","is_error":false,"result":"ok","total_cost_usd":0.1}'
+"#;
+    let (env, _origin, _alpha) = dispatch_env(&s, &[("claude", worker)]);
+    let wf = s.0.join("look.rhai");
+    fs::write(
+        &wf,
+        r#"
+        let graph = source("project")
+            .expand("review", "finding", 4, "Review `{name}`. Write findings to {out}")
+            .filter("confirm", ["reason"], "Confirm into {out}")
+            .output();
+        document(#{ finding: #{ fields: #{ title: req(line(200)), reason: line(200) }}}, [
+            workflow("look", graph, #{ caps: #{ max_units: 10, max_edits: 0 }}),
+        ])
+        "#,
+    )
+    .unwrap();
+    assert_eq!(env.ok(&["config", "instance_budget"]).trim(), "off");
+    let (_, err, ok) = env.run(&["config", "instance_budget", "cheap"]);
+    assert!(!ok && err.contains("or `off`"), "{err}");
+    env.ok(&["config", "workflow_budget", "20"]);
+    // Plans of two runs at $1 each, at most.
+    env.ok(&["config", "batch_budget", "2"]);
+    env.ok(&["config", "instance_budget", "2"]);
+    env.ok(&["workflow", "propose", wf.to_str().unwrap()]);
+    env.ok(&["workflow", "activate", "1"]);
+
+    // The review fits: $1 at most, nothing spent. Two confirms would not:
+    // $0.10 spent and $2 more is over $2.
+    let out = env.ok(&["workflow", "run", "look", "alpha", "--unattended"]);
+    assert!(out.contains("instance_budget is $2.00"), "{out}");
+    assert_eq!(out.matches("approved unattended").count(), 1, "{out}");
+    assert!(
+        out.contains(
+            "instance 1 has spent $0.10 of instance_budget $2.00; \
+             the next plan, at most $2.00, would pass it"
+        ),
+        "{out}"
+    );
+    assert!(out.contains("--instance 1 --approve"), "{out}");
+
+    // Approved by its id, the plan runs whatever the cap.
+    let id = plan_id(&out);
+    let out = env.ok(&[
+        "workflow",
+        "run",
+        "look",
+        "--instance",
+        "1",
+        "--approve",
+        &id,
+    ]);
+    assert!(out.contains("the approved plan ran"), "{out}");
+    // Resumed unattended, the cap holds over every pass of the instance.
+    let out = env.ok(&["workflow", "run", "look", "--instance", "1", "--unattended"]);
+    assert!(
+        out.contains("has spent $0.30 of instance_budget $2.00"),
+        "{out}"
+    );
+    assert!(!out.contains("approved unattended"), "{out}");
+
+    env.ok(&["config", "instance_budget", "off"]);
+    let out = env.ok(&["workflow", "run", "look", "--instance", "1", "--unattended"]);
+    assert!(out.contains("nothing left to run"), "{out}");
+}
+
 /// `--detach` queues the command and returns; a runner it started runs it
 /// to the end with no terminal, and `pma job` reports how it ended.
 #[test]
