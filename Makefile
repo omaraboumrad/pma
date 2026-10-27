@@ -23,6 +23,10 @@ test: ## run every test
 	@cargo test
 	@uv run --no-project --with pytest pytest -q scripts
 
+.PHONY: web-check
+web-check: ## drive pma web in headless Chromium against a fresh fixture
+	@sh scripts/web-check.sh
+
 .PHONY: check
 check: ## format check, clippy with warnings as errors, and test
 	@cargo fmt --check

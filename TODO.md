@@ -85,7 +85,7 @@
   Reject reverts every attempt. Attempts are append-only rows, but a clone run reverts one patch, so this needs each attempt's patch kept. Open: is the need "discard the latest rework, keep the earlier one approvable"?
 
 - [ ] Scheduled runs within a budget, finding issues and adding them to TODO.md with duplicates merged
-  Proposal and open decisions: `docs/dev/scheduling-work.md`. Tapping into an agent's session is the session-id item below.
+  Proposal and open decisions: `docs/dev/scheduling-work.md`. Step 1, `instance_budget`, built 2026-10-27. Next: a week of `pma run review` by hand on 3 projects (cost per project, share of findings kept), then step 2, confirm by severity. Tapping into an agent's session is the session-id item below.
 
 - [x] Click through the web page after the drawer removal #manual
   Done 2026-10-27 in headless Chromium (Playwright's cache), against a scratch store with two runs: tabs, the address, the chooser, prompts, a run's detail, the commit prompt and its notice's Open button, reject, the activity filter, More, and 1100 and 720 px. No console errors.
