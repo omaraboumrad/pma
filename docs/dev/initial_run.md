@@ -58,7 +58,9 @@ In order.
 4. **Name the model.** `pma preset set pilot claude <model>`, then `pma preset use pilot`, so every pilot run records the model it ran.
 
 5. **Decide the push block for local paths.** The block also stops pushes to local paths. Any project whose tests push to fixture repositories will fail verify the same way. Two options:
+
    - Keep it strict and make such test suites hermetic. This is the recommended option.
+
    - Narrow the block to network URLs, which lets an agent push into local clones.
 
 6. **Leave the allowlist as it is for the pilot.** Record denials per run. If they cluster on narrower forms of the verify command, such as a single test, consider an allow rule for that prefix.
@@ -66,4 +68,5 @@ In order.
 ## Open
 
 - Does detail predict success? One run cannot say. The difficulty estimate (1) and pma's complexity estimate (3) disagree; the pilot will show which tracks outcome.
+
 - Would the run have passed verify on a working base? Probably: the 205 unit tests passed at the head, including the new cases. It is still unverified until the redispatch.

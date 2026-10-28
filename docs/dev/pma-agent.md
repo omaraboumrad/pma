@@ -7,7 +7,9 @@ Design note, 2026-10-15. How `pma-agent`, the manager layer of [design.md](desig
 [design.md](design.md) gives `pma-agent` three jobs:
 
 - classify and specify tasks;
+
 - read a worker's output and instruct it mid-run;
+
 - propose what to approve.
 
 minos [design.md](https://github.com/shakfu/minos/blob/main/docs/dev/design.md) section 2 adds a fourth: proposals about which workflow a situation gets, and revisions of routing policy.
@@ -25,10 +27,15 @@ So `pma-agent` is not one standing agent. It is a routing role for judgment node
 ## 2. Constraints carried forward
 
 - **An LLM step proposes; code acts** ([design-review.md](design-review.md), "Manager and workers"). `pma-agent` commits nothing, pushes nothing, and approves nothing.
+
 - **An agent's authority must not exceed that of the least-trusted principal who can write to it** (minos design.md section 3). `pma-agent` reads worker output and repository text, so it is bounded by both.
+
 - **Per task, not one fleet context.** A fleet context reading every room is a channel between workers ([pma_feedback.md](https://github.com/shakfu/minos/blob/main/docs/dev/pma_feedback.md) section 1; minos D10). Cross-project judgment stays in `rank.rs` and `route.rs`, from stored scores.
+
 - **The developer reaches a worker when `pma-agent` is down or wrong** (minos design.md section 5, "The three conversations"). Supervision is advisory; a run must not depend on it.
+
 - **Agent and model live in the routing policy** (W12). Whether a run is supervised, and by which model, is a route field, not a node field.
+
 - **`pma-agent` may propose a workflow revision or trigger; it may not activate one** (W15).
 
 ## 3. Judgment steps: workflow nodes
@@ -74,8 +81,11 @@ minosb -user pma-agent -room {room} -task {brief} -quiet PASS -max-turns {max_tu
 The two brokers relay each other:
 
 1. The worker's turn ends. Its `minosb` posts the final reply to the room.
+
 2. The supervisor's `minosb` pushes it to the supervisor as `worker: <text>`.
+
 3. The supervisor replies with an instruction, or with `PASS`.
+
 4. An instruction is relayed to the room. The worker's `minosb` holds it until the worker's turn ends, then pushes it as `pma-agent: <text>`.
 
 This needs no minos client in pma and no new conversation code. The worker's `-interrupters` lists the developer and `pma-agent`, so the supervisor can stop a turn with `/interrupt <correction>`.
@@ -93,7 +103,9 @@ This flag set is enforcement inside the `claude` process, not an OS boundary. It
 `{brief}`, the supervisor's first frame, holds:
 
 - the task text and its spec, if a `specify` node wrote one;
+
 - the verify command and the path scope;
+
 - the rules: the developer outranks `pma-agent`; reply `PASS` when nothing needs saying; `ESCALATE:` for what needs a person; never approve.
 
 The worker's own prompt gains one line: a message from the developer outranks one from `pma-agent`. Authors arrive as `name: text` (minos `forPush`).
@@ -141,7 +153,9 @@ The host-mode row decides how far 4.2 supervision can be trusted. On the host it
 Proposals are outputs of judgment nodes:
 
 - which workflow a situation gets;
+
 - inputs the deterministic rules cannot read, such as priority implied by prose;
+
 - a revision of the routing policy.
 
 A node writes a unit, and an `emit` records it as pending. A person activates it, and `pma workflow activate` records who (W15). No live agent is needed, and nothing reaches minos. A minos submission becomes useful only if approvals should leave the host (minos option 4.1).
@@ -161,21 +175,31 @@ Step 4 is the first point where `pma-agent` exists as a principal. Steps 1 and 3
 ## 7. Tests
 
 - **minos:** `-quiet` and `-max-turns` against the scripted fake agent in `relay_test.go`. Plus a two-broker test: two fakes on one room exchange turns until `PASS`, and stop at `max_turns`.
+
 - **pma:** a fake supervisor beside `FAKE_CLAUDE` in `crates/pma/tests/cli.rs`, against a test `minosd`. Check that:
+
   - the supervisor starts before the worker;
+
   - its cost is added to the run;
+
   - it is killed when the worker ends;
+
   - a route without `supervise` starts no supervisor.
+
 - **Real:** a `make host-run` variant with a real supervisor, to find whether `PASS` is reliable and how many turns a run takes.
 
 ## 8. Alternative framings
 
 - **No supervising principal.** The developer is the supervisor, through option 4.2, and every judgment is a workflow node. `pma-agent` then names a routing role, not an agent. This is the default until step 4's gate passes, and may be the end state.
+
 - **An interactive head.** design-review "Manager architecture" proposes exposing `pma` over MCP so any agent session can act as the manager while `pma` keeps the gates. That is a person's session with a model in it, not an autonomous supervisor. It needs an MCP api over `pma_core::api` and no minos at all.
 
 ## 9. Open questions
 
 1. Is `PASS` reliable enough as an empty reply? If the model writes prose around it, `-quiet` needs a prefix match, which a worker cannot exploit, since only the supervisor's broker applies it.
+
 2. Should the supervisor see the worker's trace, or only its final replies? Final replies keep the room readable (minos D15). The trace would add tool calls and cost.
+
 3. Who supervises a lap of `apply-fixes`: one supervisor per run, or one per workflow instance? Per run matches D10 and the room grain question.
+
 4. Does a supervised run use `approval: each`, or can supervision relax approval? This note assumes it cannot. A supervisor that relaxes approval holds authority W15 denies it.

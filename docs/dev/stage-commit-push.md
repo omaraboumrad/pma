@@ -19,13 +19,17 @@ Three commands named after the git steps, acting in the user's clone. Each runs 
 `pma pr N` is unchanged: it publishes from the worktree.
 
 - Staging is the review, so `stage` needs no approval. `commit` and `push` on an unstaged run still need `pma review N --approve`.
+
 - `stage` refuses a ready run whose check failed, and leaves it ready.
 
 ## What the clone must hold
 
 - **HEAD at the run's base.** The check ran against that base. A clone behind or ahead of it is refused, with the cause. pma does not pull or rebase the user's branch.
+
 - **An empty index**, for `stage`. A commit would otherwise include the user's staged changes.
+
 - **The staged change unchanged**, for `commit`. The index tree must equal the tree `stage` wrote; it is kept in `runs/<id>/staged.tree`. A different index is the user's to commit.
+
 - **HEAD is the run's commit**, for `push`: its parent is the base and its tree is the staged tree. pma pushes that commit, never other local commits.
 
 `git apply --index` refuses on its own when a file it touches has unstaged edits.
@@ -39,4 +43,5 @@ Two runs in one project: the second finds HEAD past its base and is refused. Pub
 ## Rejected
 
 - **Stage only, detect the commit by patch-id.** One verb fewer, but the user writes the message and the task stays open until the next scan.
+
 - **Keep publishing from the worktree.** The clone never shows the commit, which was the complaint.

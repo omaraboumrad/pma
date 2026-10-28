@@ -5,7 +5,9 @@ Status: built, 2026-10-21.
 Where the build departs from the design below:
 
 - No route is seeded. Activating a policy is the user's gate. A policy without a catch-all refuses every other dispatch, and any applied policy refuses workflow nodes no route names. Name the worker (`-a refresh`), or add a `"class": "A"` route to your own policy.
+
 - A `refresh` run counts its attempts under its own key. A refused refresh says an update broke the check, which is the agent's task; counting it against the task left the agent no attempt.
+
 - A `refresh` run is charged nothing against `batch_budget`. Another worker that reports no cost is charged its whole `agent_budget`.
 
 ## Problem
@@ -15,9 +17,13 @@ The stale-deps state fires on almost every project, and nothing clears it withou
 Measured from `projects.db` on 2026-10-21:
 
 - 37 of 39 measured projects are in the state. The trigger is any count above zero (`rank.rs:192`).
+
 - Every measurement dates from 2026-09-15. rezon is stored at 147; `cargo update --dry-run` gives 72 today, after a lock refresh on 2026-10-18. The state reads an old number as current.
+
 - The three tools answer different questions (`deps.rs`). cargo and go report what the lock can move to within declared constraints. uv's `uv tree --outdated` reports any newer release on the index.
+
 - Of uv's 166 listed bumps, 76 change the major version or a 0.x minor version. Of cargo's 420, 28 do. The classification is a regex over version strings, so treat it as approximate.
+
 - cargo's parser keeps `Updating` lines only. It drops `Adding`, `Removing`, and the note `N unchanged dependencies behind latest`.
 
 ## Decision
@@ -29,9 +35,13 @@ This is uv's documented workflow ([uv#6692](https://github.com/astral-sh/uv/issu
 Rejected:
 
 - **Any newer release.** It grows with upstream release cadence, not with the project. No command clears it; moving a constraint is judgement.
+
 - **pma's own semver rule for uv.** It adds a policy uv does not have. Python packages do not follow semver reliably.
+
 - **Upper bounds on every dependency.** It changes packaging policy for published libraries and causes resolver conflicts for their users ([Schreiner](https://iscinumpy.dev/post/bound-version-constraints/)).
+
 - **Lock age alone.** An old lock with nothing to move needs no action.
+
 - **Count alone.** Patch releases are daily, so a lock is almost never fully current. The state would return on the next scan.
 
 ## Measurement
@@ -61,7 +71,9 @@ A lock with uncommitted changes counts as fresh: someone is refreshing it. A loc
 A project is in stale deps when all three hold:
 
 1. the last `--deps` measurement is at most 30 days old;
+
 2. that measurement found movement above zero;
+
 3. the lock is more than 30 days old.
 
 A measurement older than 30 days makes the project unmeasured, which places it in no state. It cannot say whether the lock is within the window.
@@ -75,8 +87,11 @@ A worker named `refresh`, seeded beside `claude`, runs `pma deps refresh {dir}`.
 Everything else is the existing dispatch path:
 
 - a worktree on the default branch;
+
 - `Class::Mechanical`, whose scope is the manifests (`class.rs:38`), so a refresh that touches source is refused;
+
 - `accept.rs:115`: mechanical work must leave a green tree green;
+
 - review, `pma pr` or `pma push`.
 
 ```sh
@@ -91,19 +106,27 @@ A refresh that fails the check is rejected. The project keeps its state, and its
 ## Not in scope
 
 - **Advisories.** `cargo audit`, `pip-audit`, `govulncheck` or OSV would be a separate state ranked above stale deps. Add when security tracking is wanted here.
+
 - **Raising constraints.** uv's hidden `uv upgrade <pkg>` ([uv#19738](https://github.com/astral-sh/uv/pull/19738), in 0.13.1) rewrites one constraint and leaves the lock. It is unfinished; [uv#6794](https://github.com/astral-sh/uv/issues/6794) tracks the design.
+
 - **A failed tool counted as zero.** Cohort item 9 in `pilot.md` owns it. This change leaves the summing in `measure` as it is.
 
 ## Open questions
 
 1. Escalation changes the model, not the worker (`dispatch.rs:1496`). Should a route escalate `refresh` to `claude` automatically, or stay manual? Automatic needs `escalate` to name a worker.
+
 2. `go get -u ./...` also moves indirect modules. `go get -u=patch` is narrower. Which is go's compatible range for this purpose?
+
 3. Do unattended runs (`--local --unattended`) apply to `refresh`? Mechanical work may run unattended today, and the check gates it, but a lock refresh that passes tests can still change runtime behaviour.
 
 ## Plan
 
 1. `deps.rs`: uv measure, movement lines, cargo held-back count. Unit tests on captured output.
+
 2. Lock age in `scan.rs`, stored beside `deps_at`; a migration.
+
 3. `rank.rs`: the three-part state; `deps.days`.
+
 4. `pma deps refresh <dir>`; the seeded worker; the deps prompt carries a refused refresh's verify output. CLI test with a fake `uv`.
+
 5. Docs: README, `design.md` deps section, CHANGELOG.

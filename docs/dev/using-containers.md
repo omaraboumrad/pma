@@ -100,8 +100,11 @@ The broker relays each turn's final reply to the room, and pushes room messages 
 What this does to the four problems an earlier draft listed for `minosd` on the sealed network:
 
 1. **Credential.** None enters the container; `minosb` holds it on the host. A per-run grant is still minos phase 1 work. Until it lands, `minosb` logs in with a password, which an unsandboxed agent on the host can read (issue 5 in [pma-minos-integration.md](pma-minos-integration.md)).
+
 2. **VFS exfiltration.** Closed. `minosb` implements no file or settings operation, so the container cannot reach them at any credential.
+
 3. **A dual-homed `minosd`.** Gone. `minosd` needs no presence on `sanduk-net`. The boundary is the socket, whose file mode admits only the container's uid.
+
 4. **The audit trail splits.** Unchanged; see below.
 
 `sanduk` needs two changes (minos phase 0 item 3): the agent's stdin passed through with `--input-format stream-json`, and a socket mount outside the work mount.

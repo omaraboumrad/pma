@@ -17,10 +17,15 @@ The user cannot tell a working command from a hung one, nor which step it is on.
 ## What exists
 
 - `agent::run_limited` runs every long subprocess (an agent, a check, a deps tool, a job) with its output in a log file. It is the one place a long step starts and ends.
+
 - Run logs are `~/.local/state/pma/runs/<id>/agent-<n>.log` and `verify-<n>.log`; a base check's is `verify-base/<project>-<commit>.log`.
+
 - `verify_base` records each check's duration per project, commit and command (`seconds`).
+
 - `watch.rs` reads a running agent's log: a `claude` log's last tool call, or any other log's last line.
+
 - `dispatch::execute` runs up to `max_parallel` runs on threads; only the main thread holds the store, and the threads report over a channel.
+
 - The TUI and the web queue long acts as jobs: a runner process runs the CLI command (`frontends.md`, phase 2). They read jobs and running agents through `Query::Jobs`, as `pma watch` does.
 
 ## Decision
@@ -56,25 +61,35 @@ A file over a column on `runs`: the worker threads hold no store, and every phas
 ### Drawing
 
 - On stderr, only when stderr is a terminal, as the scan bar is. A pipe or a CI log gets the bytes it gets today.
+
 - A thread redraws four times a second: one line per active run, cut to the terminal's width. The width comes from `ratatui::crossterm::terminal::size`, which the `pma` crate reaches through `pma-tui`; `pma-core`, which writes and reads the phase files, stays free of terminal code.
+
 - A run that finishes prints its usual line above the live area, which stays below it.
+
 - With no active run, the area is erased, so the command's own output starts at column 0.
 
 ## Rejected
 
 - **Streaming the check's output.** Two parallel suites interleave, and 700 pytest dots bury the phase. Kept as a possible `--follow`, for one run.
+
 - **Only `--detach` and `pma watch`.** The wait moves elsewhere, and `watch` today shows agents only, not checks or git.
+
 - **A worker reporting its own progress.** An agent may not call a progress tool, and a check cannot. `async_dispatch.md` rejected this for the same reasons.
 
 ## Open questions
 
 1. When stderr is not a terminal, stay silent, or print one plain line per phase change? Silent is the default here: scripts read the output, and a job's log already holds the step outputs.
+
 2. Should `pma watch` list base checks and `pma verify`, which belong to no run? This design lets it, from the `.phase` files in `verify-base/`.
+
 3. `git fetch` on a large repository can take a minute and writes no log. Is its name and elapsed time enough?
 
 ## Plan
 
 1. `progress.rs`: the phase file, written and read; the live area; a phase recorded at each step of `dispatch::prepare`, `dispatch::attempt` and `dispatch::preflight`. `pma verify`, `pma dispatch` and `pma review --rework` draw it. Tests on the line format and on a phase file a run leaves.
+
 2. `pma pr` and `pma push` (commit, push, `gh pr create`), `pma workflow run`, `pma campaign run`.
+
 3. `pma watch`, the TUI's agents tab and the web read the phase files, for foreground and detached work alike.
+
 4. Docs: README, CHANGELOG.

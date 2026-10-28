@@ -170,7 +170,9 @@ pma workflow run todo-audit myproject
 ```
 
 - `todo-audit`: a reviewer claims which open `TODO.md` items the code already does, citing `file:line`; a confirm checks each claim; each confirmed one becomes a note. It ticks nothing: a wrong "done" would close open work.
+
 - `doc-drift`: find-issues aimed at the README and docs, for statements the code contradicts.
+
 - The `doc` sink appends one block per unit to a file in the project's clone, uncommitted: `{"sink": "doc", "map": {"path": "REVIEW.md", "text": "..."}}`, or `.emit_doc` in a script. Section 9 put it under the instance's artifacts; a report is read and committed with the code, and artifacts are never collected. A path that leaves the repository, `.git`, `TODO.md` or a symlink is refused.
 
 The library's worst case is $63 per unit of input at the default `agent_budget` (from `ensemble-review`), over the default `workflow_budget` of $25, so activating it needs a higher budget.
@@ -221,7 +223,9 @@ pma dispatch a:deps -a claude    # after a refused refresh: carries its check ou
 **`TODO.md` writes cannot lose or misdirect the file.**
 
 - The tick made when publishing wrote the file in place, so a crash could leave it truncated. It now uses the same atomic save as every other writer.
+
 - All writers shared one temporary file, so two at once could fail, or leave a mix of both texts. Each now has its own, created new, so a file or symlink planted at the name is never written through.
+
 - Publishing refuses a `TODO.md` that the agent replaced with a symlink. The tick followed the link and wrote outside the worktree.
 
 **`pma project forget` removes all of the project's settings.** It kept `verify` and `sandbox`, and settings are matched by project name. A later, unrelated repository with the same name ran the old `verify` command, and with `sandbox = false` its agent ran without a sandbox no one chose for it. The dry run lists the settings it will remove.
@@ -233,9 +237,13 @@ pma dispatch a:deps -a claude    # after a refused refresh: carries its check ou
 **Malformed input is read, or refused with its cause.**
 
 - `pma project import` reads a file that starts with a byte-order mark. It read the CSV header as a project.
+
 - A `TODO.md` that starts with one is an error that names the mark, not "must start with `# TODO`".
+
 - An empty `PMA_HOME` counts as unset. A relative `PMA_HOME` or `PMA_STATE` is refused, since the database and session lock followed the working directory. A relative `XDG_STATE_HOME` is ignored, as the XDG specification says.
+
 - `timeout` is at most 240 minutes. A larger value could overflow when converted to seconds; the cap also refuses a value meant as seconds.
+
 - `gh:N` above `i64::MAX` is a lint error. The store wrapped it negative.
 
 ## [0.7.0]

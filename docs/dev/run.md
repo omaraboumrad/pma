@@ -47,4 +47,5 @@ Named targets run unattended: activation already set what one project may cost. 
 ## Not built
 
 - `--local` for workflows, and `--detach`; `pma workflow run` has both.
+
 - Registering a path outside every root. The error names the `pma root add` to run.

@@ -5,9 +5,13 @@ The first runs of the workflow engine on real repositories and real agents, 2026
 ## Setup
 
 - Database: a copy of `~/.config/pma/projects.db` in `PMA_HOME=~/.config/pma-trial`, so the real database stayed at schema 26. State (worktrees, artifacts, logs) went to `~/.config/pma-trial/state`.
+
 - Worker: `claude` (Claude Code 2.1.282) on the host, signed in with the user's own login. No API key was set in the environment. The `total_cost_usd` figures below are what Claude Code reports, which for a subscription login is a usage figure, not a charge.
+
 - Projects: `pma` (47 tracked files, Rust) and `argdec` (16 tracked files, Python). A workflow that edits nothing reads the clone's `HEAD`, so `pma` was reviewed at `647c850`, without the day's uncommitted fixes.
+
 - Workflow: `review` (agent `map`, `0..n`, emits `finding`), then `confirm` (agent `map`, `0..1`, may write only `reason`), then a note per kept finding. Each agent step runs once per unit in a scratch worktree.
+
 - Approval: each plan printed by a pass was approved by its id. `batch_budget` sized plans to 5 runs.
 
 ## Found before the first run
@@ -42,7 +46,9 @@ Instances 2 to 4 routed each step by a policy (`{"match": {"node": "review"}, "m
 ## What the confirm step did
 
 - **haiku** kept 6 of 7 claims. Four `pma` claims shared one false premise, that Rust's `str::lines()` splits on a bare `\r`; it does not ([`str::lines`](https://doc.rust-lang.org/std/primitive.str.html#method.lines)), and `pma lint` and `prune` handle `\r`-only and mixed endings without a panic. The `argdec` claim that `add_subparsers()` defaults to `required=True` is also false. The `reason` each confirm wrote restated the reviewer's premise.
+
 - **sonnet** rejected all 3 of instance 2's claims, which also shared one false premise: that rusqlite's `unchecked_transaction()` does not roll back on drop. rusqlite 0.40.2 builds it with `DropBehavior::Rollback`. The rejections named that.
+
 - **Opus 5.5** kept every true claim it saw. Its reviews and confirms ran code to reproduce each bug. `pma` grants a read step no shell rule, so the execution came from the user's own Claude Code settings; two confirms also wrote scripts to `/tmp`.
 
 ## What the caps did
@@ -50,6 +56,7 @@ Instances 2 to 4 routed each step by a policy (`{"match": {"node": "review"}, "m
 Instance 3 used `reason: line(300)` and `breadth` 5, both chosen without evidence.
 
 - Two confirms wrote a 351- and a 407-character `reason`. The type check refused both, and two true findings were lost. The prompt had not stated the limit.
+
 - The `argdec` review returned exactly 5 findings, `breadth`'s maximum. At 15, instance 4 found 11.
 
 Instance 4 changed `reason` to `lines(30)` and `breadth` to 15, and `pma` now appends each step's output contract to its prompt: the array's shape, `@id` where it applies, the fields a step may set, and each field's limits, generated from the declared type. Nothing was refused.
@@ -61,14 +68,19 @@ In `argdec`, 11, each reproduced by hand and filed in its `TODO.md`: reversed po
 In `pma` at `647c850`, 8 true claims across instances 3 and 4:
 
 - Already fixed in the working tree that day: the `todo` sink's `remove` pruning every finished item, multi-line text written into `TODO.md`, a missing `out.json` read as empty, a scan deleting tasks on a read error, and `sync` linking by a stale line number.
+
 - New, filed in `TODO.md`: publishing (then `pma ship`) skips the approved-tree check once `HEAD` has moved, and commits the `TODO.md` tick for a run with no changes.
+
 - Arguable: class A- may edit `LICENSE`, `COPYING` and `.netrc`. The code and the comment on `PRIVILEGED` allow it; A-'s scope is `.github/**`.
 
 ## Conclusions
 
 - The model decides the result. A cheap confirm step does not filter a cheap review; it agrees with it.
+
 - A field limit that does not fit its content discards paid, correct work. State it in the prompt, which `pma` now does, and size it to the content.
+
 - The engine held over 46 runs: plan approval by id, routing per step, the type check, unit routing and artifact keeping worked, and no worktree was left behind.
+
 - Why a confirm dropped a claim is stored only in its run's summary. Recording a reason per drop against the unit is the next change the trial points to.
 
 ## Reproducing

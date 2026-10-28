@@ -57,17 +57,25 @@ pma's template decides what runs and how it is launched. `minosb` runs whatever 
 In dependency order:
 
 1. minos: `minos room ensure` (proposed, not built).
+
 2. A room id column on the run row, with migration; shown by `pma review` and the front ends.
+
 3. A minos credential in settings, and the `ensure` call before a worker whose template names `{room}`.
+
 4. `{room}`, `{socket}` and `{events}` placeholders in `worker.rs`. `{socket}` must be outside the worktree and under 103 bytes.
+
 5. Issues 2 and 3 in `parse_claude`, for this worker.
+
 6. Exit test: a real dispatch whose room shows in the minos TUI.
 
 ## Decisions
 
 1. **Are mid-run corrections needed?** Approval-mode runs already stop at plan approval. If unsure, record during the remaining cohort runs each point where a correction would have helped.
+
 2. **Room grain.** One room per task gives up to 1031 rooms, and minos cannot delete one. One per dispatched run bounds the count by work done.
+
 3. **Interrupter.** The developer's account in `-interrupters`, or a pma account that posts `/interrupt`. pma cannot write `minosb`'s stdin: the watchdog gives the worker `/dev/null`.
+
 4. **Server down.** Does a run fail, or run without a room?
 
 Alternative if decision 1 is no: a `notify` command that posts each job's summary to a room. No broker and no template. The room is then a record only.

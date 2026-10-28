@@ -23,7 +23,9 @@ sanduk-rs is the Rust rewrite of sanduk, published as three crates. Its CLI take
 ### Where it applies
 
 - **`verify`.** Every verify run goes through `verify_once` (`src/dispatch.rs:1229`): the head check (`dispatch.rs:1196`), the base check (`dispatch.rs:1280`) and the check before publishing (`src/publish.rs:182`). It runs the project's command with `sh -c` in the worktree, so a `Makefile`, `build.rs` or `conftest.py` the agent edited runs unconfined on the host. That is the gap [using-containers.md](using-containers.md) records for stage (a).
+
 - **Host workers.** `claude` runs on the host under `--permission-mode acceptEdits`. `opencode --auto` and `omp` approve every command, which is why [pilot.md](pilot.md) left them out. Under `sanduk-sandbox`, with the worktree as the root, their writes are bounded, which may be enough to admit them. Rejected 2026-09-29: see problem 3.
+
 - **`scan`** runs `git` and `gh`, which only read. Not worth confining.
 
 ### Four design problems
@@ -38,11 +40,15 @@ sanduk-rs is the Rust rewrite of sanduk, published as three crates. Its CLI take
 
    Closed 2026-09-29: `Worker.sandbox` stays a boolean, and host workers stay unconfined. The container worker is the only one meant for untrusted work. Two reasons:
    - Nothing reads `Worker.sandbox` as a gate, by design: which context a worker runs in is the user's choice, and every worker is admitted under the same gates (`src/worker.rs:6-9`). A third value would be a label no code acts on.
+
    - A host agent runs only with its state directory writable: `~/.claude` and `~/.claude.json` for `claude`, `~/.local/share/opencode` and `~/.config/opencode` for `opencode`, `~/.omp` for `omp`. Write access there lets a confined agent add a hook, a plugin or an MCP server that runs unconfined in the user's next session. The sandbox would bound mistakes in the worktree and leave that route open.
 
 4. **Platform limits.**
+
    - Seatbelt refuses a nested profile, so a command that runs `sandbox-exec` itself fails under it. Claude Code's own sandbox mode does, and so does SwiftPM (`swift build` needs `--disable-sandbox`, as minima documents).
+
    - Landlock needs Linux 6.2 (ABI 3). Below it `sanduk-sandbox` refuses rather than run unconfined, so on an older kernel the project needs the opt-out.
+
    - A verify that writes outside the worktree and the caches (a global tool install, a build store elsewhere) fails. A per-project `sandbox = false` beside `verify`, or a list of extra writable directories, keeps such projects working.
 
 ### What it does not fix
@@ -58,13 +64,17 @@ It wraps the engine's CLI. What makes a `sanduk` run safe is the relay, the toke
 What it would give:
 
 - typed outcomes: tokens and the relay's spend as numbers, rather than a parsed stream;
+
 - cancellation and progress from inside `pma`;
+
 - one binary to install, and no `PATH` or version skew.
 
 What it would cost:
 
 - **An API that does not exist.** `run` is a CLI command: it takes clap arguments, prints notes to stderr and the trace to stdout, installs process-wide signal handlers, and uses process-wide state (the caught-signal flag, thread-local directory overrides). Called inside `pma`'s TUI, each of those collides. A `sanduk::Run` builder returning an `Outcome`, with notes to a callback, is real refactoring in sanduk-rs.
+
 - **The async stack** in `pma`'s build.
+
 - **Crash isolation and version decoupling**, which the process boundary gives for free.
 
 sanduk-rs's own plan says to wait until its interfaces settle.
@@ -88,7 +98,9 @@ Reverted; the two stay separate executables. A test that `Worker::sanduk()`'s ar
 For the record, if a library API is taken up again:
 
 - **Signals.** `Signals::catch()` saves and restores process-wide handlers, and `CAUGHT` is one global. `pma` runs agents on parallel threads (`dispatch.rs:980`); two overlapping runs restore handlers out of order and leave sanduk's installed.
+
 - **Output.** `run` prints the trace to stdout and notes to stderr. Parallel runs would interleave, and the TUI would break.
+
 - **Cancellation.** `pma` stops a run by killing its process group. A call on a thread needs a cancel token and teardown in `Drop`, and still leaks containers if `pma` is killed.
 
 ## 4. The alternative: extend the CLI
@@ -96,6 +108,7 @@ For the record, if a library API is taken up again:
 Most of what the library would give can cross the process boundary instead:
 
 - **`sanduk run --verify CMD`**: stage (b). The agent runs, then `CMD` in the same image, mount and network, and the two exit statuses are recorded separately, since one combined status cannot tell a failed edit from a failed test. `base_verify` would run the same way against the base tree, so the regression comparison is between one environment and itself.
+
 - **A richer `--stats-file`.** It records `exit`, `ok`, `stats`, `error` and `report` today. Adding the verify status, the relay's request count and spend, and token counts as numbers gives `pma` typed results without linking anything.
 
 This gets stage (b) without tokio in `pma`. The toolchain images stay the real cost of stage (b), whichever form it takes: the stock images carry no Rust, Go or C, and `sealed` cannot `cargo fetch`.
@@ -111,9 +124,13 @@ Fixed in sanduk-rs (Unreleased): each run starts `sanduk reap` in its own proces
 ## Order
 
 1. Done 2026-09-29: `cargo install sanduk`, and a test that the template's flags and agent parse against the installed binary. The test skips where `sanduk` is not on `PATH`.
+
 2. Done 2026-09-29: `sanduk-sandbox` for `verify`, with the policy wrapping the watchdog, `projects.<name>.sandbox off` as the opt-out, the sandbox in the base cache's key, and a disk test. No git grants: see problem 2.
+
 3. Closed 2026-09-29, not done: host workers stay unconfined. See problem 3.
+
 4. Done in sanduk-rs 2026-09-29 (Unreleased): `run --verify CMD`, and `--stats-file` with `mode`, the relay's numbers and the verify result. `run --verify` with no task checks a base tree in the same container setup, in place of a separate verb. Toolchain kits followed the same day: `build`, `rust`, `go` and `uv`, which stack on one image. sanduk-rs's own suite passes inside `--kit rust`. `pma` does not read the results yet; that is the next step: a per-project opt-in with the project's kits, `--verify {verify}` in the `sanduk` template, head and base results from the stats file, and where verify ran in the base cache's key.
+
 5. No library API. Anything `pma` needs from a run goes into the CLI or the stats file.
 
 ## Open questions
@@ -121,5 +138,7 @@ Fixed in sanduk-rs (Unreleased): each run starts `sanduk reap` in its own proces
 These decide the order:
 
 - **The threat.** An agent that errs, or an injected prompt? `sanduk-sandbox` covers the first. If the second matters now, step 4 comes next.
+
 - **Where `pma` runs unattended.** A macOS laptop, or a Linux server? That decides whether Landlock's kernel floor and Seatbelt's nesting limit bite.
+
 - **Host workers.** Answered 2026-09-29: the container worker is the only one meant for untrusted work.
