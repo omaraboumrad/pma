@@ -1,6 +1,19 @@
 # Bundled dispatch and project prompts
 
-Status: proposed, 2026-10-28. Not built.
+Status: built, 2026-10-28.
+
+Where the build departs from the design below:
+
+- The key is `bundle`, not `bundle:<n>`. Nothing reads a bundle's number from its key.
+- `run_items` has `n` and `dropped INTEGER NOT NULL DEFAULT 0`, not `done`. An item is ticked unless dropped, so an approval without `--drop` ticks every item.
+- `--drop` takes the item numbers `pma review <id>` prints and the prompt uses, not TODO.md lines. A line goes stale when the file is edited; the number does not.
+- `pma stage` takes no `--drop`, and refuses a ready bundle, as commit, push and a pull request from a view do (`dispatch::needs_approval`). Approve with `--drop`, then publish.
+- Step 2 came with step 1. Without the clean-run exclusion, `--push` would tick every item of a bundle.
+- A bundle holds TODO.md items only. A signal named beside them keeps its own run.
+- `Ask::Check` serves every approval from the TUI and the web. A run with no items gives an empty list, which asks nothing, so a plain run is approved as before. The input is the numbers left unchecked, as `--drop` takes them. A re-approval starts with the earlier choice.
+- `pma task <project:line>` does not list a bundle among the runs holding the item. The busy check does see it.
+- A prompt's key is `prompt`, not `prompt:<n>`, as a bundle's is `bundle`. Its whole text is kept in `runs.description`, which `--retry` dispatches again. Its attempts count against its title, the first line cut at 80 characters.
+- Marks are a front end's, per view: a `Pick::Tasks` built from them is the pick `d` acts on (`screen::marked`). They clear on a dispatch, on Escape and on another view. A refresh drops a mark whose row is gone, so nothing unseen is dispatched. Retried when any marked task would be on its own.
 
 ## Problem
 
@@ -20,7 +33,7 @@ A second need: a prompt that is not a TODO.md item, such as "audit error handlin
 
 ## Decisions
 
-1. Several tasks of one project, named in one dispatch, become one run: a bundle. This is the default in both workspaces. `--separate` restores one run per task.
+1. Several tasks of one project, named in one dispatch, become one run: a bundle. This is the default in both workspaces. A bundle has one workspace (the clone, or one worktree and branch), one agent session and one diff. `--separate` restores one run per task.
 
 2. At approval the reviewer sees the bundle's items, all checked, and unchecks those not done. Only checked items are ticked and closed.
 
@@ -87,11 +100,15 @@ A single-task run writes no rows and is read as today. A bundle's `runs.task_key
 
 Not answered on 2026-10-28; these defaults hold until changed.
 
-- **Attempts.** A failed bundle counts against the bundle's text, not each item's. A failed bundle says little about any one item.
+- **Attempts.** A failed bundle counts against the bundle's text, not each item's. A failed bundle says little about any one item. Dispatch checks the bundle's count after grouping, so the same items stop at `ATTEMPT_LIMIT` until `--retry`.
 
-- **Budget and timeout.** Not scaled with item count. A bundle is capped at 8 items; a larger selection is refused with the count. Revisit after 10 bundled runs, from their cost and time against single runs.
+- **Budget and timeout.** Not scaled with item count. A bundle is capped at 8 items; a project named with more is passed over with a warning, and the other targets run. Revisit after 10 bundled runs, from their cost and time against single runs.
 
 - **Ordering.** No `proj:medium:2` selector. "Top two" is chosen by hand with marks. A selector needs a defined order (file order or `rank::place`), and marks need none.
+
+## Known limits
+
+- Unchecking an item leaves it open in TODO.md; its changes stay in the diff. A bundle is approved, reworked or rejected whole. To drop one item's partial work, send rework feedback asking the agent to revert it. Per-item diffs would need one commit per item, which the prompt forbids.
 
 ## Failure modes to test
 

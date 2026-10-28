@@ -105,6 +105,29 @@ check("a reload adds no history entry", (await js(`history.length`)) === len + 1
 await key("Escape");
 await wait(600);
 
+// A checkbox marks a task; d asks to dispatch the marked ones together.
+// Cancelled, so the runs the next script reads stay as they are.
+const boxes = await js(`document.querySelectorAll("td.mark input").length`);
+check("task rows carry a checkbox", boxes >= 2, boxes);
+await js(`[...document.querySelectorAll("td.mark input")].slice(0, 2).forEach((b) => b.click())`);
+await wait(300);
+const marked = await js(`({
+  checked: document.querySelectorAll("td.mark input:checked").length,
+  button: [...document.querySelectorAll("#toolbar button")].some((b) => b.textContent.startsWith("Dispatch 2 marked")),
+})`);
+check("two marks show in the toolbar", marked.checked === 2 && marked.button, marked);
+await js(`document.activeElement && document.activeElement.blur()`);
+await key("d", "d");
+await wait(800);
+const asked = await js(`document.getElementById("dialog").open ? document.getElementById("dialog").textContent : ""`);
+check("d asks to dispatch the marked tasks", asked.includes("2 tasks"), asked);
+await key("Escape");
+await wait(300);
+check("cancelling keeps the marks", (await js(`S.marks.length`)) === 2, await js(`S.marks`));
+await key("Escape");
+await wait(300);
+check("Escape clears the marks", (await js(`document.querySelectorAll("td.mark input:checked").length`)) === 0, null);
+
 // z: the chooser filters by name and aligns its columns.
 await js(`document.activeElement && document.activeElement.blur()`);
 await key("z", "z");

@@ -649,7 +649,7 @@ fn a_local_dispatch_lands_verified_edits_unstaged() {
     let (env, _, alpha) = dispatch_env(&s, &[("claude", FAKE_CLAUDE)]);
     // Both start from the same tree, which lacks hello.txt, so the second
     // task's verify fails.
-    let out = env.ok(&["dispatch", "alpha:5", "alpha:7", "--local"]);
+    let out = env.ok(&["dispatch", "alpha:5", "alpha:7", "--local", "--separate"]);
     assert!(out.contains("#1 alpha: applied to"), "{out}");
     assert!(out.contains("#2 alpha: discarded: verify failed"), "{out}");
     assert!(out.contains("1 applied unstaged, 1 not"), "{out}");
@@ -1172,6 +1172,184 @@ fn a_failed_run_is_retried_as_it_was() {
     assert!(
         !success && err.contains("--retry takes a failed run"),
         "{err}"
+    );
+}
+
+/// Does every task its prompt names, as one agent session would.
+const BUNDLE_CLAUDE: &str = r#"#!/bin/sh
+case "$2" in *"add greeting"*) echo hi > hello.txt ;; esac
+case "$2" in *"second task"*) echo two > second.txt ;; esac
+case "$2" in *"third task"*) echo three > third.txt ;; esac
+echo '{"type":"result","subtype":"success","is_error":false,"result":"1 and 2 done; 3 half done","total_cost_usd":0.1}'
+"#;
+
+/// Items of one project named together are one run, a task named twice once.
+/// An item origin does not hold open is left out. The approver drops the
+/// items not done: only the rest are ticked and closed, though the whole diff
+/// is published. Staging is no way around the approval.
+#[test]
+fn a_bundle_is_one_run_and_its_approver_says_what_it_closes() {
+    let s = Scratch::new("bundle");
+    let (env, origin, _) = dispatch_env(&s, &[("claude", BUNDLE_CLAUDE)]);
+    let (out, err, success) = env.run(&["dispatch", "alpha:5", "alpha:high", "alpha:12"]);
+    assert!(success, "{out}{err}");
+    assert!(
+        out.starts_with("#1 alpha: add greeting; second task; third task\n"),
+        "{out}"
+    );
+    assert!(
+        err.contains(
+            "warning: alpha: `guarded task` is tagged #manual and is not dispatched; left out"
+        ),
+        "{err}"
+    );
+
+    let detail = env.ok(&["review", "1"]);
+    assert!(
+        detail.contains("items:\n  1. add greeting\n  2. second task\n  3. third task\n"),
+        "{detail}"
+    );
+    assert!(detail.contains("a bundle of 3 items"), "{detail}");
+    for added in ["+hi", "+two", "+three"] {
+        assert!(detail.contains(added), "{detail}");
+    }
+    let (_, err, success) = env.run(&["dispatch", "alpha:7"]);
+    assert!(!success && err.contains("already has a run"), "{err}");
+
+    let (out, _, success) = env.run(&["stage", "1"]);
+    assert!(
+        !success && out.contains("run #1 is a bundle; approve it first"),
+        "{out}"
+    );
+    let (_, err, success) = env.run(&["review", "1", "--approve", "--drop", "4"]);
+    assert!(
+        !success && err.contains("run #1 has items 1 to 3; there is no item 4"),
+        "{err}"
+    );
+    let (_, err, success) = env.run(&["review", "1", "--approve", "--drop", "1,2,3"]);
+    assert!(!success && err.contains("reject the run instead"), "{err}");
+    env.ok(&["review", "1", "--approve", "--drop", "3"]);
+    let detail = env.ok(&["review", "1"]);
+    assert!(
+        detail.contains("  3. third task  (left open)\n"),
+        "{detail}"
+    );
+
+    env.ok(&["push", "1"]);
+    let todo = git_out(&origin, &["show", "main:TODO.md"]);
+    assert!(
+        todo.contains("- [x] add greeting")
+            && todo.contains("- [x] second task")
+            && todo.contains("- [ ] third task"),
+        "{todo}"
+    );
+    let message = git_out(&origin, &["log", "-1", "--format=%B", "main"]);
+    assert!(
+        message.starts_with("2 TODO items\n\n- add greeting\n- second task\n\nCloses #7"),
+        "{message}"
+    );
+    // A dropped item's changes are published with the rest.
+    assert_eq!(git_out(&origin, &["show", "main:third.txt"]), "three\n");
+}
+
+/// A bundle's failures count against the bundle, which stops at the attempt
+/// limit as one task does, until --retry.
+#[test]
+fn a_bundle_stops_at_its_attempt_limit() {
+    let s = Scratch::new("bundle-attempts");
+    let (env, _, _) = dispatch_env(&s, &[("claude", FAKE_CLAUDE)]);
+    // The check fails, which uses one attempt; the rejection uses the other.
+    env.ok(&["dispatch", "alpha:7", "alpha:8"]);
+    env.ok(&["review", "1", "--reject"]);
+    let (_, err, success) = env.run(&["dispatch", "alpha:7", "alpha:8"]);
+    assert!(
+        !success && err.contains("2 attempts on the bundle `second task; third task`"),
+        "{err}"
+    );
+    let out = env.ok(&["dispatch", "alpha:7", "alpha:8", "--retry"]);
+    assert!(out.contains("#2 alpha: second task; third task"), "{out}");
+}
+
+/// The clone holds one run, so a bundle is how several items run there at
+/// all; one run each is refused after the first.
+#[test]
+fn a_bundle_runs_in_the_clone() {
+    let s = Scratch::new("bundle-clone");
+    let (env, _, alpha) = dispatch_env(&s, &[("claude", BUNDLE_CLAUDE)]);
+    env.ok(&["config", "workspace", "clone"]);
+    let (_, err, _) = env.run(&["dispatch", "alpha:5", "alpha:7", "--separate"]);
+    assert!(err.contains("its clone holds run #1"), "{err}");
+    env.ok(&["review", "1", "--reject"]);
+
+    let (out, err, success) = env.run(&["dispatch", "alpha:5", "alpha:7"]);
+    assert!(success && !err.contains("holds run"), "{out}{err}");
+    assert!(
+        out.starts_with("#2 alpha: add greeting; second task\n"),
+        "{out}"
+    );
+    assert_eq!(fs::read_to_string(alpha.join("hello.txt")).unwrap(), "hi\n");
+    assert_eq!(
+        fs::read_to_string(alpha.join("second.txt")).unwrap(),
+        "two\n"
+    );
+}
+
+/// A failed bundle is retried as the same bundle.
+#[test]
+fn a_failed_bundle_is_retried_as_a_bundle() {
+    let s = Scratch::new("bundle-retry");
+    let (env, _, _) = dispatch_env(&s, &[("claude", GIVING_UP_CLAUDE)]);
+    env.ok(&["dispatch", "alpha:5", "alpha:7"]);
+    assert!(env.ok(&["review", "1"]).starts_with("#1 failed"));
+    let out = env.ok(&["review", "1", "--retry"]);
+    assert!(out.contains("#2 alpha: add greeting; second task"), "{out}");
+    assert!(env.ok(&["review", "2"]).contains("  2. second task\n"));
+}
+
+/// A prompt runs over a whole project in place of a task: reviewed and
+/// published as any run, with nothing ticked. A failed one is retried with
+/// the prompt it kept.
+#[test]
+fn a_prompt_is_a_run_over_the_project() {
+    let s = Scratch::new("prompt");
+    let (env, origin, _) = dispatch_env(&s, &[("claude", GIVING_UP_CLAUDE)]);
+    for (args, why) in [
+        (
+            vec!["alpha:5"],
+            "runs over a whole project; name `alpha` alone",
+        ),
+        (vec!["alpha", "beta"], "runs over one project"),
+        (vec!["alpha", "--auto"], "cannot be used with"),
+    ] {
+        let mut argv = vec!["dispatch", "--prompt", "add greeting"];
+        argv.extend(args);
+        let (_, err, success) = env.run(&argv);
+        assert!(!success && err.contains(why), "{argv:?}: {err}");
+    }
+    let (_, err, success) = env.run(&["dispatch", "alpha", "--prompt", "  "]);
+    assert!(!success && err.contains("--prompt needs text"), "{err}");
+
+    // The first attempt gives up; the retry dispatches the same prompt.
+    env.ok(&[
+        "dispatch",
+        "alpha",
+        "--prompt",
+        "add greeting\nwith a newline at the end",
+    ]);
+    assert!(env.ok(&["review", "1"]).starts_with("#1 failed"));
+    let out = env.ok(&["review", "1", "--retry"]);
+    assert!(out.contains("#2 alpha: add greeting"), "{out}");
+
+    env.ok(&["review", "2", "--approve"]);
+    env.ok(&["push", "2"]);
+    assert_eq!(git_out(&origin, &["show", "main:hello.txt"]), "hi\n");
+    assert!(
+        git_out(&origin, &["show", "main:TODO.md"]).contains("- [ ] add greeting"),
+        "a prompt ticks no item"
+    );
+    assert_eq!(
+        git_out(&origin, &["log", "-1", "--format=%s", "main"]),
+        "add greeting\n"
     );
 }
 
@@ -2641,7 +2819,7 @@ fn a_target_can_name_a_heading_or_a_quadrant() {
     );
 
     // Tier 1 high items are important and not urgent: the whole of Q2.
-    let out = env.ok(&["dispatch", "alpha:q2"]);
+    let out = env.ok(&["dispatch", "alpha:q2", "--separate"]);
     assert!(
         out.starts_with("#1 alpha: add greeting\n#2 alpha: second task\n#3 alpha: third task\n"),
         "{out}"

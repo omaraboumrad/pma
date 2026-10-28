@@ -32,11 +32,8 @@ pub fn enqueue(store: &Store, targets: &[String]) -> Result<()> {
         .skip(1)
         .filter(|a| a != "--detach")
         .collect();
-    let project = match targets {
-        [one] => Some(one.split(':').next().unwrap_or(one)),
-        _ => None,
-    };
-    let id = queue(store, &args, &std::env::current_dir()?, project)?;
+    let project = crate::api::one_project(targets);
+    let id = queue(store, &args, &std::env::current_dir()?, project.as_deref())?;
     println!("job {id} queued; `pma job` lists jobs and `pma job log {id}` shows its output");
     Ok(())
 }

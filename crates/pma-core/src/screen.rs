@@ -22,6 +22,12 @@ pub enum Pick {
         target: String,
         retry: bool,
     },
+    /// Tasks marked together, by dispatch target. Dispatching them makes
+    /// one run per project (`docs/dev/bundled-dispatch.md`).
+    Tasks {
+        targets: Vec<String>,
+        retry: bool,
+    },
     /// A task no agent may take.
     Manual {
         project: String,
@@ -140,7 +146,7 @@ pub struct Cell {
 /// fits any. A front end offers only the acts that fit the selected row.
 pub fn fits(act: Act, pick: &Pick) -> bool {
     match act {
-        Act::Dispatch => matches!(pick, Pick::Task { .. }),
+        Act::Dispatch => matches!(pick, Pick::Task { .. } | Pick::Tasks { .. }),
         Act::Verify => matches!(pick, Pick::Task { .. } | Pick::Manual { .. }),
         Act::AddReviewTime => matches!(pick, Pick::Run { .. }),
         Act::ApproveRun
@@ -197,6 +203,39 @@ pub fn next_act(pick: &Pick) -> Option<Act> {
             _ => None,
         },
         _ => None,
+    }
+}
+
+/// The 1-based numbers an `Ask::Check` left unchecked, from its input.
+fn unchecked(input: &str) -> Result<Vec<usize>, String> {
+    input
+        .split(',')
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(|n| {
+            n.parse()
+                .map_err(|_| format!("`{n}` is not an item number"))
+        })
+        .collect()
+}
+
+/// The marked task rows as one pick; `Nothing` when none is a task. Retried
+/// when any of them would be on its own.
+pub fn marked(marks: &[Pick]) -> Pick {
+    let mut targets = Vec::new();
+    let mut again = false;
+    for m in marks {
+        if let Pick::Task { target, retry, .. } = m {
+            targets.push(target.clone());
+            again |= retry;
+        }
+    }
+    match targets.is_empty() {
+        true => Pick::Nothing,
+        false => Pick::Tasks {
+            targets,
+            retry: again,
+        },
     }
 }
 
@@ -485,6 +524,9 @@ fn run_detail(
         })
         .collect();
     let mut sections = Vec::new();
+    if !run.items.is_empty() {
+        sections.push(("Items".into(), Section::Prose, report::item_lines(run, "")));
+    }
     if let Some(s) = run.summary.as_deref().filter(|s| !s.trim().is_empty()) {
         sections.push(("Summary".into(), Section::Prose, s.to_string()));
     }
@@ -2154,6 +2196,9 @@ pub fn initial_input(act: Act, pick: &Pick) -> String {
 pub fn question(act: Act, pick: &Pick) -> String {
     let what = match pick {
         Pick::Task { target, .. } => target.clone(),
+        Pick::Tasks { targets, .. } => {
+            format!("{} tasks ({})", targets.len(), targets.join(", "))
+        }
         Pick::Manual { project } => project.clone(),
         Pick::Run { id, .. } | Pick::Job { id, .. } | Pick::Note { id, .. } => format!("#{id}"),
         Pick::Instance { id, .. } => format!("instance {id}"),
@@ -2524,7 +2569,34 @@ pub fn action_in(
             count: None,
             retry: *retry,
             worker,
+            prompt: None,
         },
+        (Act::Dispatch, Pick::Tasks { targets, retry }) => Action::Dispatch {
+            targets: targets.clone(),
+            tags: Vec::new(),
+            auto: false,
+            count: None,
+            retry: *retry,
+            worker,
+            prompt: None,
+        },
+        (Act::Prompt, _) => {
+            if project.is_empty() {
+                return Err("open a project first".into());
+            }
+            if input.is_empty() {
+                return Err("a prompt needs text".into());
+            }
+            Action::Dispatch {
+                targets: vec![project.to_string()],
+                tags: Vec::new(),
+                auto: false,
+                count: None,
+                retry: false,
+                worker,
+                prompt: Some(input.to_string()),
+            }
+        }
         (Act::Dispatch, Pick::Manual { .. }) => return Err("not a task for agents".into()),
         (Act::Verify, Pick::Task { project, .. } | Pick::Manual { project }) => Action::Verify {
             of: Selection {
@@ -2536,6 +2608,7 @@ pub fn action_in(
         (Act::ApproveRun, Pick::Run { id, state, .. }) => Action::ApproveRun {
             id: *id,
             seen: Some(state.clone()),
+            drop: unchecked(input)?,
         },
         (Act::RejectRun, Pick::Run { id, state, .. }) => Action::RejectRun {
             id: *id,
@@ -2753,6 +2826,78 @@ mod tests {
         );
     }
 
+    /// `P` dispatches what was typed over the project in view.
+    #[test]
+    fn a_prompt_is_a_dispatch_of_the_project_in_view() {
+        assert!(action_in(Act::Prompt, &Pick::Nothing, &[], "fix it", "").is_err());
+        assert!(action_in(Act::Prompt, &Pick::Nothing, &[], " ", "a").is_err());
+        let Ok(Action::Dispatch {
+            targets, prompt, ..
+        }) = action_in(Act::Prompt, &Pick::Nothing, &[], "fix it", "a")
+        else {
+            panic!("a dispatch");
+        };
+        assert_eq!(
+            (targets, prompt.as_deref()),
+            (vec!["a".to_string()], Some("fix it"))
+        );
+    }
+
+    /// An approval's input names the bundle items left unchecked.
+    #[test]
+    fn an_approval_drops_the_unchecked_items() {
+        let run = Pick::Run {
+            id: 3,
+            clean: false,
+            state: "ready".into(),
+            project: "a".into(),
+        };
+        let drop = |input| match action(Act::ApproveRun, &run, &[], input) {
+            Ok(Action::ApproveRun { drop, .. }) => Ok(drop),
+            Ok(other) => panic!("{other:?}"),
+            Err(e) => Err(e),
+        };
+        assert_eq!(drop(""), Ok(vec![]));
+        assert_eq!(drop("2, 3"), Ok(vec![2, 3]));
+        assert_eq!(drop("x"), Err("`x` is not an item number".into()));
+    }
+
+    /// Marked task rows are one pick, dispatched as one action; a row that
+    /// is not a task is not part of it.
+    #[test]
+    fn marked_tasks_are_one_dispatch() {
+        let task = |target: &str, retry| Pick::Task {
+            project: "a".into(),
+            target: target.into(),
+            retry,
+        };
+        let run = Pick::Run {
+            id: 1,
+            clean: false,
+            state: "ready".into(),
+            project: "a".into(),
+        };
+        assert_eq!(marked(std::slice::from_ref(&run)), Pick::Nothing);
+        let pick = marked(&[task("a:5", false), run, task("b:2", true)]);
+        assert_eq!(
+            pick,
+            Pick::Tasks {
+                targets: vec!["a:5".into(), "b:2".into()],
+                retry: true,
+            }
+        );
+        assert!(fits(Act::Dispatch, &pick) && !fits(Act::Verify, &pick));
+        assert_eq!(
+            question(Act::Dispatch, &pick),
+            "dispatch 2 tasks (a:5, b:2)?"
+        );
+        let Ok(Action::Dispatch { targets, retry, .. }) = action(Act::Dispatch, &pick, &[], "")
+        else {
+            panic!("a dispatch");
+        };
+        assert_eq!((targets.len(), retry), (2, true));
+    }
+
     #[test]
     fn keys_on_rows_build_actions() {
         let task = Pick::Task {
@@ -2769,6 +2914,7 @@ mod tests {
                 count: None,
                 retry: true,
                 worker: WorkerChoice::default(),
+                prompt: None,
             })
         );
         let pane = [run(1, true), run(2, false), run(3, true)];

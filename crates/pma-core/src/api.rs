@@ -348,6 +348,8 @@ pub enum Action {
     ApproveRun {
         id: i64,
         seen: Option<String>,
+        /// A bundle's items, numbered from 1, to leave open.
+        drop: Vec<usize>,
     },
     /// Approves several runs at once, each of which must be clean.
     ApproveRuns {
@@ -398,6 +400,9 @@ pub enum Action {
         count: Option<usize>,
         retry: bool,
         worker: WorkerChoice,
+        /// A prompt of the developer's own over the one project named, in
+        /// place of a task.
+        prompt: Option<String>,
     },
     /// Starts or resumes an instance; with `approve`, runs that plan.
     WorkflowRun {
@@ -715,7 +720,11 @@ pub fn has_run(runs: &[Run], project: &str, key: &str, text: &str) -> bool {
     runs.iter().any(|r| {
         !r.state.is_final()
             && r.project == project
-            && (r.task_key == key || todo::normal_text(&r.text) == todo::normal_text(text))
+            && (r.task_key == key
+                || todo::normal_text(&r.text) == todo::normal_text(text)
+                || r.items
+                    .iter()
+                    .any(|i| i.key == key || todo::normal_text(&i.text) == todo::normal_text(text)))
     })
 }
 
@@ -965,6 +974,21 @@ pub fn initial_input(store: &Store, act: Act, pick: &screen::Pick) -> Result<Str
         (Act::Commit, screen::Pick::Run { id, .. }) => store.run(*id)?.text,
         _ => screen::initial_input(act, pick),
     })
+}
+
+/// What a front end lists for an act that asks `Ask::Check`: each row, and
+/// whether it starts checked. A bundle's items, for its approval: the ones
+/// an earlier approval dropped start unchecked.
+pub fn checklist(store: &Store, act: Act, pick: &screen::Pick) -> Result<Vec<(String, bool)>> {
+    match (act, pick) {
+        (Act::ApproveRun, screen::Pick::Run { id, .. }) => Ok(store
+            .run(*id)?
+            .items
+            .into_iter()
+            .map(|i| (i.text, !i.dropped))
+            .collect()),
+        _ => Ok(Vec::new()),
+    }
 }
 
 /// What a front end lists for an act that asks `Ask::Choose`.
@@ -1430,8 +1454,14 @@ pub fn act(store: &Store, a: Action) -> Result<Outcome> {
         && *target != publish::Target::Stage
     {
         let by = whoami();
-        for id in ids {
-            let mut run = store.run(*id)?;
+        let runs = ids
+            .iter()
+            .map(|id| store.run(*id))
+            .collect::<Result<Vec<_>>>()?;
+        if let Some(why) = runs.iter().find_map(dispatch::needs_approval) {
+            return Err(why.into());
+        }
+        for mut run in runs {
             if run.state == RunState::Ready {
                 dispatch::approve(store, &mut run, &by)?;
             }
@@ -1445,9 +1475,16 @@ pub fn act(store: &Store, a: Action) -> Result<Outcome> {
         Ok(t)
     };
     Ok(match a {
-        Action::ApproveRun { id, seen } => {
+        Action::ApproveRun { id, seen, drop } => {
             let mut run = store.run(id)?;
             unmoved(&run, seen.as_deref())?;
+            dispatch::check_drops(&run, &drop)?;
+            // Before the approval: an approved run must never hold an
+            // earlier choice. A failed approval leaves the run ready, and the
+            // next one writes the choice again.
+            if !run.items.is_empty() {
+                store.set_dropped(id, &drop)?;
+            }
             dispatch::approve(store, &mut run, &whoami())?;
             Outcome::default()
         }
@@ -1769,19 +1806,22 @@ pub fn act(store: &Store, a: Action) -> Result<Outcome> {
     })
 }
 
-/// The one project a queued action is about, when it names exactly one, so
-/// the job shows in that project's view. A target may be `name:task`.
+/// The project every name or `name:task` target names, when they name one.
+pub fn one_project(names: &[String]) -> Option<String> {
+    let mut projects = names.iter().map(|n| n.split(':').next().unwrap_or(n));
+    let first = projects.next()?;
+    projects.all(|p| p == first).then(|| first.to_string())
+}
+
+/// The one project a queued action is about, when every name it holds is
+/// that project, so the job shows in that project's view.
 fn project_of(a: &Action) -> Option<String> {
-    let one = |names: &[String]| match names {
-        [name] => Some(name.split(':').next().unwrap_or(name).to_string()),
-        _ => None,
-    };
     match a {
         Action::Run { project, .. } => Some(project.clone()),
-        Action::Dispatch { targets, .. } => one(targets),
-        Action::WorkflowRun { projects, .. } => one(projects),
+        Action::Dispatch { targets, .. } => one_project(targets),
+        Action::WorkflowRun { projects, .. } => one_project(projects),
         Action::Scan { of, .. } | Action::Sync { of, .. } | Action::Verify { of } => {
-            one(&of.projects)
+            one_project(&of.projects)
         }
         _ => None,
     }
@@ -1827,6 +1867,7 @@ pub fn command_line(a: &Action) -> Option<Vec<String>> {
             count,
             retry,
             worker: w,
+            prompt,
         } => {
             push("dispatch");
             v.extend(targets.iter().cloned());
@@ -1834,6 +1875,7 @@ pub fn command_line(a: &Action) -> Option<Vec<String>> {
             flag(&mut v, *auto, "--auto");
             opt(&mut v, "--count", &count.map(|n| n.to_string()));
             flag(&mut v, *retry, "--retry");
+            opt(&mut v, "--prompt", prompt);
             worker(&mut v, w);
         }
         Action::WorkflowRun {
@@ -1956,6 +1998,19 @@ pub fn command_line(a: &Action) -> Option<Vec<String>> {
 mod tests {
     use super::*;
 
+    /// A job shows in a project's view when everything it names is in that
+    /// project: several of its tasks too.
+    #[test]
+    fn a_job_is_about_one_project_when_every_name_is() {
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            one_project(&names(&["a:5", "a:9", "a"])).as_deref(),
+            Some("a")
+        );
+        assert_eq!(one_project(&names(&["a:5", "b:2"])), None);
+        assert_eq!(one_project(&[]), None);
+    }
+
     /// A queued action's command line is one the CLI parses, with each flag
     /// spelled as the CLI spells it.
     #[test]
@@ -2020,7 +2075,8 @@ mod tests {
                 auto: true,
                 count: Some(2),
                 retry: false,
-                worker: w,
+                worker: w.clone(),
+                prompt: None,
             }),
             [
                 "dispatch",

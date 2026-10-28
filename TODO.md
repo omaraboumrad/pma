@@ -92,6 +92,8 @@
 
 - [ ] Record each run's agent session id, so `resumes` does something `Worker::resumes` is stored, settable and listed by `pma agent`, but no dispatch path reads it (`crates/pma-core/src/worker.rs:210`). `opencode()` sets it `true`, so the listing claims a feature pma lacks. A `{session}` placeholder in worker args (`claude --session-id <uuid>`, as wallfacer does) plus a session column on the run would let a rework continue the earlier session instead of re-prompting, and let `pma review N --open` hand the terminal to `claude --resume <id>` in the worktree. Takeover must run under the `agent::restrict` environment, or it gains push credentials. Open: does a `-p` session resume interactively; does a `sanduk` transcript survive its container; what is opencode's flag. If neither use is wanted, delete the field.
 
+- [ ] Calibrate bundles after 10 bundled runs #manual A bundle runs under one task's `agent_budget` ($1.00) and `timeout` (30 min), holds at most 8 items (`dispatch::BUNDLE_MAX`), and a failure uses an attempt of the bundle, not of each item. All four are defaults no run has tested (`docs/dev/bundled-dispatch.md`, "Defaulted, open"). For each bundled run record cost, time, items, items dropped at approval, and whether one item's failure failed the run. Then decide whether budget and timeout scale with item count. If most bundles end with items dropped, reconsider one commit per item, which the one-diff limit rules out today.
+
 ## Low
 
 - [x] The TUI footer names only the last transition of a batch #agent `App::noticed` keeps the last of what one `Watch::poll` returned. Three runs reaching review within a second name one. Queue them, or name the count.
@@ -129,3 +131,9 @@
 - [ ] Smaller review items, unverified: run scope stored comma-joined (`src/store.rs:1149`); the CI prompt has no byte cap and can exceed the argument limit (`src/dispatch.rs:726`); cost over budget is judged on cumulative cost across reworks (`src/accept.rs:91`); table widths count characters, not display columns. (REVIEW.md)
 
 - [ ] Windows support pma-core assumes Unix, so a Windows build stops at a `compile_error!`; `release.yml` builds Linux and macOS only. Sites: the `sh` watchdog and `kill -KILL -<pgid>` (`crates/pma-core/src/agent.rs:121`, `:134`; `scan.rs:357`; `jobs.rs:186`), `process_group(0)` (`agent.rs:147`, `scan.rs:314`, `jobs.rs:63`), `Command::new("sh")` in `agent.rs`, `jobs.rs:152`, `scan.rs:1081` and `dispatch.rs:1401`, and mode bits in `agent.rs:70` and the hook snapshot (`dispatch.rs:375`). Needs a job object to kill a process tree (`windows-sys`), `CREATE_NEW_PROCESS_GROUP` for the runner, a Windows rule for which hooks git runs, and a Windows CI job. sanduk-sandbox has no Windows backend, so confined verify fails closed there. Open: is WSL, which runs the Linux binary unchanged, enough? Until then, a `compile_error!` in `pma-core/src/lib.rs` names the limit; remove it with the port.
+
+- [ ] `pma task <project:line>` does not list a bundle among the runs holding the item. The busy check sees it through `run_items` (`api::has_run`); the task detail's `held_by` (`api::task_view`) matches `runs.task_key` alone, which a bundle sets to `bundle`. #agent
+
+- [ ] Approving a bundle from its run detail in the TUI returns to the list, not the detail. The checklist replaces `Mode::Detail` (`App::checking`), so Enter or Esc leaves both.
+
+- [ ] `make web-check` on Linux: the default `CHROME` in `scripts/web-check.sh` is a macOS path, and headless Chromium aborts with "No usable sandbox" where unprivileged user namespaces are blocked (Ubuntu's AppArmor rule). It ran on 2026-10-28 through a wrapper adding `--no-sandbox`. Options: a `CHROME_FLAGS` variable, or detect the Linux path in Playwright's cache.

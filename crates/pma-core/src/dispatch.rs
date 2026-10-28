@@ -15,7 +15,7 @@ use crate::config::{Config, Workspace};
 use crate::rank::Quadrant;
 use crate::route::{Policy, Subject};
 use crate::scan;
-use crate::store::{Attempt, Result, Run, RunState, Store};
+use crate::store::{Attempt, Result, Run, RunItem, RunState, Store};
 use crate::todo::{self, Priority};
 use crate::worker::Worker;
 
@@ -44,6 +44,54 @@ pub struct Pick {
     /// Where the agent edits. `Clone` ignores `local`: a clone run always
     /// starts from the working tree, and waits there for review.
     pub workspace: Workspace,
+    /// A bundle's items, when `key` is `BUNDLE`; empty otherwise.
+    pub items: Vec<RunItem>,
+}
+
+/// The key of a bundle: one run over several TODO.md items of a project
+/// (`docs/dev/bundled-dispatch.md`).
+pub const BUNDLE: &str = "bundle";
+
+/// The key of a run over a prompt the developer typed, which names no
+/// TODO.md item.
+pub const PROMPT: &str = "prompt";
+
+/// What a prompt's run is called: its first line, at most 80 characters.
+pub fn prompt_title(prompt: &str) -> String {
+    let line = prompt.trim().lines().next().unwrap_or("");
+    match line.char_indices().nth(80) {
+        Some((at, _)) => format!("{}...", line[..at].trim_end()),
+        None => line.to_string(),
+    }
+}
+
+/// Items one bundle may hold. Its budget and timeout are those of one task.
+pub const BUNDLE_MAX: usize = 8;
+
+/// What a bundle's run is called: its items' texts.
+pub fn bundle_text(items: &[RunItem]) -> String {
+    items
+        .iter()
+        .map(|i| i.text.as_str())
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// The TODO.md items a run marks done when published, as key, text and
+/// issue: a bundle's items the approver did not drop, or the run's own item.
+pub fn closes(run: &Run) -> Vec<(&str, &str, Option<i64>)> {
+    if run.task_key == BUNDLE {
+        return run
+            .items
+            .iter()
+            .filter(|i| !i.dropped)
+            .map(|i| (i.key.as_str(), i.text.as_str(), i.gh))
+            .collect();
+    }
+    match without_item(&run.task_key) {
+        true => Vec::new(),
+        false => vec![(run.task_key.as_str(), run.text.as_str(), run.gh)],
+    }
 }
 
 /// Which workflow unit a dispatch serves.
@@ -133,7 +181,11 @@ pub fn is_signal(key: &str) -> bool {
 /// definition across repositories. There is nothing to check on origin before
 /// dispatch and nothing to tick when it is published.
 pub fn without_item(key: &str) -> bool {
-    is_signal(key) || key.starts_with("campaign:") || key.starts_with("workflow:")
+    is_signal(key)
+        || key == BUNDLE
+        || key == PROMPT
+        || key.starts_with("campaign:")
+        || key.starts_with("workflow:")
 }
 
 /// Consumed attempts after which a task revision is not dispatched again.
@@ -511,6 +563,42 @@ pub fn slug(text: &str) -> String {
     if out.is_empty() { "task".into() } else { out }
 }
 
+/// Why `run` must be approved on its own before it is published: a ready
+/// bundle, whose approver has not yet said which items it finished.
+/// Publishing it as it is would tick every item.
+pub fn needs_approval(run: &Run) -> Option<String> {
+    (run.state == RunState::Ready && !run.items.is_empty()).then(|| {
+        format!(
+            "run #{} is a bundle; approve it first, leaving open the items it did \
+             not finish (`pma review {} --approve --drop N`)",
+            run.id, run.id
+        )
+    })
+}
+
+/// Refuses a list of bundle items to leave open, numbered from 1, that
+/// names an item the run lacks or every item it has.
+pub fn check_drops(run: &Run, drop: &[usize]) -> Result<()> {
+    if drop.is_empty() {
+        return Ok(());
+    }
+    let n = run.items.len();
+    if n == 0 {
+        return Err(format!("run #{} is not a bundle; it has no items to drop", run.id).into());
+    }
+    if let Some(bad) = drop.iter().find(|i| **i == 0 || **i > n) {
+        return Err(format!("run #{} has items 1 to {n}; there is no item {bad}", run.id).into());
+    }
+    if (1..=n).all(|i| drop.contains(&i)) {
+        return Err(format!(
+            "every item of run #{} is dropped; reject the run instead",
+            run.id
+        )
+        .into());
+    }
+    Ok(())
+}
+
 /// What `prepare` made of a pick.
 /// How a run refused before it started says so, in `Run::error`. A run that
 /// never reached the agent is not a run that failed: the caller leaves its
@@ -519,7 +607,8 @@ pub const NOT_STARTED: &str = "not started: batch budget";
 
 #[derive(Debug)]
 pub enum Prepared {
-    Queued(Box<Run>),
+    /// With a warning for each bundle item left out.
+    Queued(Box<Run>, Vec<String>),
     /// The task is not dispatchable as the last scan described it. Other
     /// tasks of the project may still be.
     Refused(String),
@@ -535,15 +624,18 @@ pub fn prepare(
     over: &Overrides,
     pick: &Pick,
 ) -> Result<Prepared> {
-    let repo = &pick.repo;
+    // A bundle loses the items origin no longer holds open.
+    let mut pick = pick.clone();
+    let mut dropped = Vec::new();
+    let project = pick.project.clone();
+    let repo = &pick.repo.clone();
     // Before the fetch, which reads `url.*` and `core.sshCommand`.
     clone_unchanged(store, repo)?;
     let in_clone = pick.workspace == Workspace::Clone;
     if in_clone && let Some(held) = clone_busy(&store.runs()?, repo) {
         return Ok(Prepared::Refused(format!(
-            "{}: its clone holds run #{held} ({}); approve or reject it first, or \
+            "{project}: its clone holds run #{held} ({}); approve or reject it first, or \
              dispatch with --worktree",
-            pick.project,
             store.run(held)?.state.name()
         )));
     }
@@ -572,9 +664,10 @@ pub fn prepare(
         )?;
         (default_branch, base)
     };
-    let refuse = |why: String| Ok(Prepared::Refused(format!("{}: {why}", pick.project)));
+    let refuse = |why: String| Ok(Prepared::Refused(format!("{project}: {why}")));
 
-    let (details, tags) = match pick.key.as_str() {
+    let key = pick.key.clone();
+    let (details, tags) = match key.as_str() {
         "ci" => {
             let Some(scan::Ci::Failing(workflows)) = store.project(&pick.project)?.map(|p| p.ci)
             else {
@@ -611,6 +704,52 @@ pub fn prepare(
                 ));
             }
             (prompt, Vec::new())
+        }
+        BUNDLE => {
+            let from = start.as_deref().unwrap_or(&base);
+            let file = git(repo, &["show", &format!("{from}:TODO.md")]).ok();
+            let mut kept = Vec::new();
+            for item in &pick.items {
+                let why = match on_origin(file.as_deref(), &item.key, &item.text) {
+                    OnOrigin::Open(description, tags) => {
+                        if Class::of(&item.key, &tags).dispatchable() {
+                            kept.push((item.clone(), description));
+                            continue;
+                        }
+                        "is tagged #manual and is not dispatched".to_string()
+                    }
+                    OnOrigin::Done => format!("is already done on origin/{default_branch}"),
+                    OnOrigin::Absent => format!(
+                        "is not in TODO.md on origin/{default_branch}; commit and push it first"
+                    ),
+                };
+                dropped.push(format!("{project}: `{}` {why}; left out", item.text));
+            }
+            if kept.is_empty() {
+                return refuse(format!(
+                    "no item of the bundle can be dispatched: {}",
+                    dropped.join("; ")
+                ));
+            }
+            if let [(item, description)] = &kept[..] {
+                pick.key = item.key.clone();
+                pick.text = item.text.clone();
+                pick.gh = item.gh;
+                pick.items.clear();
+                (description.clone(), Vec::new())
+            } else {
+                let mut details = String::new();
+                for (n, (item, description)) in kept.iter().enumerate() {
+                    details.push_str(&format!("{}. {}\n", n + 1, item.text));
+                    for line in description.lines() {
+                        details.push_str(&format!("   {line}\n"));
+                    }
+                    details.push('\n');
+                }
+                pick.items = kept.into_iter().map(|(item, _)| item).collect();
+                pick.text = bundle_text(&pick.items);
+                (details, Vec::new())
+            }
         }
         key if without_item(key) && !is_signal(key) => {
             (pick.details.clone().unwrap_or_default(), Vec::new())
@@ -651,12 +790,12 @@ pub fn prepare(
     if in_clone {
         // The run's `worktree` is the clone; `branch` is what it has checked
         // out, which is where a push goes.
-        return queue(
+        let prepared = queue(
             store,
             home,
             cfg,
             over,
-            pick,
+            &pick,
             repo,
             &default_branch.clone(),
             class,
@@ -665,6 +804,7 @@ pub fn prepare(
             start,
             details,
         );
+        return noting(prepared, dropped);
     }
 
     let parent = home.join("worktrees").join(&pick.project);
@@ -708,7 +848,7 @@ pub fn prepare(
         home,
         cfg,
         over,
-        pick,
+        &pick,
         &worktree,
         &branch,
         class,
@@ -717,10 +857,18 @@ pub fn prepare(
         None,
         details,
     );
-    if !matches!(prepared, Ok(Prepared::Queued(_))) {
+    if !matches!(prepared, Ok(Prepared::Queued(..))) {
         let _ = remove_worktree(repo, &worktree, &branch);
     }
-    prepared
+    noting(prepared, dropped)
+}
+
+/// A queued run with the bundle items `prepare` left out.
+fn noting(prepared: Result<Prepared>, dropped: Vec<String>) -> Result<Prepared> {
+    prepared.map(|p| match p {
+        Prepared::Queued(run, _) => Prepared::Queued(run, dropped),
+        p => p,
+    })
 }
 
 /// The clone run that holds `repo`, if one does: one that is queued, under
@@ -931,10 +1079,11 @@ fn queue(
         infra: false,
         workspace: pick.workspace,
         start,
+        items: pick.items.clone(),
     };
     run.prompt = prompt(&run, &details, verify.as_deref());
     store.insert_run(&mut run)?;
-    Ok(Prepared::Queued(Box::new(run)))
+    Ok(Prepared::Queued(Box::new(run), Vec::new()))
 }
 
 pub fn path_arg(path: &Path) -> Result<&str> {
@@ -1035,10 +1184,18 @@ fn prompt(run: &Run, details: &str, verify: Option<&str>) -> String {
         }
         Workspace::Worktree => "in a git worktree of it.",
     };
-    let mut p = format!(
-        "You are working on the project `{}`, {where_}\n\nTask: {}\n",
-        run.project, run.text
+    let head = format!(
+        "You are working on the project `{}`, {where_}\n\n",
+        run.project
     );
+    // A prompt's title is its first line, which the details repeat.
+    let mut p = if run.task_key == PROMPT {
+        format!("{head}Task, from the developer:\n")
+    } else if run.items.is_empty() {
+        format!("{head}Task: {}\n", run.text)
+    } else {
+        format!("{head}Tasks, numbered:\n")
+    };
     if !details.trim().is_empty() {
         p.push('\n');
         p.push_str(details);
@@ -1060,7 +1217,13 @@ fn prompt(run: &Run, details: &str, verify: Option<&str>) -> String {
             "- Run `{v}` to check your change. pma runs it again after you finish.\n"
         ));
     }
-    p.push_str("\nEnd with a short summary of what you changed and what is left undone.\n");
+    p.push_str(match run.items.is_empty() {
+        true => "\nEnd with a short summary of what you changed and what is left undone.\n",
+        false => {
+            "\nEnd with a short summary, by task number, of what you changed and what is \
+             left undone.\n"
+        }
+    });
     p
 }
 
@@ -2161,6 +2324,7 @@ mod tests {
             infra: false,
             workspace: Workspace::Worktree,
             start: None,
+            items: Vec::new(),
         };
         let p = prompt(&run, "for all classes\n", Some("make test"));
         assert!(p.contains("`cynn`"));
@@ -2187,6 +2351,113 @@ mod tests {
         assert!(p.contains("Do not edit CHANGELOG.md"), "{p}");
         assert!(p.contains("`.pma/changelog.md`"), "{p}");
         let _ = std::fs::remove_dir_all(repo);
+    }
+
+    fn bundle(dropped: &[usize]) -> Run {
+        let item = |n: usize, key: &str, gh| RunItem {
+            key: key.into(),
+            text: format!("task {key}"),
+            gh,
+            dropped: dropped.contains(&n),
+        };
+        Run {
+            id: 4,
+            task_key: BUNDLE.into(),
+            text: "task a; task b; task c".into(),
+            items: vec![
+                item(1, "a", Some(7)),
+                item(2, "b", None),
+                item(3, "c", Some(9)),
+            ],
+            ..Run::blank()
+        }
+    }
+
+    /// A prompt's run is named by its first line, cut at 80 characters; the
+    /// agent reads the whole prompt once.
+    #[test]
+    fn a_prompt_run_carries_the_whole_prompt() {
+        assert_eq!(prompt_title("  fix it\nand more"), "fix it");
+        let long = "word ".repeat(30);
+        let title = prompt_title(&long);
+        assert!(
+            title.ends_with("...") && title.chars().count() <= 83,
+            "{title}"
+        );
+        let run = Run {
+            task_key: PROMPT.into(),
+            text: "fix it".into(),
+            ..Run::blank()
+        };
+        let p = prompt(&run, "fix it\nand more\n", None);
+        assert!(
+            p.contains("Task, from the developer:\n\nfix it\nand more\n"),
+            "{p}"
+        );
+        assert_eq!(p.matches("fix it").count(), 1, "{p}");
+    }
+
+    /// A bundle's prompt numbers its tasks, and asks for a summary by number,
+    /// which is how the approver says which are done.
+    #[test]
+    fn a_bundle_prompt_numbers_its_tasks() {
+        let p = prompt(&bundle(&[]), "1. task a\n\n2. task b\n", None);
+        assert!(
+            p.contains("Tasks, numbered:\n\n1. task a\n\n2. task b\n"),
+            "{p}"
+        );
+        assert!(!p.contains("Task: "), "{p}");
+        assert!(p.contains("summary, by task number"), "{p}");
+    }
+
+    #[test]
+    fn a_bundle_closes_what_its_approver_kept() {
+        let run = bundle(&[2]);
+        assert_eq!(
+            closes(&run),
+            [("a", "task a", Some(7)), ("c", "task c", Some(9))]
+        );
+        let one = Run {
+            gh: Some(3),
+            ..Run::blank()
+        };
+        assert_eq!(closes(&one), [("fix it", "Fix it", Some(3))]);
+        let signal = Run {
+            task_key: "ci".into(),
+            ..Run::blank()
+        };
+        assert!(closes(&signal).is_empty());
+    }
+
+    /// A ready bundle is published only after an approval that says which
+    /// items it finished; an approved one, or a plain ready run, goes on.
+    #[test]
+    fn a_ready_bundle_needs_its_own_approval() {
+        let ready = |run: Run| Run {
+            state: RunState::Ready,
+            ..run
+        };
+        assert!(needs_approval(&ready(bundle(&[]))).is_some());
+        assert!(needs_approval(&ready(Run::blank())).is_none());
+        let approved = Run {
+            state: RunState::Approved,
+            ..bundle(&[])
+        };
+        assert!(needs_approval(&approved).is_none());
+    }
+
+    #[test]
+    fn drops_name_items_the_bundle_has_and_leave_one() {
+        let run = bundle(&[]);
+        assert!(check_drops(&run, &[]).is_ok());
+        assert!(check_drops(&run, &[1, 3]).is_ok());
+        let err = check_drops(&run, &[4]).unwrap_err().to_string();
+        assert_eq!(err, "run #4 has items 1 to 3; there is no item 4");
+        assert!(check_drops(&run, &[0]).is_err());
+        let err = check_drops(&run, &[1, 2, 3]).unwrap_err().to_string();
+        assert!(err.contains("reject the run instead"), "{err}");
+        let err = check_drops(&Run::blank(), &[1]).unwrap_err().to_string();
+        assert!(err.contains("is not a bundle"), "{err}");
     }
 
     /// Only a run that reached the agent and failed its check says anything

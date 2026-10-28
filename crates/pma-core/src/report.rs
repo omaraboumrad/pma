@@ -527,6 +527,19 @@ pub fn run_fields(run: &Run) -> Vec<Vec<String>> {
     rows
 }
 
+/// A bundle's items, numbered as its prompt and `--drop` number them, one
+/// per line.
+pub fn item_lines(run: &Run, indent: &str) -> String {
+    run.items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let open = if item.dropped { "  (left open)" } else { "" };
+            format!("{indent}{}. {}{open}\n", i + 1, item.text)
+        })
+        .collect()
+}
+
 pub fn run_detail(run: &Run, attempts: &[Attempt], changelog: Option<&str>, diff: &str) -> String {
     let rows = run_fields(run);
     let mut out = format!(
@@ -539,6 +552,10 @@ pub fn run_detail(run: &Run, attempts: &[Attempt], changelog: Option<&str>, diff
             .map_or(String::new(), |q| format!("  {q}"))
     );
     out.push_str(&table(&rows, "  "));
+    if !run.items.is_empty() {
+        out.push_str("\nitems:\n");
+        out.push_str(&item_lines(run, "  "));
+    }
     if let Some(summary) = run.summary.as_deref().filter(|s| !s.trim().is_empty()) {
         out.push_str("\nsummary:\n");
         for line in summary.lines() {

@@ -31,7 +31,7 @@ pma push 1                     # commit and push it; or `pma pr 1` after --appro
 
 - Failing CI, outdated dependencies, idle repositories and dirty working trees appear as tasks beside the written ones.
 
-- Two front ends with the same views and actions: `pma tui` in a terminal, over SSH too, and `pma web` in a local browser, on 127.0.0.1 behind a one-time token. Both act on what is selected: dispatch a task, approve or reject a run, approve a plan, stop a job.
+- Two front ends with the same views and actions: `pma tui` in a terminal, over SSH too, and `pma web` in a local browser, on 127.0.0.1 behind a one-time token. Both act on what is selected: dispatch a task, approve or reject a run, approve a plan, stop a job. Space marks tasks, and `d` dispatches the marked ones, one run per project. `P` in a project view dispatches a prompt you type.
 
 - A view of each project: its state and why, CI, dependencies, local changes, open tasks and every run, with how old the scan behind it is. `pma project show <name>`, or `o` on any row.
 
@@ -224,13 +224,16 @@ Dispatch, review, publish:
 ```sh
 pma dispatch myproject:31       # a TODO.md line from the last scan
 pma dispatch myproject:ci       # failing CI; or :deps for dependencies
-pma dispatch myproject:critical # every open item under that heading
+pma dispatch myproject:critical # every open item under that heading, as one run
+pma dispatch myproject:31 myproject:40  # one run over both; --separate for one each
 pma dispatch myproject          # pick from a list
+pma dispatch myproject --prompt "audit error handling"  # your own prompt, no item
 pma dispatch --auto -n 3        # the top 3 dispatchable tasks
 pma dispatch -p claude-haiku myproject:31
 pma review                      # runs not yet published or rejected
 pma review 4                    # task, test result, cost, summary, diff
 pma review 4 --approve          # or --reject, or --rework "feedback"
+pma review 4 --approve --drop 3 # a bundle: leave its item 3 open
 pma review 4 --reject --infra   # the check or machine failed, not the agent
 pma review 4 5 6 --approve      # a batch; every run is checked before any is approved
 pma stage 4                     # into your clone's index, item ticked; no approval needed
@@ -242,6 +245,8 @@ pma report --by project         # also class or agent
 ```
 
 A target naming one task fails if that task cannot run. A target naming many passes over each with its reason, and dispatches the rest.
+
+The `TODO.md` items named in one project are one run, a bundle; `--separate` gives each its own. Its rules: `docs/dev/bundled-dispatch.md`.
 
 A run edits the clone, or with `pma config workspace worktree` a worktree of the remote default branch under `~/.local/state/pma/worktrees`, on a `pma/` branch; in a worktree, the item must be open in the remote `TODO.md`, so commit and push before dispatching. Set the test command with `pma config projects.myproject.verify "make check"`, or let it be detected. `pma config projects.myproject.sandbox on` confines what the check may write. `docs/dev/clone-runs.md` has the clone run's rules.
 

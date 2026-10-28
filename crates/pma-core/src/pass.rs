@@ -2815,13 +2815,14 @@ fn run_edit(ctx: &Ctx<'_>, node: &Node, units: &[WorkflowUnit], known: &Known) -
                 quadrant: None,
                 local: ctx.local,
                 workspace: ctx.workspace,
+                items: Vec::new(),
             };
             match crate::dispatch::prepare(ctx.store, ctx.home, ctx.cfg, ctx.over, &pick)? {
                 crate::dispatch::Prepared::Refused(why) => {
                     ctx.store
                         .atomically(|| route_failed(ctx, node, unit, &why))?;
                 }
-                crate::dispatch::Prepared::Queued(run) => {
+                crate::dispatch::Prepared::Queued(run, _) => {
                     edits += 1;
                     driving.insert(run.id, unit.clone());
                     queued.push(*run);

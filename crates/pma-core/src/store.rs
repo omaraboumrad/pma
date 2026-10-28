@@ -24,7 +24,7 @@ use crate::worker::{Parser, Worker};
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
-const VERSION: i64 = 42;
+const VERSION: i64 = 43;
 
 const SCHEMA: &str = "
 CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -395,6 +395,20 @@ ALTER TABLE jobs ADD COLUMN project TEXT;
 ";
 
 const REFRESH_WORKER: &str = "-- no schema change; the seed is in Rust";
+
+/// Version 43. The items of a bundle, one run over several TODO.md items,
+/// numbered from 1 as the prompt numbers them. A run with one item has none.
+const RUN_ITEMS: &str = "
+CREATE TABLE run_items (
+    run INTEGER NOT NULL REFERENCES runs(id),
+    n INTEGER NOT NULL,
+    key TEXT NOT NULL,
+    text TEXT NOT NULL,
+    gh INTEGER,
+    dropped INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (run, n)
+);
+";
 
 /// Version 38. When the stalest lock last changed, read on every scan, and
 /// the crates cargo's constraints hold back, read with `--deps`. A table for
@@ -998,6 +1012,7 @@ impl Store {
                     SCAN_FAULTS,
                     WORKSPACE,
                     JOB_PROJECT,
+                    RUN_ITEMS,
                 ];
                 let tx = conn.unchecked_transaction()?;
                 for step in &steps[version as usize..] {
@@ -1944,7 +1959,8 @@ impl Store {
     /// `run`.
     pub fn insert_run(&self, run: &mut Run) -> Result<i64> {
         run.dispatched_at = Some(crate::dates::now());
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
             "INSERT INTO runs (project, task_key, text, gh, quadrant, agent, branch, worktree,
                                default_branch, base, prompt, state, repo, dispatched_at,
                                class, scope, tier, description, agent_budget, timeout_minutes,
@@ -1998,8 +2014,38 @@ impl Store {
                 run.start,
             ],
         )?;
-        run.id = self.conn.last_insert_rowid();
+        run.id = tx.last_insert_rowid();
+        for (n, item) in run.items.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO run_items (run, n, key, text, gh, dropped)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    run.id,
+                    n as i64 + 1,
+                    item.key,
+                    item.text,
+                    item.gh,
+                    item.dropped
+                ],
+            )?;
+        }
+        tx.commit()?;
         Ok(run.id)
+    }
+
+    /// Marks bundle items 1-based `dropped` as left open, and every other
+    /// item as done.
+    pub fn set_dropped(&self, id: i64, dropped: &[usize]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("UPDATE run_items SET dropped = 0 WHERE run = ?1", [id])?;
+        for n in dropped {
+            tx.execute(
+                "UPDATE run_items SET dropped = 1 WHERE run = ?1 AND n = ?2",
+                params![id, *n as i64],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Writes every mutable column of the run with `run.id`.
@@ -2193,9 +2239,32 @@ impl Store {
                 infra: r.get(57)?,
                 workspace: Workspace::parse(&r.get::<_, String>(58)?).unwrap_or_default(),
                 start: r.get(59)?,
+                items: Vec::new(),
             })
         })?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+        let mut runs: Vec<Run> = rows.collect::<rusqlite::Result<_>>()?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT run, key, text, gh, dropped FROM run_items ORDER BY run, n")?;
+        let mut items: HashMap<i64, Vec<RunItem>> = HashMap::new();
+        for row in stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                RunItem {
+                    key: r.get(1)?,
+                    text: r.get(2)?,
+                    gh: r.get(3)?,
+                    dropped: r.get(4)?,
+                },
+            ))
+        })? {
+            let (run, item) = row?;
+            items.entry(run).or_default().push(item);
+        }
+        for run in &mut runs {
+            run.items = items.remove(&run.id).unwrap_or_default();
+        }
+        Ok(runs)
     }
 
     pub fn run(&self, id: i64) -> Result<Run> {
@@ -2758,7 +2827,8 @@ impl Store {
     }
 
     /// Moves the runs still holding a task onto its new key, once `pma` has
-    /// written an id into its line: those keyed by its old key or by its text.
+    /// written an id into its line: those keyed by its old key or by its text,
+    /// and the matching items of open bundles.
     /// A finished run keeps the key it was dispatched under.
     pub fn rekey_runs(&self, project: &str, old: &str, text: &str, new: &str) -> Result<()> {
         let text = crate::todo::normal_text(text);
@@ -2771,6 +2841,17 @@ impl Store {
                     "UPDATE runs SET task_key = ?2 WHERE id = ?1",
                     params![run.id, new],
                 )?;
+            }
+            // A bundle's own key stays `bundle`; its items move.
+            if run.project == project && !run.state.is_final() {
+                for (n, item) in run.items.iter().enumerate() {
+                    if item.key == old || crate::todo::normal_text(&item.text) == text {
+                        self.conn.execute(
+                            "UPDATE run_items SET key = ?3 WHERE run = ?1 AND n = ?2",
+                            params![run.id, n as i64 + 1, new],
+                        )?;
+                    }
+                }
             }
         }
         Ok(())
@@ -3213,6 +3294,18 @@ pub struct Run {
     /// A clone run's working tree at dispatch, as a commit; `HEAD` itself
     /// when nothing differed. What its diff and its revert read against.
     pub start: Option<String>,
+    /// A bundle's items, in prompt order; empty for any other run.
+    pub items: Vec<RunItem>,
+}
+
+/// One TODO.md item of a bundle.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct RunItem {
+    pub key: String,
+    pub text: String,
+    pub gh: Option<i64>,
+    /// The approver left it open: not ticked, not closed.
+    pub dropped: bool,
 }
 
 impl Run {
@@ -3280,6 +3373,7 @@ impl Run {
             infra: false,
             workspace: Workspace::Worktree,
             start: None,
+            items: Vec::new(),
         }
     }
 
@@ -3462,6 +3556,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// An id written into an item's line moves an open bundle's item onto
+    /// it, by key or by text; the bundle's own key stays.
+    #[test]
+    fn a_rekey_moves_an_open_bundles_items() {
+        let dir = scratch("rekey-bundle");
+        let store = Store::open(&dir.join("p.db")).unwrap();
+        let item = |key: &str, text: &str| RunItem {
+            key: key.into(),
+            text: text.into(),
+            ..RunItem::default()
+        };
+        let mut run = Run {
+            task_key: crate::dispatch::BUNDLE.into(),
+            text: "task a; task b".into(),
+            items: vec![item("a", "task a"), item("old-b", "Task  B")],
+            ..Run::blank()
+        };
+        store.insert_run(&mut run).unwrap();
+        store.rekey_runs("p", "a", "task a", "id:1").unwrap();
+        store.rekey_runs("p", "b", "task b", "id:2").unwrap();
+        let got = store.run(run.id).unwrap();
+        assert_eq!(got.task_key, crate::dispatch::BUNDLE);
+        let keys: Vec<&str> = got.items.iter().map(|i| i.key.as_str()).collect();
+        assert_eq!(keys, ["id:1", "id:2"]);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn item(key: &str, line: i64) -> ScannedItem {
@@ -3853,9 +3974,10 @@ mod tests {
         }
     }
 
-    /// Undoes versions 40 to 42, for a test that rewinds the schema past
+    /// Undoes versions 40 to 43, for a test that rewinds the schema past
     /// them.
     const BEFORE_SCAN_FAULTS: &str = "
+        DROP TABLE run_items;
         ALTER TABLE jobs DROP COLUMN project;
         ALTER TABLE runs DROP COLUMN workspace;
         ALTER TABLE runs DROP COLUMN start;
@@ -4350,8 +4472,25 @@ mod tests {
             infra: false,
             workspace: Workspace::Worktree,
             start: None,
+            items: vec![
+                RunItem {
+                    key: "a".into(),
+                    text: "first".into(),
+                    gh: Some(7),
+                    dropped: false,
+                },
+                RunItem {
+                    key: "b".into(),
+                    text: "second".into(),
+                    gh: None,
+                    dropped: true,
+                },
+            ],
         };
         store.insert_run(&mut run).unwrap();
+        assert_eq!(store.run(run.id).unwrap(), run);
+        store.set_dropped(run.id, &[1]).unwrap();
+        (run.items[0].dropped, run.items[1].dropped) = (true, false);
         assert_eq!(store.run(run.id).unwrap(), run);
 
         run.state = RunState::Ready;

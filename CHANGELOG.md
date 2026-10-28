@@ -6,6 +6,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Bundles.** The `TODO.md` items `pma dispatch` names in one project are one run: one agent session, one diff, one review, one commit. The prompt numbers the tasks. `pma review <id> --approve --drop 2,3` leaves those items open; publishing ticks the rest, lists them in the commit body and closes each one's issue. A dropped item's changes stay in the diff. A bundle is never clean, so `--push` and batch approval pass over it, and a ready one must be approved before it is staged or published. In the clone, which holds one run, several items could not run at all. Design and open steps: `docs/dev/bundled-dispatch.md`.
+
+- Space marks tasks in the TUI, and a checkbox does in the web; `d` then dispatches every marked task, one bundle per project. Marks clear on a dispatch, on Escape and on another view, and a mark on a row a refresh removed is dropped, so nothing unseen is dispatched.
+
+- **`pma dispatch <project> --prompt <text>`** runs an agent over the project with a prompt of your own, for work that is no `TODO.md` item; `P` in a project view does the same. The run is named by the prompt's first line, is reviewed and published as any run, and ticks nothing. `pma review <id> --retry` dispatches the same prompt again. The TUI and web prompt is one line.
+
+- Approving a bundle in the TUI or the web lists its items, checked; the ones unchecked are left open, as `--drop` leaves them. A run that is not a bundle is approved without a question, as before.
+
 - `pma task <project:line>` prints a task in full, as Enter on it does in the TUI and the web; `<project:ci>` prints the signal.
 
 - **`pma lint --fix`** lists the mechanical errors a rewrite settles, and `--apply` writes them: a byte-order mark, a missing or wrong `# TODO` title, a section heading not written `## Name`, a plain bullet where an item belongs, and a checkbox not written `- [ ]` or `- [x]`. Dates, issue numbers, duplicates and fences stay for a person. The parser stays strict: one broken file hid every item it held, and 46 of one project's errors were the same bullet. In the TUI and the web, `f` on a project now offers prune or fix.
@@ -36,6 +44,8 @@ pma workflow run find-issues --tag nightly --unattended
 - `/` in the TUI's run list filters it by name; the web's list has a filter box, and the arrows move among what it keeps. The web's names and descriptions line up in columns.
 
 ### Changed
+
+- `pma dispatch` with several items of one project starts one bundle, not one run per item; `--separate` restores one run each.
 
 - A command already queued or running from the same directory is refused as a job: `job 12 is queued already: pma verify alpha`. A second click on verify queued a second verify. It applies to `--detach` too.
 

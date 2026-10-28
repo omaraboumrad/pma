@@ -1,5 +1,6 @@
 #!/bin/sh
-# A scratch pma store with two worktree runs ready for review, for the web
+# A scratch pma store with three worktree runs ready for review, the third
+# a bundle of two items, for the web
 # checks. Everything is written under <dir>, which must not exist yet: a
 # seed repository, a bare origin, a clone at <dir>/root/alpha, a fake
 # `claude`, and the store at <dir>/home. Run it yourself: it commits in the
@@ -27,7 +28,7 @@ EOF
 . "$S/env.sh"
 cd "$S/seed"
 git init -q -b main
-printf '# TODO\n\n## High\n\n- [ ] add greeting #agent\n  say hello\n- [ ] second task #agent\n- [ ] third task #agent\n' > TODO.md
+printf '# TODO\n\n## High\n\n- [ ] add greeting #agent\n  say hello\n- [ ] second task #agent\n- [ ] third task #agent\n- [ ] fourth task #agent\n' > TODO.md
 printf 'test:\n\ttest -f hello.txt\n' > Makefile
 git add . && git commit -qm init
 cd "$S" && git clone -q --bare seed origin.git
@@ -38,5 +39,6 @@ cd "$S/root" && git clone -q ../origin.git alpha
 "$P" scan --offline >/dev/null
 "$P" dispatch alpha:5
 "$P" dispatch alpha:7
+"$P" dispatch alpha:8 alpha:9
 "$P" review
 echo "store: $S/home; run \`. $S/env.sh\` before \`pma web --no-open\`"

@@ -149,10 +149,13 @@ pub enum Act {
     /// Tidies the project in view's TODO.md: prunes finished items, or
     /// rewrites its mechanical errors, by choice.
     Prune,
+    /// Dispatches a typed prompt over the project in view: work that is no
+    /// TODO.md item.
+    Prompt,
 }
 
 impl Act {
-    pub const ALL: [Act; 43] = [
+    pub const ALL: [Act; 44] = [
         Act::ApproveRun,
         Act::ApproveRuns,
         Act::RejectRun,
@@ -196,6 +199,7 @@ impl Act {
         Act::RemoveCampaign,
         Act::Configure,
         Act::Prune,
+        Act::Prompt,
     ];
 
     pub fn name(self) -> String {
@@ -221,6 +225,7 @@ impl Act {
                 | Act::AddCampaign
                 | Act::Configure
                 | Act::Prune
+                | Act::Prompt
         )
     }
 
@@ -264,7 +269,7 @@ impl Act {
             Action::EditNote { .. } => &[Act::EditNote],
             Action::RemoveNote { .. } => &[Act::RemoveNote],
             Action::Scan { .. } => &[Act::Scan, Act::ScanProject],
-            Action::Dispatch { .. } => &[Act::Dispatch],
+            Action::Dispatch { .. } => &[Act::Dispatch, Act::Prompt],
             Action::WorkflowRun { .. } => &[Act::ResumeWorkflow, Act::StartWorkflow],
             Action::ReworkRun { .. } => &[Act::ReworkRun],
             Action::RetryRun { .. } => &[Act::RetryRun],
@@ -320,6 +325,8 @@ pub enum Command {
     Finished,
     /// The project of the selected row.
     OpenProject,
+    /// Marks the selected task, or unmarks it, for a dispatch of several.
+    Mark,
     Help,
     /// The TUI only; a browser tab is closed by the browser.
     Quit,
@@ -335,6 +342,10 @@ pub enum Ask {
     Text(&'static str),
     /// One of a list `api::choices` gives, plus its flags, with this label.
     Choose(&'static str),
+    /// Rows `api::checklist` gives to check or uncheck, with this label. The
+    /// input is the 1-based numbers left unchecked, comma-separated. An
+    /// empty list asks nothing.
+    Check(&'static str),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -461,6 +472,13 @@ pub const BINDINGS: &[Binding] = &[
         "project settings",
     ),
     on(
+        "P",
+        &[Tab::Project],
+        Act::Prompt,
+        Ask::Text("prompt for an agent, over the whole project"),
+        "prompt an agent",
+    ),
+    on(
         "f",
         &[Tab::Project],
         Act::Prune,
@@ -476,10 +494,20 @@ pub const BINDINGS: &[Binding] = &[
         "run",
     ),
     // A task.
+    Binding {
+        tabs: TASKS,
+        ..bind(" ", Command::Mark, "mark")
+    },
     on("d", TASKS, Act::Dispatch, Ask::Confirm, "dispatch"),
     on("v", TASKS, Act::Verify, Ask::Nothing, "verify project"),
     // A run.
-    on("a", RUNS, Act::ApproveRun, Ask::Nothing, "approve"),
+    on(
+        "a",
+        RUNS,
+        Act::ApproveRun,
+        Ask::Check("items done"),
+        "approve",
+    ),
     on("b", RUNS, Act::ApproveRuns, Ask::Confirm, "approve clean"),
     on("x", RUNS, Act::RejectRun, Ask::Confirm, "reject"),
     on("w", RUNS, Act::ReworkRun, Ask::Text("feedback"), "rework"),

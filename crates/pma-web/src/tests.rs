@@ -10,6 +10,10 @@ fn picks_round_trip_through_json() {
             target: "a:5".into(),
             retry: true,
         },
+        Pick::Tasks {
+            targets: vec!["a:5".into(), "b:2".into()],
+            retry: false,
+        },
         Pick::Manual {
             project: "a".into(),
         },
@@ -61,6 +65,8 @@ fn picks_round_trip_through_json() {
     }
     assert_eq!(pick_from(&json!({ "kind": "run", "id": "3" })), None);
     assert_eq!(pick_from(&json!({ "kind": "shell" })), None);
+    let none = json!({ "kind": "tasks", "targets": [], "retry": false });
+    assert_eq!(pick_from(&none), None, "no target is no pick");
 }
 
 /// The page learns every tab and every act from the table, by the names the

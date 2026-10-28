@@ -331,6 +331,15 @@ enum Command {
         /// rest wait in `pma review`.
         #[arg(long, conflicts_with = "local")]
         push: bool,
+        /// One run per task named. Without it, the TODO.md items named in one
+        /// project are one run, a bundle, reviewed and published together.
+        #[arg(long, conflicts_with = "auto")]
+        separate: bool,
+        /// Run an agent over the one project named with this prompt, in
+        /// place of a task: `pma dispatch cynn --prompt "audit error
+        /// handling"`. Reviewed and published as any run; nothing is ticked.
+        #[arg(long, conflicts_with_all = ["auto", "separate"], value_name = "TEXT")]
+        prompt: Option<String>,
         /// Queue the command and return at once; `pma job` follows it.
         #[arg(long)]
         detach: bool,
@@ -364,6 +373,15 @@ enum Command {
         /// Minutes spent reviewing this run, added to the run's total.
         #[arg(long, requires = "ids", value_name = "N")]
         minutes: Option<u32>,
+        /// With --approve on a bundle, the items left open, by the numbers
+        /// `pma review <id>` shows: `--drop 2,3`.
+        #[arg(
+            long,
+            requires = "approve",
+            value_delimiter = ',',
+            value_name = "N,..."
+        )]
+        drop: Vec<usize>,
     },
     /// One task in full, as Enter opens it in the TUI and web.
     ///
@@ -1015,6 +1033,8 @@ fn main() -> ExitCode {
             local,
             worktree,
             push,
+            separate,
+            prompt,
             detach: false,
         } => overrides(agent, model, preset).and_then(|over| {
             run_dispatch(
@@ -1023,8 +1043,12 @@ fn main() -> ExitCode {
                 auto,
                 count,
                 retry,
-                dispatch_flags(local, worktree, push),
+                DispatchFlags {
+                    separate,
+                    ..dispatch_flags(local, worktree, push)
+                },
                 &over,
+                prompt.as_deref(),
             )
         }),
         Command::Review {
@@ -1041,6 +1065,7 @@ fn main() -> ExitCode {
             infra,
             rework,
             minutes,
+            drop,
             retry: false,
         } => run_review(
             &ids,
@@ -1050,6 +1075,7 @@ fn main() -> ExitCode {
             infra,
             rework.as_deref(),
             minutes,
+            &drop,
         ),
         Command::Task { target } => match target.rsplit_once(':') {
             Some((project, _)) => show(Query::task(project, &target)),
@@ -2052,6 +2078,8 @@ pub struct DispatchFlags {
     pub worktree: bool,
     /// Approve and push each run whose gates are clean.
     pub push: bool,
+    /// One run per task, not one bundle per project.
+    pub separate: bool,
 }
 
 pub fn dispatch_flags(local: bool, worktree: bool, push: bool) -> DispatchFlags {
@@ -2059,9 +2087,11 @@ pub fn dispatch_flags(local: bool, worktree: bool, push: bool) -> DispatchFlags 
         local,
         worktree,
         push,
+        separate: false,
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_dispatch(
     targets: &[String],
     tags: &[String],
@@ -2070,6 +2100,7 @@ pub fn run_dispatch(
     retry: bool,
     flags: DispatchFlags,
     over: &dispatch::Overrides,
+    prompt: Option<&str>,
 ) -> Result<()> {
     let store = Store::open_default()?;
     let home = store::state_home()?;
@@ -2159,6 +2190,7 @@ pub fn run_dispatch(
                 quadrant: Some(format!("{:?}", x.quadrant)),
                 local: false,
                 workspace: config::Workspace::Worktree,
+                items: Vec::new(),
             });
         }
         let tasks = store.tasks()?;
@@ -2168,6 +2200,50 @@ pub fn run_dispatch(
                 .find(|t| t.project == pick.project && t.key == pick.key)
                 .and_then(|t| t.gh);
         }
+    } else if let Some(text) = prompt.map(str::trim) {
+        let [target] = targets else {
+            return Err("--prompt runs over one project; name it, such as `cynn`".into());
+        };
+        let (project, what) = dispatch::target(target)?;
+        if what != dispatch::Target::Project {
+            return Err(
+                format!("--prompt runs over a whole project; name `{project}` alone").into(),
+            );
+        }
+        if text.is_empty() {
+            return Err("--prompt needs text".into());
+        }
+        let r = row(project)?;
+        if r.absent_since.is_some() {
+            return Err(
+                format!("{project} is not under a root; clone it back and run `pma scan`").into(),
+            );
+        }
+        let title = dispatch::prompt_title(text);
+        let spent = store.consumed_attempts(project, &dispatch::revision(&title))?;
+        if !retry && spent >= dispatch::ATTEMPT_LIMIT {
+            return Err(format!(
+                "{spent} attempts on `{title}` were used without an accepted result; \
+                 reword the prompt, or add --retry"
+            )
+            .into());
+        }
+        named_any = true;
+        picks.push(dispatch::Pick {
+            workflow: None,
+            project: project.into(),
+            repo: r.path.clone(),
+            key: dispatch::PROMPT.into(),
+            text: title,
+            gh: None,
+            tier: r.tier,
+            class: None,
+            details: Some(format!("{text}\n")),
+            quadrant: None,
+            local: false,
+            workspace: config::Workspace::Worktree,
+            items: Vec::new(),
+        });
     } else {
         if targets.is_empty() {
             return Err(
@@ -2297,8 +2373,38 @@ pub fn run_dispatch(
                     gh,
                     local: false,
                     workspace: config::Workspace::Worktree,
+                    items: Vec::new(),
                 });
             }
+        }
+        // A task a heading and a line both name is one task.
+        let mut seen = std::collections::HashSet::new();
+        picks.retain(|p| seen.insert((p.project.clone(), p.key.clone())));
+        if !flags.separate {
+            let warnings;
+            (picks, warnings) = bundled(picks);
+            for w in warnings {
+                eprintln!("warning: {w}");
+            }
+            // A bundle's failures count against its own text, which no item's
+            // check reads.
+            let mut kept = Vec::new();
+            for pick in picks {
+                if pick.key == dispatch::BUNDLE && !retry {
+                    let spent =
+                        store.consumed_attempts(&pick.project, &dispatch::revision(&pick.text))?;
+                    if spent >= dispatch::ATTEMPT_LIMIT {
+                        eprintln!(
+                            "warning: {}: {spent} attempts on the bundle `{}` were used \
+                             without an accepted result; name fewer items, or add --retry",
+                            pick.project, pick.text
+                        );
+                        continue;
+                    }
+                }
+                kept.push(pick);
+            }
+            picks = kept;
         }
     }
     // A selector expands to as many tasks as it names; `max_parallel` and
@@ -2330,6 +2436,57 @@ pub fn run_dispatch(
         push_clean(&store, &home, &p.cfg, finished)?;
     }
     Ok(())
+}
+
+/// Each project's TODO.md items as one bundle pick, in the order named; a
+/// project with one item, and every signal, keeps its own pick. A project
+/// with more items than a bundle takes is passed over, with a warning, so
+/// the other targets still run.
+fn bundled(picks: Vec<dispatch::Pick>) -> (Vec<dispatch::Pick>, Vec<String>) {
+    let mut warnings = Vec::new();
+    let mut out: Vec<dispatch::Pick> = Vec::new();
+    let mut items: Vec<(String, Vec<dispatch::Pick>)> = Vec::new();
+    for pick in picks {
+        if dispatch::without_item(&pick.key) {
+            out.push(pick);
+        } else if let Some((_, group)) = items.iter_mut().find(|(p, _)| *p == pick.project) {
+            group.push(pick);
+        } else {
+            items.push((pick.project.clone(), vec![pick]));
+        }
+    }
+    for (project, mut group) in items {
+        if group.len() == 1 {
+            out.extend(group);
+            continue;
+        }
+        if group.len() > dispatch::BUNDLE_MAX {
+            warnings.push(format!(
+                "{project}: {} tasks named; a bundle takes at most {}. Name fewer, \
+                 or dispatch them one run each with --separate",
+                group.len(),
+                dispatch::BUNDLE_MAX
+            ));
+            continue;
+        }
+        let items: Vec<store::RunItem> = group
+            .iter()
+            .map(|p| store::RunItem {
+                key: p.key.clone(),
+                text: p.text.clone(),
+                gh: p.gh,
+                dropped: false,
+            })
+            .collect();
+        let mut pick = group.swap_remove(0);
+        pick.key = dispatch::BUNDLE.into();
+        pick.text = dispatch::bundle_text(&items);
+        pick.gh = None;
+        pick.quadrant = None;
+        pick.items = items;
+        out.push(pick);
+    }
+    (out, warnings)
 }
 
 /// Approves and pushes each finished run whose recorded gates are clean;
@@ -2518,7 +2675,10 @@ fn run_picks(
             continue;
         }
         match dispatch::prepare(store, home, cfg, over, pick) {
-            Ok(dispatch::Prepared::Queued(run)) => {
+            Ok(dispatch::Prepared::Queued(run, dropped)) => {
+                for why in dropped {
+                    eprintln!("warning: {why}");
+                }
                 println!("#{} {}: {}", run.id, run.project, run.text);
                 queued.push(*run);
             }
@@ -2579,6 +2739,7 @@ fn run_picks(
     Ok(finished)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_review(
     ids: &[i64],
     approve: bool,
@@ -2587,6 +2748,7 @@ fn run_review(
     infra: bool,
     rework: Option<&str>,
     minutes: Option<u32>,
+    drop: &[usize],
 ) -> Result<()> {
     let store = Store::open_default()?;
     if ids.is_empty() {
@@ -2596,6 +2758,9 @@ fn run_review(
     if ids.len() > 1 {
         if !approve {
             return Err("name one run, or several ids with --approve".into());
+        }
+        if !drop.is_empty() {
+            return Err("--drop names the items of one run; approve it on its own".into());
         }
         say(api::act(&store, Action::ApproveRuns { ids: ids.to_vec() })?);
         return Ok(());
@@ -2607,7 +2772,14 @@ fn run_review(
         say(api::act(&store, Action::AddReviewTime { id, minutes })?);
     }
     if approve {
-        say(api::act(&store, Action::ApproveRun { id, seen: None })?);
+        say(api::act(
+            &store,
+            Action::ApproveRun {
+                id,
+                seen: None,
+                drop: drop.to_vec(),
+            },
+        )?);
     } else if reject {
         say(api::act(
             &store,
@@ -2646,8 +2818,37 @@ fn retry_run(id: i64) -> Result<()> {
         )
         .into());
     }
-    let target = if dispatch::is_signal(&run.task_key) {
-        format!("{}:{}", run.project, run.task_key)
+    let line = |key: &str| -> Result<String> {
+        store
+            .tasks()?
+            .into_iter()
+            .find(|t| t.project == run.project && t.key == key)
+            .map(|t| format!("{}:{}", run.project, t.line))
+            .ok_or_else(|| {
+                format!(
+                    "run #{id}'s item is not in {}'s TODO.md as last scanned; `pma scan` it",
+                    run.project
+                )
+                .into()
+            })
+    };
+    // A prompt is dispatched again from the text the run kept.
+    let prompt =
+        match run.task_key == dispatch::PROMPT {
+            true => Some(run.description.clone().ok_or_else(|| {
+                format!("run #{id} kept no prompt; dispatch it again with --prompt")
+            })?),
+            false => None,
+        };
+    let targets = if dispatch::is_signal(&run.task_key) {
+        vec![format!("{}:{}", run.project, run.task_key)]
+    } else if prompt.is_some() {
+        vec![run.project.clone()]
+    } else if run.task_key == dispatch::BUNDLE {
+        run.items
+            .iter()
+            .map(|i| line(&i.key))
+            .collect::<Result<Vec<_>>>()?
     } else if dispatch::without_item(&run.task_key) {
         return Err(format!(
             "run #{id} is part of `{}`; run that again instead",
@@ -2655,18 +2856,7 @@ fn retry_run(id: i64) -> Result<()> {
         )
         .into());
     } else {
-        let line = store
-            .tasks()?
-            .into_iter()
-            .find(|t| t.project == run.project && t.key == run.task_key)
-            .map(|t| t.line)
-            .ok_or_else(|| {
-                format!(
-                    "run #{id}'s item is not in {}'s TODO.md as last scanned; `pma scan` it",
-                    run.project
-                )
-            })?;
-        format!("{}:{line}", run.project)
+        vec![line(&run.task_key)?]
     };
     say(api::act(
         &store,
@@ -2682,7 +2872,7 @@ fn retry_run(id: i64) -> Result<()> {
         .last()
         .and_then(|a| a.model.clone());
     run_dispatch(
-        &[target],
+        &targets,
         &[],
         false,
         None,
@@ -2693,6 +2883,7 @@ fn retry_run(id: i64) -> Result<()> {
             model,
             preset: None,
         },
+        prompt.as_deref(),
     )
 }
 
@@ -2806,6 +2997,7 @@ fn run_campaign(name: &str, count: Option<usize>) -> Result<()> {
             quadrant: None,
             local: false,
             workspace: cfg.workspace,
+            items: Vec::new(),
         });
     }
     if picks.is_empty() {
@@ -4468,6 +4660,65 @@ fn render(view: View) -> String {
 mod tests {
     use super::*;
 
+    fn pick(project: &str, key: &str) -> dispatch::Pick {
+        dispatch::Pick {
+            workflow: None,
+            project: project.into(),
+            repo: std::path::PathBuf::from("/r"),
+            key: key.into(),
+            text: format!("task {key}"),
+            gh: None,
+            tier: None,
+            class: None,
+            details: None,
+            quadrant: None,
+            local: false,
+            workspace: config::Workspace::Clone,
+            items: Vec::new(),
+        }
+    }
+
+    /// One project's items are one run; a lone item and a signal keep their
+    /// own.
+    #[test]
+    fn items_named_in_one_project_are_one_bundle() {
+        let picks = vec![
+            pick("a", "1"),
+            pick("b", "1"),
+            pick("a", "ci"),
+            pick("a", "2"),
+        ];
+        let (out, warnings) = bundled(picks);
+        assert!(warnings.is_empty());
+        let got: Vec<(&str, &str, &str)> = out
+            .iter()
+            .map(|p| (p.project.as_str(), p.key.as_str(), p.text.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("a", "ci", "task ci"),
+                ("a", "bundle", "task 1; task 2"),
+                ("b", "1", "task 1"),
+            ]
+        );
+        let keys: Vec<&str> = out[1].items.iter().map(|i| i.key.as_str()).collect();
+        assert_eq!(keys, ["1", "2"]);
+
+        // Too many in one project passes that project over, not the rest.
+        let mut many: Vec<_> = (0..=dispatch::BUNDLE_MAX)
+            .map(|n| pick("a", &n.to_string()))
+            .collect();
+        many.push(pick("b", "1"));
+        let (out, warnings) = bundled(many);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].project, "b");
+        assert!(
+            warnings[0].contains("9 tasks named; a bundle takes at most 8"),
+            "{warnings:?}"
+        );
+    }
+
     /// A front end queues a long action as the CLI command it names, so each
     /// one must be a command the CLI accepts, or the job fails on start.
     #[test]
@@ -4499,6 +4750,7 @@ mod tests {
                 count: Some(2),
                 retry: false,
                 worker: worker.clone(),
+                prompt: None,
             },
             Action::Dispatch {
                 targets: vec!["a:3".into()],
@@ -4507,6 +4759,16 @@ mod tests {
                 count: None,
                 retry: true,
                 worker: worker.clone(),
+                prompt: None,
+            },
+            Action::Dispatch {
+                targets: vec!["a".into()],
+                tags: vec![],
+                auto: false,
+                count: None,
+                retry: false,
+                worker: worker.clone(),
+                prompt: Some("-audit the error paths\nand fix them".into()),
             },
             Action::WorkflowRun {
                 name: "w".into(),

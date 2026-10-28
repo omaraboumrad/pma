@@ -243,6 +243,15 @@ fn route(req: &Request, ctx: &Ctx) -> Response {
                 let chooses = keys::BINDINGS
                     .iter()
                     .any(|b| b.command == Command::Act(act) && matches!(b.ask, Ask::Choose(_)));
+                let checks = keys::BINDINGS
+                    .iter()
+                    .any(|b| b.command == Command::Act(act) && matches!(b.ask, Ask::Check(_)));
+                if checks {
+                    out["items"] = api::checklist(store, act, &pick)?
+                        .into_iter()
+                        .map(|(text, on)| json!({ "text": text, "on": on }))
+                        .collect();
+                }
                 if chooses {
                     let c = api::choices(store, act)?;
                     out["options"] = c
@@ -415,6 +424,7 @@ fn keys_json() -> Value {
                 Ask::Confirm => json!({ "kind": "confirm" }),
                 Ask::Text(label) => json!({ "kind": "text", "label": label }),
                 Ask::Choose(label) => json!({ "kind": "choose", "label": label }),
+                Ask::Check(label) => json!({ "kind": "check", "label": label }),
             };
             json!({
                 "key": b.key,
@@ -507,6 +517,9 @@ fn pick_json(p: &Pick) -> Value {
             target,
             retry,
         } => json!({ "kind": "task", "project": project, "target": target, "retry": retry }),
+        Pick::Tasks { targets, retry } => {
+            json!({ "kind": "tasks", "targets": targets, "retry": retry })
+        }
         Pick::Manual { project } => json!({ "kind": "manual", "project": project }),
         Pick::Run {
             id,
@@ -551,6 +564,15 @@ fn pick_from(v: &Value) -> Option<Pick> {
         "task" => Pick::Task {
             project: s("project")?,
             target: s("target")?,
+            retry: b("retry")?,
+        },
+        "tasks" => Pick::Tasks {
+            targets: v["targets"]
+                .as_array()?
+                .iter()
+                .map(|t| t.as_str().map(String::from))
+                .collect::<Option<Vec<_>>>()
+                .filter(|t| !t.is_empty())?,
             retry: b("retry")?,
         },
         "manual" => Pick::Manual {

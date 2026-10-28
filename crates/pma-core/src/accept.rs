@@ -48,6 +48,13 @@ pub fn review_reasons(run: &Run) -> Vec<String> {
             class.name()
         ));
     }
+    // Passing gates say the change is sound, not which items it finished.
+    if !run.items.is_empty() {
+        reasons.push(format!(
+            "a bundle of {} items: its approver says which are done",
+            run.items.len()
+        ));
+    }
     if run.commits.unwrap_or(0) > 0 {
         reasons.push("the agent committed; it was told not to".into());
     }

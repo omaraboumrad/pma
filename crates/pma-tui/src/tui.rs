@@ -48,6 +48,12 @@ pub enum Request {
         pick: Pick,
         label: &'static str,
     },
+    /// The rows `api::checklist` gives for an act, to check.
+    Check {
+        act: Act,
+        pick: Pick,
+        label: &'static str,
+    },
     Quit,
 }
 
@@ -80,6 +86,16 @@ enum Mode {
         at: usize,
         on: Vec<bool>,
         filter: Option<String>,
+    },
+    /// Rows to check or uncheck for an act, such as a bundle's items before
+    /// its approval.
+    Check {
+        act: Act,
+        label: &'static str,
+        pick: Pick,
+        items: Vec<String>,
+        on: Vec<bool>,
+        at: usize,
     },
 }
 
@@ -140,6 +156,8 @@ pub struct App {
     status: Option<(String, Tone)>,
     /// Runs and jobs the footer names, oldest first; Enter opens the first.
     notices: Vec<api::Transition>,
+    /// Tasks marked on the current view, which `d` dispatches together.
+    marks: Vec<Pick>,
     busy: bool,
     palette: Palette,
 }
@@ -169,6 +187,7 @@ impl App {
             mode: Mode::Normal,
             status: None,
             notices: Vec::new(),
+            marks: Vec::new(),
             busy: false,
             palette: Palette::from_env(),
         }
@@ -287,6 +306,22 @@ impl App {
                     .unwrap_or(self.pane[t].min(panes.len().saturating_sub(1)));
             }
         }
+        // A mark on a row no longer shown would be dispatched unseen. One
+        // still shown takes the row's pick as it is now: its `retry` moves.
+        if tab == self.tab
+            && let Body::Panes(panes) = &s.body
+        {
+            let rows: Vec<&Pick> = panes
+                .iter()
+                .flat_map(|p| &p.items)
+                .map(|i| &i.pick)
+                .collect();
+            self.marks = self
+                .marks
+                .iter()
+                .filter_map(|m| rows.iter().find(|p| same_task(m, p)).map(|p| (*p).clone()))
+                .collect();
+        }
         self.screens[t] = Some(Ok(s));
     }
 
@@ -313,6 +348,39 @@ impl App {
                 };
             }
             Err(e) => self.say(e, Tone::Bad),
+        }
+    }
+
+    /// The checklist for an act arrived. An empty one asks nothing: the act
+    /// is done at once, and its request returned.
+    pub fn checking(
+        &mut self,
+        act: Act,
+        pick: Pick,
+        label: &'static str,
+        items: std::result::Result<Vec<(String, bool)>, String>,
+    ) -> Option<Request> {
+        match items {
+            Ok(items) if items.is_empty() => {
+                let (_, pane) = self.pick();
+                self.ask_done(act, &pick, &pane, "")
+            }
+            Ok(items) => {
+                let (items, on) = items.into_iter().unzip();
+                self.mode = Mode::Check {
+                    act,
+                    label,
+                    pick,
+                    items,
+                    on,
+                    at: 0,
+                };
+                None
+            }
+            Err(e) => {
+                self.say(e, Tone::Bad);
+                None
+            }
         }
     }
 
@@ -395,7 +463,12 @@ impl App {
                 let action = action.clone();
                 self.mode = Mode::Normal;
                 return match key {
-                    "y" => Some(Request::Act(action)),
+                    "y" => {
+                        if matches!(action, Action::Dispatch { .. }) {
+                            self.marks.clear();
+                        }
+                        Some(Request::Act(action))
+                    }
                     _ => {
                         self.say("Cancelled.", Tone::Muted);
                         None
@@ -486,6 +559,32 @@ impl App {
                 }
                 return None;
             }
+            Mode::Check { items, on, at, .. } => {
+                match key {
+                    "j" | "ArrowDown" => *at = (*at + 1).min(items.len().saturating_sub(1)),
+                    "k" | "ArrowUp" => *at = at.saturating_sub(1),
+                    " " => on[*at] = !on[*at],
+                    "Escape" => {
+                        self.mode = Mode::Normal;
+                        self.say("Cancelled.", Tone::Muted);
+                    }
+                    "Enter" => {
+                        let Mode::Check { act, pick, on, .. } =
+                            std::mem::replace(&mut self.mode, Mode::Normal)
+                        else {
+                            unreachable!("in a checklist");
+                        };
+                        let off: Vec<String> = (1..=on.len())
+                            .filter(|n| !on[n - 1])
+                            .map(|n| n.to_string())
+                            .collect();
+                        let (_, pane) = self.pick();
+                        return self.ask_done(act, &pick, &pane, &off.join(","));
+                    }
+                    _ => {}
+                }
+                return None;
+            }
             Mode::Normal => {}
         }
         if !self.notices.is_empty() {
@@ -509,6 +608,7 @@ impl App {
             Command::Tab(tab) => {
                 self.tab = tab;
                 self.status = None;
+                self.marks.clear();
                 return Some(Request::Load(self.query()));
             }
             Command::Down | Command::Up | Command::First | Command::Last => {
@@ -554,7 +654,10 @@ impl App {
             }
             Command::Back => {
                 self.status = None;
-                if self.tab == Tab::Project {
+                if !self.marks.is_empty() {
+                    self.marks.clear();
+                    self.say("Marks cleared.", Tone::Muted);
+                } else if self.tab == Tab::Project {
                     self.tab = self.previous;
                     return Some(Request::Load(self.query()));
                 }
@@ -573,8 +676,31 @@ impl App {
             }
             Command::Help => self.mode = Mode::Help,
             Command::Quit => return Some(Request::Quit),
+            Command::Mark => {
+                let pick = self.pick().0;
+                if !matches!(pick, Pick::Task { .. }) {
+                    self.say("Only a task can be marked.", Tone::Warn);
+                    return None;
+                }
+                match self.marks.iter().position(|m| same_task(m, &pick)) {
+                    Some(i) => {
+                        self.marks.remove(i);
+                    }
+                    None => self.marks.push(pick),
+                }
+                match self.marks.len() {
+                    0 => self.say("No task marked.", Tone::Muted),
+                    n => self.say(
+                        format!("{n} marked; d dispatches them, one run per project. Esc clears."),
+                        Tone::Accent,
+                    ),
+                }
+            }
             Command::Act(act) => {
-                let (pick, pane) = self.pick();
+                let (mut pick, pane) = self.pick();
+                if act == Act::Dispatch && !self.marks.is_empty() {
+                    pick = screen::marked(&self.marks);
+                }
                 return self.begin(act, binding.ask, pick, pane);
             }
         }
@@ -584,6 +710,7 @@ impl App {
     /// Opens `name`'s project view, remembering where it was opened from.
     fn open_project(&mut self, name: String) -> Request {
         self.project = name;
+        self.marks.clear();
         if self.tab != Tab::Project {
             self.previous = self.tab;
         }
@@ -606,6 +733,7 @@ impl App {
                 None
             }
             Ask::Choose(label) => Some(Request::Choose { act, pick, label }),
+            Ask::Check(label) => Some(Request::Check { act, pick, label }),
             Ask::Confirm => match screen::action_in(act, &pick, &pane, "", &self.project) {
                 Ok(action) => {
                     self.mode = Mode::Confirm {
@@ -689,6 +817,13 @@ impl App {
                 filter,
                 ..
             } => self.render_choose(frame, body, label, &choices, at, &on, filter.as_deref()),
+            Mode::Check {
+                label,
+                items,
+                on,
+                at,
+                ..
+            } => self.render_check(frame, body, label, &items, &on, at),
             Mode::Normal => {}
         }
     }
@@ -785,6 +920,17 @@ impl App {
                 pairs.extend([("j/k", "scroll"), ("PgDn/PgUp", "page"), ("Esc", "close")]);
                 return hints(p, &pairs);
             }
+            Mode::Check { .. } => {
+                return hints(
+                    p,
+                    &[
+                        ("j/k", "move"),
+                        ("Space", "toggle"),
+                        ("Enter", "submit"),
+                        ("Esc", "cancel"),
+                    ],
+                );
+            }
             Mode::Help => return hints(p, &[("any key", "close")]),
             Mode::Normal => {}
         }
@@ -808,6 +954,7 @@ impl App {
                     ) || pick.project().is_some()
                 }
                 Command::OpenProject => pick.project().is_some(),
+                Command::Mark => matches!(pick, Pick::Task { .. }),
                 _ => false,
             })
             .chain(
@@ -943,27 +1090,51 @@ impl App {
                 }
             })
             .collect();
-        let header = Row::new(shown.iter().map(|i| &pane.columns[*i]).map(|c| {
-            let cell = TableCell::from(c.title.to_uppercase());
-            match c.kind {
-                Kind::Number => cell.content(Text::from(c.title.to_uppercase()).right_aligned()),
-                _ => cell,
-            }
-        }))
+        // A column for marks, only while this pane holds one.
+        let marked = |pick: &Pick| self.marks.iter().any(|m| same_task(m, pick));
+        let marking = pane.items.iter().any(|it| marked(&it.pick));
+        let mut widths = widths;
+        if marking {
+            widths.insert(0, Constraint::Length(1));
+        }
+        let header = Row::new(marking.then(|| TableCell::from("")).into_iter().chain(
+            shown.iter().map(|i| &pane.columns[*i]).map(|c| {
+                let cell = TableCell::from(c.title.to_uppercase());
+                match c.kind {
+                    Kind::Number => {
+                        cell.content(Text::from(c.title.to_uppercase()).right_aligned())
+                    }
+                    _ => cell,
+                }
+            }),
+        ))
         .style(p.muted().add_modifier(Modifier::BOLD));
         let rows = pane.items.iter().map(|it| {
+            let marked = marked(&it.pick);
+            let mark = marking.then(|| {
+                TableCell::from(Span::styled(
+                    if marked { "+" } else { "" },
+                    p.accent().add_modifier(Modifier::BOLD),
+                ))
+            });
             Row::new(
-                shown
-                    .iter()
-                    .map(|i| (&it.cells[*i], &pane.columns[*i]))
-                    .map(|(c, col)| {
-                        let text = Text::from(Span::styled(c.text.clone(), p.tone(c.tone)));
-                        TableCell::from(match col.kind {
-                            Kind::Number => text.right_aligned(),
-                            _ => text,
-                        })
-                    }),
+                mark.into_iter().chain(
+                    shown
+                        .iter()
+                        .map(|i| (&it.cells[*i], &pane.columns[*i]))
+                        .map(|(c, col)| {
+                            let text = Text::from(Span::styled(c.text.clone(), p.tone(c.tone)));
+                            TableCell::from(match col.kind {
+                                Kind::Number => text.right_aligned(),
+                                _ => text,
+                            })
+                        }),
+                ),
             )
+            .style(match marked {
+                true => Style::new().add_modifier(Modifier::BOLD),
+                false => Style::new(),
+            })
         });
         Table::new(rows, widths)
             .header(header)
@@ -1244,6 +1415,53 @@ impl App {
         );
     }
 
+    fn render_check(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        label: &str,
+        items: &[String],
+        on: &[bool],
+        at: usize,
+    ) {
+        let p = self.palette;
+        let lines: Vec<Line> = items
+            .iter()
+            .zip(on)
+            .enumerate()
+            .map(|(i, (text, on))| {
+                let cursor = match i == at {
+                    true => Span::styled("> ", p.accent().add_modifier(Modifier::BOLD)),
+                    false => Span::raw("  "),
+                };
+                let (box_, tone) = match on {
+                    true => ("[x] ", p.tone(Tone::Good)),
+                    false => ("[ ] ", p.muted()),
+                };
+                Line::from(vec![
+                    cursor,
+                    Span::styled(box_, tone),
+                    Span::raw(format!("{}. {text}", i + 1)),
+                ])
+            })
+            .collect();
+        let height = (lines.len() as u16 + 2).min(area.height);
+        let longest = lines.iter().map(Line::width).max().unwrap_or(0) as u16 + 4;
+        let area = centered(area, longest.min(area.width), height);
+        frame.render_widget(Clear, area);
+        frame.render_widget(
+            Paragraph::new(lines)
+                .scroll((
+                    at.saturating_sub(height.saturating_sub(3) as usize) as u16,
+                    0,
+                ))
+                .block(
+                    dialog(p, &format!(" {label} "), p.accent()).padding(Padding::horizontal(1)),
+                ),
+            area,
+        );
+    }
+
     fn render_prompt(&self, frame: &mut Frame, label: &str, input: &str) {
         let p = self.palette;
         let area = centered(frame.area(), 70.min(frame.area().width), 5);
@@ -1407,6 +1625,11 @@ pub fn key_name(code: KeyCode) -> Option<String> {
     })
 }
 
+/// Whether two picks are the same task, whatever else about it changed.
+fn same_task(a: &Pick, b: &Pick) -> bool {
+    matches!((a, b), (Pick::Task { target: x, .. }, Pick::Task { target: y, .. }) if x == y)
+}
+
 /// Puts the act that moves `pick` on (`screen::next_act`) first, so a
 /// footer cut short at the terminal's width still shows it.
 fn next_first(bindings: &mut [&keys::Binding], pick: &Pick) {
@@ -1445,6 +1668,12 @@ fn execute(store: &Store, app: &mut App, request: Request) {
         Request::Prompt { act, pick, label } => {
             let input = api::initial_input(store, act, &pick).map_err(|e| e.to_string());
             app.prompted(act, pick, label, input);
+        }
+        Request::Check { act, pick, label } => {
+            let items = api::checklist(store, act, &pick).map_err(|e| e.to_string());
+            if let Some(next) = app.checking(act, pick, label, items) {
+                execute(store, app, next);
+            }
         }
         Request::Quit => {}
     }
@@ -1713,6 +1942,100 @@ mod tests {
         app.key("Escape");
         assert!(app.idle());
         assert_eq!(app.key("q"), Some(Request::Quit));
+    }
+
+    /// Space marks tasks; `d` then dispatches the marked ones together,
+    /// whichever row is selected. A dispatch, Escape or another view clears
+    /// the marks.
+    #[test]
+    fn marked_tasks_are_dispatched_together() {
+        let mut app = App::new();
+        // Two tasks for agents; the second's `retry` as given.
+        let view = |retry: bool| {
+            let mut lists = next_view_lists();
+            let mut second = lists.agents[0].clone();
+            second.cells[0] = "a:9".into();
+            second.subject = Subject::Task {
+                project: "a".into(),
+                target: "a:9".into(),
+                retry,
+            };
+            lists.agents.push(second);
+            View::Next {
+                header: String::new(),
+                limit: None,
+                lists,
+                repos: Default::default(),
+            }
+        };
+        app.loaded(Ok(view(false)));
+        app.key(" ");
+        app.key("j");
+        app.key(" ");
+        assert_eq!(app.marks.len(), 2);
+        // A refresh that moves a marked task's `retry` keeps the mark.
+        app.loaded(Ok(view(true)));
+        assert_eq!(app.marks.len(), 2, "{:?}", app.marks);
+        assert!(screen_text(&mut app).contains("2 marked"));
+        app.key("Tab");
+        app.key(" ");
+        assert!(
+            app.status.as_ref().unwrap().0.contains("Only a task"),
+            "a run is not marked"
+        );
+        assert_eq!(app.key("d"), None);
+        assert!(screen_text(&mut app).contains("dispatch 2 tasks (a:5, a:9)?"));
+        let Some(Request::Act(Action::Dispatch { targets, .. })) = app.key("y") else {
+            panic!("a dispatch");
+        };
+        assert_eq!(targets, ["a:5", "a:9"]);
+        assert!(app.marks.is_empty());
+
+        app.key("Tab");
+        app.key(" ");
+        app.key("Escape");
+        assert!(app.marks.is_empty());
+        app.key(" ");
+        app.key("2");
+        assert!(app.marks.is_empty(), "another view clears them");
+    }
+
+    /// Approving a run asks for its checklist first. A bundle's items come
+    /// back checked or not; what is left unchecked is dropped. A run with
+    /// none is approved without a question.
+    #[test]
+    fn a_bundle_approval_checks_its_items() {
+        let mut app = App::new();
+        app.loaded(Ok(next_view()));
+        app.key("Tab");
+        let Some(Request::Check { act, pick, label }) = app.key("a") else {
+            panic!("a checklist request");
+        };
+        assert_eq!(act, Act::ApproveRun);
+        let items = vec![
+            ("one".to_string(), true),
+            ("two".to_string(), true),
+            ("three".to_string(), false),
+        ];
+        assert_eq!(app.checking(act, pick.clone(), label, Ok(items)), None);
+        let out = screen_text(&mut app);
+        assert!(
+            out.contains("[x] 1. one") && out.contains("[ ] 3. three"),
+            "{out}"
+        );
+        app.key("j");
+        app.key(" ");
+        let Some(Request::Act(Action::ApproveRun { id, drop, .. })) = app.key("Enter") else {
+            panic!("an approval");
+        };
+        assert_eq!((id, drop), (4, vec![2, 3]));
+
+        let Some(Request::Act(Action::ApproveRun { drop, .. })) =
+            app.checking(act, pick, label, Ok(vec![]))
+        else {
+            panic!("approved without a question");
+        };
+        assert!(drop.is_empty());
     }
 
     /// `o` opens the selected row's project; Escape goes back to where it was
@@ -1987,6 +2310,14 @@ mod tests {
                     at: 0,
                     on: vec![],
                     filter: Some("rev".into()),
+                },
+                Mode::Check {
+                    act: Act::ApproveRun,
+                    label: "items done",
+                    pick: Pick::Nothing,
+                    items: vec!["a long item text".into(), "another".into()],
+                    on: vec![true, false],
+                    at: 1,
                 },
             ];
             for mode in modes {

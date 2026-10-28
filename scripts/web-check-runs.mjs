@@ -1,21 +1,22 @@
 // Drives the run paths of `pma web` in headless Chromium: a run's detail,
-// the toolbar and More, the commit prompt and its notice, reject, the
-// activity filter, 720 px. Needs a fresh web-fixture.sh store: it commits
-// run #1 and rejects run #2, so a second pass fails.
+// the toolbar and More, the commit prompt and its notice, reject, a
+// bundle's approval checklist, the activity filter, 720 px. Needs a fresh
+// web-fixture.sh store: it commits run #1, rejects run #2 and approves run
+// #3, so a second pass fails.
 //
 //   node scripts/web-check-runs.mjs <token-url> <dir>/root/alpha
 //
 // $CHROME overrides the browser, as in web-check.mjs.
 import { spawn, execFileSync } from "node:child_process";
 import { mkdtempSync } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
 const [url, clone] = process.argv.slice(2);
 const chrome = process.env.CHROME
   || `${homedir()}/Library/Caches/ms-playwright/chromium_headless_shell-1234/chrome-headless-shell-mac-arm64/chrome-headless-shell`;
 const origin = new URL(url).origin;
-const profile = mkdtempSync(join(process.env.TMPDIR, "cdp-"));
+const profile = mkdtempSync(join(process.env.TMPDIR || tmpdir(), "cdp-"));
 const proc = spawn(chrome, ["--headless", "--remote-debugging-port=9336", `--user-data-dir=${profile}`, "--window-size=1100,900", "about:blank"], { stdio: "ignore" });
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 let target;
@@ -101,6 +102,23 @@ await js(`document.getElementById("dialog-ok").click()`);
 const rejected = await waitFor(`[...document.querySelectorAll(".toast p")].some(p => p.textContent.startsWith("Run #2 rejected"))`);
 check("a reject says what it did", rejected, await toasts());
 console.log(`  ${(await toasts()).find((t) => t.startsWith("Run #2")) || ""}`);
+
+// Approving bundle #3 lists its items, checked; the one unchecked is left
+// open, as `pma review 3` shows.
+await send("Page.navigate", { url: `${origin}/?tab=inbox&open=run:3` });
+await waitFor(`!!document.querySelector(".detail")`);
+await js(`document.activeElement && document.activeElement.blur()`);
+await key("a", "a");
+await waitFor(`document.getElementById("dialog").open`);
+const items = await js(`[...document.querySelectorAll(".checklist input")].map(i => i.checked)`);
+check("approval lists the bundle's items, checked", JSON.stringify(items) === "[true,true]", items);
+await js(`document.querySelectorAll(".checklist input")[1].click()`);
+await js(`document.getElementById("dialog-ok").click()`);
+await waitFor(`[...document.querySelectorAll(".toast p")].some(p => p.textContent.includes("done"))`);
+const pma = new URL("../target/debug/pma", import.meta.url).pathname;
+let review = "";
+try { review = execFileSync(pma, ["review", "3"]).toString(); } catch (e) { review = String(e); }
+check("the unchecked item is left open", review.startsWith("#3 approved") && review.includes("2. fourth task  (left open)"), review);
 
 // Activity lists it under Rejected.
 await send("Page.navigate", { url: `${origin}/?tab=activity&finished=rejected` });

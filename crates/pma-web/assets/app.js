@@ -32,6 +32,7 @@ const S = {
   projects: [], // every project, worst first: { name, tier, state, tone }
   filter: "",
   restoring: false, // the view is being set from the address
+  marks: [], // task picks marked on this view, which dispatch takes together
 };
 
 const $ = (id) => document.getElementById(id);
@@ -96,7 +97,7 @@ function lookup(key) {
   const fit = S.keys.bindings.filter((b) => b.key === key);
   const onTab = fit.filter((b) => b.tabs.includes(S.tab));
   const cands = onTab.length ? onTab : fit.filter((b) => b.tabs.length === 0);
-  const fits = currentActs();
+  const fits = S.marks.length && !S.detail ? currentActs().concat("Dispatch") : currentActs();
   return cands.find((b) => b.command.kind === "act" && fits.includes(b.command.act))
     || cands.find((b) => b.command.kind !== "act")
     || cands[0];
@@ -147,6 +148,25 @@ function currentPick() {
   if (S.detail) return S.detail.pick;
   const s = selected();
   return s ? s.item.pick : { kind: "nothing" };
+}
+
+// ---------------------------------------------------------------- marks
+
+const sameTask = (a, b) => a.kind === "task" && b.kind === "task" && a.target === b.target;
+const isMarked = (pick) => S.marks.some((m) => sameTask(m, pick));
+
+function toggleMark(pick) {
+  if (pick.kind !== "task") {
+    toast("Only a task can be marked.", "warn");
+    return;
+  }
+  S.marks = isMarked(pick) ? S.marks.filter((m) => !sameTask(m, pick)) : S.marks.concat(pick);
+  draw();
+}
+
+// The marked tasks as one pick, as `screen::marked` builds it.
+function markedPick() {
+  return { kind: "tasks", targets: S.marks.map((m) => m.target), retry: S.marks.some((m) => m.retry) };
 }
 
 function currentActs() {
@@ -242,6 +262,9 @@ async function load() {
     p = first >= 0 ? first : 0;
   }
   S.pane[S.tab] = p;
+  // A mark on a row no longer shown would be dispatched unseen.
+  const shown = ps.flatMap((x) => x.items.map((i) => i.pick));
+  S.marks = S.marks.filter((m) => shown.some((x) => sameTask(m, x)));
   draw();
 }
 
@@ -322,6 +345,7 @@ async function loadProjects() {
 }
 
 function openProject(name) {
+  S.marks = [];
   if (S.tab !== "project") S.previous = S.tab;
   S.tab = "project";
   S.project = name;
@@ -410,10 +434,22 @@ function draw() {
     });
   }
   for (const b of acts(false).filter((b) => b.tabs.length)) toolbar.append(button(b));
+  if (S.marks.length) {
+    const dispatch = acts(true).find((b) => b.command.act === "Dispatch");
+    const back = onTab().find((b) => b.command.kind === "Back");
+    toolbar.append(el("span", { class: "sep", "aria-hidden": "true" }));
+    if (dispatch) {
+      toolbar.append(el("button", { class: "button primary", type: "button", onclick: () => act(dispatch) },
+        `Dispatch ${S.marks.length} marked`, el("kbd", {}, dispatch.key)));
+    }
+    toolbar.append(el("button", { class: "button", type: "button", onclick: () => { S.marks = []; draw(); } },
+      "Clear marks", back ? el("kbd", {}, back.key) : null));
+  }
   // The selected row's acts, after the view's: what the key would do to it.
+  // With tasks marked, dispatch is theirs, above.
   const sel = selected();
   if (sel) {
-    const fit = sel.item.acts;
+    const fit = sel.item.acts.filter((a) => !(S.marks.length && a === "Dispatch"));
     const own = acts(true).filter((b) => fit.includes(b.command.act));
     const proj = onTab().find((b) => b.command.kind === "OpenProject");
     const open = onTab().find((b) => b.command.kind === "Open");
@@ -523,17 +559,32 @@ function card(p, pi) {
   }
   // A column no row fills says nothing; it is left out.
   const shown = p.columns.map((_, i) => i).filter((i) => p.items.some((it) => it.cells[i] && it.cells[i].text));
-  const head = el("tr", {}, shown.map((i) => el("th", { scope: "col", class: p.columns[i].kind }, p.columns[i].title)));
+  // A checkbox per task, where the view binds marking.
+  const markable = onTab().some((b) => b.command.kind === "Mark") && p.items.some((it) => it.pick.kind === "task");
+  const head = el("tr", {},
+    markable ? el("th", { scope: "col", class: "mark" }, el("span", { class: "visually-hidden" }, "Marked")) : null,
+    shown.map((i) => el("th", { scope: "col", class: p.columns[i].kind }, p.columns[i].title)));
   const body = el("tbody");
   const foot = el("tfoot");
   p.items.forEach((item, ii) => {
     const sel = focused && ii === S.sel[S.tab][pi];
     const total = item.cells.every((c) => c.tone === "strong");
     // A row with a detail opens on one click; any other row is selected.
+    const box = markable && item.pick.kind === "task"
+      ? el("input", {
+        type: "checkbox",
+        "aria-label": `Mark ${item.pick.target}`,
+        onclick: (e) => { e.stopPropagation(); toggleMark(item.pick); },
+      })
+      : null;
+    if (box) box.checked = isMarked(item.pick);
     const tr = el("tr", {
+      class: box && box.checked ? "marked" : "",
       "aria-selected": String(sel),
       onclick: () => { select(pi, ii); if (opens(item.pick)) run(lookup("Enter")); },
-    }, shown.map((i) => el("td", { class: p.columns[i].kind }, cellNode(item.cells[i], p.columns[i]))));
+    },
+    markable ? el("td", { class: "mark" }, box) : null,
+    shown.map((i) => el("td", { class: p.columns[i].kind }, cellNode(item.cells[i], p.columns[i]))));
     (total ? foot : body).append(tr);
     if (sel) requestAnimationFrame(() => tr.scrollIntoView({ block: "nearest" }));
   });
@@ -623,6 +674,18 @@ function chooser(asked, name) {
   return box;
 }
 
+// Rows to check, numbered from 1; `read` gives the numbers left unchecked,
+// as `keys::Ask::Check` takes them.
+function checklist(items, name) {
+  const box = el("fieldset", { class: "options checklist" },
+    el("legend", { class: "visually-hidden" }, name),
+    items.map((it, i) => el("label", { class: "option" },
+      el("input", { type: "checkbox", value: String(i + 1), checked: it.on }),
+      el("span", {}, `${i + 1}. `, ...inline(it.text)))));
+  box.read = () => [...box.querySelectorAll("input:not(:checked)")].map((i) => i.value).join(",");
+  return box;
+}
+
 // One dialog serves a question, a prompt and a list. Resolves to the input's
 // value, what `read` gives, true for OK, or null when cancelled.
 function dialog({ title, text, field, input, ok, okClass, cancel, read }) {
@@ -681,8 +744,9 @@ function shortcuts() {
 // ---------------------------------------------------------------- acting
 
 async function act(b) {
-  const pick = currentPick();
   const name = b.command.act;
+  const marked = name === "Dispatch" && S.marks.length > 0 && !S.detail;
+  const pick = marked ? markedPick() : currentPick();
   let input = "";
   try {
     if (b.ask.kind !== "nothing") {
@@ -695,6 +759,14 @@ async function act(b) {
           cancel: true,
         });
         if (!yes) return;
+      } else if (b.ask.kind === "check") {
+        // No rows, as for a run that is not a bundle: nothing to ask.
+        if (asked.items.length) {
+          const node = checklist(asked.items, label(b.ask.label));
+          const left = await dialog({ title: label(b.label), text: node, ok: label(b.label), cancel: true, read: node.read });
+          if (left === null) return;
+          input = left;
+        }
       } else if (b.ask.kind === "choose") {
         const node = chooser(asked, label(b.ask.label));
         const chosen = await dialog({ title: label(b.label), text: node, ok: label(b.label), cancel: true, read: node.read });
@@ -709,6 +781,7 @@ async function act(b) {
     const pending = toast(`${label(b.label)}...`, "accent");
     const out = await api("/api/act", { tab: S.tab, act: name, pick, input, project: S.project })
       .finally(() => pending.remove());
+    if (marked) S.marks = [];
     const lines = out.said.concat(out.warnings.map((w) => `Warning: ${w}`));
     toast(lines.length ? lines.join("\n") : `${label(b.label)}: done.`, out.warnings.length ? "warn" : "good");
   } catch (e) {
@@ -730,6 +803,7 @@ async function run(b) {
     case "tab":
       S.tab = b.command.tab;
       S.detail = null;
+      S.marks = [];
       return load();
     case "Down": move(Math.min((sel[p] || 0) + 1, len - 1)); break;
     case "Up": move(Math.max((sel[p] || 0) - 1, 0)); break;
@@ -740,6 +814,8 @@ async function run(b) {
     case "Back":
       if (S.detail) {
         S.detail = null;
+      } else if (S.marks.length) {
+        S.marks = [];
       } else if (S.tab === "project") {
         S.tab = S.previous;
         return load();
@@ -768,6 +844,7 @@ async function run(b) {
       if (pick.project) return openProject(pick.project);
       break;
     }
+    case "Mark": return toggleMark(currentPick());
     case "act": return act(b);
   }
   draw();
@@ -783,6 +860,8 @@ function onKey(e) {
   const b = lookup(e.key);
   if (!b) return;
   if (e.key === "Enter" && e.target instanceof HTMLButtonElement) return;
+  // Space on a focused button or checkbox presses it, as the browser does.
+  if (e.key === " " && (e.target instanceof HTMLButtonElement || e.target instanceof HTMLInputElement)) return;
   // Over a detail, only its own acts and Back apply; the tables beneath
   // are not what the eye is on.
   if (S.detail && !(b.command.kind === "Back" || b.command.kind === "Help"

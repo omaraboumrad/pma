@@ -73,6 +73,10 @@ pub fn publish(
             );
             continue;
         }
+        if let Some(why) = crate::dispatch::needs_approval(&run) {
+            done(&run, &Err(why));
+            continue;
+        }
         let result = match target {
             Target::Pr => open_pr(store, cfg, &mut run),
             _ => to_clone(store, home, cfg, &mut run, target, subject),
@@ -301,14 +305,14 @@ fn stage_in_clone(home: &std::path::Path, run: &mut Run, tree: &str) -> Result<S
             file.display()
         )
     })?;
-    if !crate::dispatch::without_item(&run.task_key) {
+    if !crate::dispatch::closes(run).is_empty() {
         let path = run.repo.join("TODO.md");
         if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
             return Err(format!("{}: is a symlink; pma edits only a file", path.display()).into());
         }
         let text =
             std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-        if let Some(edited) = todo::mark_done(&text, &run.task_key, &run.text) {
+        if let Some(edited) = ticked(run, &text) {
             todo::save(&path, &edited).map_err(|e| format!("{}: {e}", path.display()))?;
             git(&run.repo, &["add", "--", "TODO.md"])?;
         }
@@ -331,7 +335,7 @@ fn stage_in_clone(home: &std::path::Path, run: &mut Run, tree: &str) -> Result<S
 /// worktree's index. The file itself is left alone, so a refused stage leaves
 /// the worktree as the reviewer saw it.
 fn tick(home: &std::path::Path, run: &Run, tree: &str) -> Result<String> {
-    if crate::dispatch::without_item(&run.task_key) {
+    if crate::dispatch::closes(run).is_empty() {
         return Ok(tree.to_string());
     }
     let path = run.worktree.join("TODO.md");
@@ -341,7 +345,7 @@ fn tick(home: &std::path::Path, run: &Run, tree: &str) -> Result<String> {
         return Err(format!("{}: is a symlink; pma edits only a file", path.display()).into());
     }
     let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let Some(edited) = todo::mark_done(&text, &run.task_key, &run.text) else {
+    let Some(edited) = ticked(run, &text) else {
         return Ok(tree.to_string());
     };
     let dir = home.join("runs").join(run.id.to_string());
@@ -605,7 +609,7 @@ fn publish_one(cfg: &Config, run: &Run) -> Result<String> {
     )?;
     wt_git(run, &["read-tree", "--reset", "-u", approved])?;
     wt_git(run, &["commit", "--quiet", "-m", &message])?;
-    if !crate::dispatch::without_item(&run.task_key) {
+    if !crate::dispatch::closes(run).is_empty() {
         let path = wt.join("TODO.md");
         // The agent controls the worktree, and a symlink would point the
         // read and the write outside it.
@@ -614,7 +618,7 @@ fn publish_one(cfg: &Config, run: &Run) -> Result<String> {
         }
         let text =
             std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-        if let Some(edited) = todo::mark_done(&text, &run.task_key, &run.text) {
+        if let Some(edited) = ticked(run, &text) {
             todo::save(&path, &edited).map_err(|e| format!("{}: {e}", path.display()))?;
             wt_git(run, &["add", "TODO.md"])?;
             wt_git(run, &["commit", "--quiet", "--amend", "--no-edit"])?;
@@ -792,13 +796,46 @@ fn gh_in(dir: &std::path::Path, args: &[&str]) -> Result<String> {
     Ok(out.stdout.trim().to_string())
 }
 
+/// `text` with each item the run closes marked done; `None` when none was
+/// open in it.
+fn ticked(run: &Run, text: &str) -> Option<String> {
+    let mut out: Option<String> = None;
+    for (key, item, _) in crate::dispatch::closes(run) {
+        if let Some(edited) = todo::mark_done(out.as_deref().unwrap_or(text), key, item) {
+            out = Some(edited);
+        }
+    }
+    out
+}
+
 /// The task text as subject, unless `subject` replaces it; `Closes #N` and
-/// the co-author trailer as body.
+/// the co-author trailer as body. A bundle's subject counts its items, and
+/// its body lists the ones it closes.
 fn message(cfg: &Config, run: &Run, subject: Option<&str>) -> String {
-    let subject = subject.unwrap_or(&run.text);
+    let closes = crate::dispatch::closes(run);
+    let bundle = run.task_key == crate::dispatch::BUNDLE;
+    let counted = format!("{} TODO items", closes.len());
+    let subject = match subject {
+        Some(s) => s,
+        None if bundle => &counted,
+        None => &run.text,
+    };
     let mut body = Vec::new();
-    if let Some(n) = run.gh {
-        body.push(format!("Closes #{n}"));
+    if bundle {
+        let listed: Vec<String> = closes
+            .iter()
+            .map(|(_, text, _)| format!("- {text}"))
+            .collect();
+        body.push(listed.join("\n"));
+    }
+    // A run with no item has no issue: every such pick is made without one.
+    let issues: Vec<String> = closes
+        .iter()
+        .filter_map(|c| c.2)
+        .map(|n| format!("Closes #{n}"))
+        .collect();
+    if !issues.is_empty() {
+        body.push(issues.join("\n"));
     }
     // Only a worker whose identity `pma` knows gets a trailer. Inventing an
     // address for an unknown one would attribute the commit to nobody.
@@ -823,6 +860,34 @@ fn which(program: &str) -> Option<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A bundle's commit counts what it closes, lists it, and closes each
+    /// issue; a dropped item is in none of the three.
+    #[test]
+    fn a_bundle_message_names_the_items_it_closes() {
+        let item = |key: &str, gh, dropped| crate::store::RunItem {
+            key: key.into(),
+            text: format!("task {key}"),
+            gh,
+            dropped,
+        };
+        let run = Run {
+            task_key: crate::dispatch::BUNDLE.into(),
+            agent: "other".into(),
+            items: vec![
+                item("a", Some(7), false),
+                item("b", Some(8), true),
+                item("c", None, false),
+            ],
+            ..Run::blank()
+        };
+        let cfg = Config::default();
+        assert_eq!(
+            message(&cfg, &run, None),
+            "2 TODO items\n\n- task a\n- task c\n\nCloses #7"
+        );
+        assert!(message(&cfg, &run, Some("Fix two things")).starts_with("Fix two things\n\n"));
+    }
 
     #[test]
     fn activity_on_an_open_pull_request_reads_as_github_shows_it() {

@@ -142,6 +142,7 @@ pub fn run(req: Request) -> Result<()> {
                 false,
                 super::dispatch_flags(local && !req.push, req.worktree, req.push),
                 &over,
+                None,
             )
         }
         Runs::Workflow(workflow_name) => {
