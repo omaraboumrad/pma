@@ -6840,3 +6840,265 @@ fn a_refresh_the_check_refuses_reaches_the_next_agent() {
         "{prompt}"
     );
 }
+
+/// A stand-in for herdr: workspaces, tabs and panes are files under
+/// `herdr/` beside its `bin`, every call is appended to `herdr/calls.log`,
+/// and `pane run` runs the command in the background, as a pane would,
+/// with the environment of whoever asked. `herdr/down` makes the server
+/// not running. A pane that is not pma's is recorded and not run, so the
+/// layout's `pma tui` never starts.
+const FAKE_HERDR: &str = r#"#!/bin/sh
+st="$(cd "$(dirname "$0")/.." && pwd)/herdr"
+mkdir -p "$st/ws" "$st/tabs" "$st/panes"
+[ "$1" = --session ] && shift 2
+echo "$*" >> "$st/calls.log"
+next() { n=$(($(cat "$st/n" 2>/dev/null || echo 0) + 1)); echo $n > "$st/n"; echo $n; }
+ok() { printf '{"id":"x","result":%s}\n' "${1:-{\}}"; }
+fail() { printf '{"id":"x","error":{"code":"x","message":"%s"}}\n' "$1"; exit 1; }
+opt() { want=$1; shift; while [ $# -gt 0 ]; do [ "$1" = "$want" ] && { echo "$2"; return; }; shift; done; }
+case "$1 $2" in
+  "server ") rm -f "$st/down"; exit 0 ;;
+  "session stop") touch "$st/down"; exit 0 ;;
+esac
+[ -e "$st/down" ] && fail "no herdr server is running"
+case "$1 $2" in
+  "workspace list")
+    list=""; for f in "$st"/ws/*; do [ -e "$f" ] || continue
+      list="$list${list:+,}{\"workspace_id\":\"$(basename "$f")\",\"label\":\"$(cat "$f")\"}"; done
+    ok "{\"workspaces\":[$list]}" ;;
+  "workspace create")
+    w="w$(next)"; opt --label "$@" > "$st/ws/$w"; p="$w:p1"; touch "$st/panes/$p"
+    ok "{\"workspace\":{\"workspace_id\":\"$w\"},\"root_pane\":{\"pane_id\":\"$p\",\"tab_id\":\"$w:t1\",\"terminal_id\":\"term_$p\"}}" ;;
+  "tab create")
+    n=$(next); w=$(opt --workspace "$@"); t="$w:t$n"; p="$w:p$n"
+    opt --label "$@" > "$st/tabs/$t"; echo "$t" > "$st/panes/$p"
+    ok "{\"tab\":{\"tab_id\":\"$t\"},\"root_pane\":{\"pane_id\":\"$p\",\"tab_id\":\"$t\",\"terminal_id\":\"term_$p\"}}" ;;
+  "tab close")
+    [ -e "$st/tabs/$3" ] || fail "tab $3 not found"; rm "$st/tabs/$3"
+    for f in "$st"/panes/*.pid; do [ -e "$f" ] || continue
+      p=$(basename "$f" .pid); [ "$(cat "$st/panes/$p")" = "$3" ] || continue
+      pid=$(cat "$f"); pkill -HUP -P "$pid"; kill -HUP "$pid"; done
+    ok ;;
+  "pane get")
+    [ -e "$st/panes/$3" ] || fail "pane $3 not found"
+    ok "{\"pane\":{\"pane_id\":\"$3\",\"terminal_id\":\"term_$3\"}}" ;;
+  "pane run")
+    pane=$3; shift 3
+    case "$*" in *"herdr pane"*) ;; *) ok; exit 0 ;; esac
+    HERDR_ENV=1 HERDR_PANE_ID=$pane HERDR_TAB_ID=$(cat "$st/panes/$pane") \
+      sh -c "$*" > "$st/panes/$pane.out" 2>&1 < /dev/null &
+    echo $! > "$st/panes/$pane.pid"
+    ok ;;
+  *) ok ;;
+esac
+"#;
+
+/// Waits until `done` holds, for at most `seconds`.
+fn wait_until(seconds: u64, what: &str, done: impl Fn() -> bool) {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+    while !done() {
+        assert!(
+            std::time::Instant::now() < until,
+            "timed out waiting for {what}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// An agent that says what it can see of the environment, then succeeds.
+const TELLING_AGENT: &str = r#"#!/bin/sh
+echo '{"type":"assistant","message":{"content":[{"type":"text","text":"writing hello"}]}}'
+echo "token=${GH_TOKEN:-none} herdr=${HERDR_ENV:-none}" > "$(dirname "$0")/../seen.txt"
+echo hi > hello.txt
+echo '{"type":"result","subtype":"success","is_error":false,"result":"wrote hello.txt","total_cost_usd":0.1}'
+"#;
+
+/// `pma herdr` lays the session out and turns `herdr` on; a dispatch then
+/// runs its agent in a tab of `agents`, under pma's environment rather than
+/// the server's, and is reviewed as any run; rejecting it closes the tab.
+#[test]
+fn a_dispatch_runs_its_agent_in_a_herdr_tab() {
+    let s = Scratch::new("herdrtab");
+    let (env, _origin, _alpha) =
+        dispatch_env(&s, &[("claude", TELLING_AGENT), ("herdr", FAKE_HERDR)]);
+    let st = s.0.join("herdr");
+    let calls = || fs::read_to_string(st.join("calls.log")).unwrap_or_default();
+
+    let out = env
+        .command(&["herdr"])
+        .env("HERDR_ENV", "1")
+        .output()
+        .unwrap();
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{said}");
+    assert!(said.contains("herdr on"), "{said}");
+    assert_eq!(env.ok(&["config", "herdr"]).trim(), "on");
+    let log = calls();
+    assert!(log.contains("workspace create --label pma"), "{log}");
+    assert!(log.contains("workspace create --label agents"), "{log}");
+    assert!(log.contains(" tui"), "pma tui runs in the first: {log}");
+
+    let out = env
+        .command(&["dispatch", "alpha:5"])
+        .env("GH_TOKEN", "leaked")
+        .output()
+        .unwrap();
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{said}");
+    assert!(said.contains("1 ready"), "{said}");
+
+    let log = calls();
+    assert!(log.contains("--label alpha #1"), "{log}");
+    assert!(
+        log.contains("tab rename") && log.contains("alpha #1"),
+        "{log}"
+    );
+    assert!(log.contains("--state working"), "{log}");
+    wait_until(10, "the tab to report done", || {
+        calls().contains("--state idle")
+    });
+    assert_eq!(
+        fs::read_to_string(s.0.join("seen.txt")).unwrap().trim(),
+        "token=none herdr=none",
+        "the agent ran under pma's stripped environment"
+    );
+    let pane_out = fs::read_dir(st.join("panes"))
+        .unwrap()
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "out"))
+        .map(|e| fs::read_to_string(e.path()).unwrap())
+        .collect::<String>();
+    assert!(
+        pane_out.contains("writing hello"),
+        "the tab shows the agent: {pane_out}"
+    );
+    assert!(pane_out.contains("-- success, $0.10"), "{pane_out}");
+    assert!(!pane_out.contains("\"type\""), "not its JSON: {pane_out}");
+    let review = env.ok(&["review", "1"]);
+    assert!(review.contains("wrote hello.txt"), "{review}");
+
+    let tabs = s.0.join("home").join("state").join("herdr-tabs");
+    assert_eq!(fs::read_dir(&tabs).unwrap().count(), 1);
+    env.ok(&["review", "1", "--reject"]);
+    assert!(calls().contains("tab close"), "{}", calls());
+    assert_eq!(
+        fs::read_dir(&tabs).unwrap().count(),
+        0,
+        "the tab is forgotten"
+    );
+}
+
+/// With `herdr` on but no session running, the agent runs headless.
+#[test]
+fn without_the_herdr_session_an_agent_runs_headless() {
+    let s = Scratch::new("herdrdown");
+    let (env, _origin, _alpha) =
+        dispatch_env(&s, &[("claude", TELLING_AGENT), ("herdr", FAKE_HERDR)]);
+    env.ok(&["config", "herdr", "on"]);
+    fs::create_dir_all(s.0.join("herdr")).unwrap();
+    fs::write(s.0.join("herdr").join("down"), "").unwrap();
+    let out = env.ok(&["dispatch", "alpha:5"]);
+    assert!(out.contains("1 ready"), "{out}");
+    let log = fs::read_to_string(s.0.join("herdr").join("calls.log")).unwrap_or_default();
+    assert!(!log.contains("tab create"), "{log}");
+}
+
+/// An agent that runs until it is killed, leaving its pid.
+const STUCK_AGENT: &str = r#"#!/bin/sh
+echo '{"type":"system","subtype":"init","model":"m"}'
+sleep 60 & echo $! > "$(dirname "$0")/../agent.pid"; wait
+"#;
+
+/// Whether the process `pid` has ended.
+fn ended(pid: &str) -> bool {
+    !command("kill")
+        .args(["-0", pid.trim()])
+        .status()
+        .unwrap()
+        .success()
+}
+
+/// Closing a run's tab ends its agent, and the run fails saying why.
+#[test]
+fn closing_a_herdr_tab_stops_its_agent() {
+    let s = Scratch::new("herdrclose");
+    let (env, _origin, _alpha) =
+        dispatch_env(&s, &[("claude", STUCK_AGENT), ("herdr", FAKE_HERDR)]);
+    let st = s.0.join("herdr");
+    env.command(&["herdr"])
+        .env("HERDR_ENV", "1")
+        .output()
+        .unwrap();
+    let dispatch = env.command(&["dispatch", "alpha:5"]).spawn().unwrap();
+    let pid = s.0.join("agent.pid");
+    wait_until(20, "the agent to start", || pid.exists());
+    let tab = fs::read_dir(st.join("tabs"))
+        .unwrap()
+        .flatten()
+        .find(|e| fs::read_to_string(e.path()).unwrap().contains("alpha #1"))
+        .map(|e| e.file_name().into_string().unwrap())
+        .expect("the run's tab");
+    let herdr = s.0.join("bin").join("herdr");
+    assert!(
+        command(&herdr)
+            .args(["tab", "close", &tab])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let out = dispatch.wait_with_output().unwrap();
+    assert!(out.status.success());
+    let agent = fs::read_to_string(&pid).unwrap();
+    wait_until(5, "the agent to end", || ended(&agent));
+    let log = fs::read_to_string(s.0.join("home/state/runs/1/agent-1.log")).unwrap();
+    assert!(
+        log.contains("the herdr tab closed before the agent finished"),
+        "{log}"
+    );
+    assert!(env.ok(&["review", "1"]).contains("failed"));
+}
+
+/// The tab ends its agent once the bridge has gone, as at pma's timeout,
+/// which kills the bridge and removes the run's directory, lock and all.
+#[test]
+fn a_herdr_tab_ends_its_agent_when_the_bridge_goes() {
+    let s = Scratch::new("herdrbridge");
+    let (env, _origin, _alpha) = dispatch_env(&s, &[("herdr", FAKE_HERDR)]);
+    let dir = s.0.join("run.herdr");
+    fs::create_dir_all(&dir).unwrap();
+    let pid = s.0.join("agent.pid");
+    let spec = serde_json::json!({
+        "program": "sh",
+        "args": ["-c", format!("sleep 60 & echo $! > {}; wait", pid.display())],
+        "cwd": s.0,
+        "env": {"PATH": "/usr/bin:/bin"},
+        "log": s.0.join("agent.log"),
+        "run": 1,
+        "label": "alpha #1",
+        "agent": "claude",
+    });
+    fs::write(dir.join("spec.json"), spec.to_string()).unwrap();
+    let bridge = fs::File::create(dir.join("bridge.lock")).unwrap();
+    bridge.lock().unwrap();
+
+    let pane = env
+        .command(&["herdr", "pane", dir.to_str().unwrap()])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_until(20, "the agent to start", || pid.exists());
+    assert!(
+        !dir.join("spec.json").exists(),
+        "the environment is not left on disk"
+    );
+    fs::remove_dir_all(&dir).unwrap();
+    drop(bridge);
+
+    let out = pane.wait_with_output().unwrap();
+    let shown = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{shown}");
+    assert!(shown.contains("stopped by pma"), "{shown}");
+    let agent = fs::read_to_string(&pid).unwrap();
+    wait_until(5, "the agent to end", || ended(&agent));
+}

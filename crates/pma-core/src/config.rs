@@ -54,6 +54,9 @@ pub struct Config {
     pub notify: Option<String>,
     /// Where an agent edits: the clone itself, or a worktree of it.
     pub workspace: Workspace,
+    /// Whether an agent starts in a tab of the `pma` herdr session while it
+    /// runs. `pma herdr` turns it on. See `herdr.rs`.
+    pub herdr: bool,
     pub projects: BTreeMap<String, ProjectSettings>,
 }
 
@@ -142,6 +145,7 @@ impl Default for Config {
             timeout: 30,
             notify: None,
             workspace: Workspace::Clone,
+            herdr: false,
             projects: BTreeMap::new(),
         }
     }
@@ -271,6 +275,7 @@ impl Config {
                 "timeout",
                 "notify",
                 "workspace",
+                "herdr",
             ]
             .map(String::from),
         );
@@ -449,6 +454,7 @@ impl Config {
                 "timeout" => Slot::Count(&mut self.timeout, 1, 240),
                 "notify" => Slot::OptText(&mut self.notify),
                 "workspace" => Slot::Workspace(&mut self.workspace),
+                "herdr" => Slot::Switch(&mut self.herdr),
                 _ => return None,
             },
             Some(("tiers", t)) => Slot::Number(&mut self.tiers[tier(t)?], 0.0),
@@ -507,7 +513,7 @@ mod tests {
     #[test]
     fn every_key_reads_and_round_trips() {
         let keys = Config::keys();
-        assert_eq!(keys.len(), 35);
+        assert_eq!(keys.len(), 36);
         let defaults = Config::default();
         let mut copy = Config::default();
         for key in &keys {

@@ -3,9 +3,9 @@
 //! Design: `docs/dev/design.md`.
 
 use pma_core::{
-    api, class, config, dates, deps, dispatch, history, jobs, next, pass, progress, projects,
-    publish, rank, report, report_runs, route, scan, script, store, sync, todo, watch, worker,
-    workflow,
+    api, class, config, dates, deps, dispatch, herdr, history, jobs, next, pass, progress,
+    projects, publish, rank, report, report_runs, route, scan, script, store, sync, todo, watch,
+    worker, workflow,
 };
 use pma_tui::{choose, tui};
 
@@ -38,7 +38,9 @@ const GROUPS: [(&str, &[&str]); 6] = [
     ),
     (
         "Reading",
-        &["status", "history", "report", "tui", "web", "watch"],
+        &[
+            "status", "history", "report", "tui", "web", "watch", "herdr",
+        ],
     ),
     ("Setup", &["root", "project", "config", "verify"]),
     ("Agents", &["agent", "preset", "route"]),
@@ -556,6 +558,19 @@ enum Command {
     /// Run queued jobs until none is left. `--detach` starts it.
     #[command(hide = true)]
     Runner,
+    /// `pma tui` and a tab per running agent, in herdr.
+    ///
+    /// Opens the herdr session `pma`, starting it when it is not running,
+    /// with `pma tui` in the workspace `pma` and a tab per agent run in the
+    /// workspace `agents`. While the session runs, an agent starts in a tab
+    /// of its own instead of headless; the log, the timeout and the review
+    /// are as before. A tab closes once its run is approved or rejected.
+    /// Turns `herdr` on; `pma config herdr off` runs agents headless again.
+    /// Needs herdr.
+    Herdr {
+        #[command(subcommand)]
+        action: Option<HerdrAction>,
+    },
     /// Mirror `Critical` items to GitHub Issues.
     ///
     /// Opens an issue per Critical item and writes `gh:N` into its line,
@@ -583,6 +598,18 @@ enum JobAction {
     Stop { id: i64 },
     /// Queue the approval of the plan a job stopped at.
     Approve { id: i64 },
+}
+
+#[derive(Subcommand)]
+enum HerdrAction {
+    /// Stop the session, closing every tab and the agents in them.
+    Stop,
+    /// Stands in for an agent under the timeout, while the agent runs in a tab.
+    #[command(hide = true)]
+    Bridge { dir: PathBuf },
+    /// Runs the agent in its tab.
+    #[command(hide = true)]
+    Pane { dir: PathBuf },
 }
 
 #[derive(Subcommand)]
@@ -938,6 +965,8 @@ fn main() -> ExitCode {
         tags: Vec::new(),
         all: false,
     });
+    // After a review, a run's herdr tab may be due to close.
+    let sweeps = !matches!(command, Command::Herdr { .. } | Command::Runner);
     let result = match command {
         Command::Next {
             projects,
@@ -1122,8 +1151,23 @@ fn main() -> ExitCode {
         Command::Web { no_open, app, port } => run_web(no_open, app, port),
         Command::Job { action } => run_job(action),
         Command::Runner => jobs::run(),
+        Command::Herdr {
+            action: Some(HerdrAction::Bridge { dir }),
+        } => {
+            return match herdr::bridge(&dir) {
+                Ok(code) => ExitCode::from(u8::try_from(code).unwrap_or(1)),
+                Err(e) => {
+                    eprintln!("pma: {e}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        Command::Herdr { action } => run_herdr(action),
         Command::Watch { once } => run_watch(once),
     };
+    if sweeps && let Err(e) = herdr::sweep_default() {
+        eprintln!("pma: herdr: {e}");
+    }
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -4224,6 +4268,39 @@ fn run_watch(once: bool) -> Result<()> {
             return Ok(());
         }
         std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+}
+
+fn run_herdr(action: Option<HerdrAction>) -> Result<()> {
+    match action {
+        Some(HerdrAction::Stop) => herdr::stop(),
+        Some(HerdrAction::Pane { dir }) => herdr::pane(&dir),
+        Some(HerdrAction::Bridge { .. }) => unreachable!("handled in main"),
+        None => {
+            use std::os::unix::process::CommandExt;
+
+            let store = Store::open_default()?;
+            if !api::config(&store)?.herdr {
+                store.set_config("herdr", "on")?;
+                println!("herdr on: agents start in the session `pma` while it runs");
+            }
+            herdr::start()?;
+            herdr::agents()?;
+            herdr::home(&std::env::current_dir()?)?;
+            herdr::sweep(&store)?;
+            // A client inside a herdr pane would nest one terminal in another.
+            if std::env::var_os("HERDR_ENV").is_some() {
+                println!(
+                    "the session `pma` is running; attach from outside herdr with `herdr --session {}`",
+                    herdr::SESSION
+                );
+                return Ok(());
+            }
+            let e = std::process::Command::new("herdr")
+                .args(["--session", herdr::SESSION])
+                .exec();
+            Err(format!("herdr: {e}").into())
+        }
     }
 }
 

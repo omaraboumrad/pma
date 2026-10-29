@@ -75,6 +75,8 @@ pma push 1                     # commit and push it; or `pma pr 1` after --appro
 
 - `--detach` on `pma dispatch` and `pma workflow run` queues the work and returns at once; a runner takes it and outlives the terminal. `pma job` lists jobs, `pma watch` shows what each running agent is doing, and `pma config notify '<command>'` runs when a job ends.
 
+- `pma herdr` opens a [herdr](https://herdr.dev) session of pma's own: `pma tui` in one workspace, and in `agents` a tab per agent run, live, with herdr showing which are working and which are done. The agent runs under the same stripped environment, timeout and log as a headless one, and is reviewed the same way. A tab closes once its run is approved or rejected; closing it sooner stops the agent. `pma herdr stop` ends the session, and agents run headless again.
+
 - `pma workflow run --local --unattended` approves each plan as it comes and leaves every edit that passed the project's tests as unstaged changes in your clone; one that failed is discarded. Nothing is committed or pushed.
 
 **Which model, where**
@@ -305,6 +307,7 @@ pma workflow run review-fix myproject --local --unattended --detach   # returns 
 pma job                         # queued, running and finished jobs; `job log <id>`, `job stop <id>`
 pma job approve 3               # run the plan a detached job stopped at
 pma watch                       # each running agent's tool calls and last words
+pma herdr                       # pma tui and a live tab per agent, in herdr; `herdr stop` ends it
 pma config notify 'notify-send pma "$PMA_JOB_SUMMARY"'   # told when a job ends
 # design and known gaps: docs/dev/async_dispatch.md
 pma workflow run triage --instance 3 --cap max_units=80   # resume a capped instance

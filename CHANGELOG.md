@@ -6,6 +6,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`pma herdr`** opens the herdr session `pma`, with `pma tui` in the workspace `pma` and, in `agents`, a tab per agent run as it works. While the session runs, `pma dispatch`, `pma run` and detached jobs start their agent in a tab instead of headless: the environment pma built rather than herdr's, so the push credentials stay stripped; the same timeout, log, cost and review. The tab reports working and done to herdr, and closes once its run is approved or rejected. Closing a tab stops its agent and fails the run. `pma config herdr off` runs agents headless again; `pma herdr stop` ends the session.
+
 - **Bundles.** The `TODO.md` items `pma dispatch` names in one project are one run: one agent session, one diff, one review, one commit. The prompt numbers the tasks. `pma review <id> --approve --drop 2,3` leaves those items open; publishing ticks the rest, lists them in the commit body and closes each one's issue. A dropped item's changes stay in the diff. A bundle is never clean, so `--push` and batch approval pass over it, and a ready one must be approved before it is staged or published. In the clone, which holds one run, several items could not run at all. Design and open steps: `docs/dev/bundled-dispatch.md`.
 
 - Space marks tasks in the TUI, and a checkbox does in the web; `d` then dispatches every marked task, one bundle per project. Marks clear on a dispatch, on Escape and on another view, and a mark on a row a refresh removed is dropped, so nothing unseen is dispatched.

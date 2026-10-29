@@ -1520,7 +1520,12 @@ fn attempt(
     a.started_at = crate::dates::now();
     run.error = None;
     let log = logs.join(format!("agent-{n}.log"));
-    let finished = match agent::run_limited(cmd, None, &log, timeout) {
+    let launch = crate::herdr::Launch {
+        run: run.id,
+        project: &run.project,
+        agent: &run.agent,
+    };
+    let finished = match crate::herdr::run_limited(cfg, cmd, &log, timeout, &launch) {
         Ok(f) => f,
         Err(e) => {
             fail(run, &mut a, format!("{}: {e}", worker.command));

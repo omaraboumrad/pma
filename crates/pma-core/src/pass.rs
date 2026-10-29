@@ -2280,8 +2280,13 @@ fn work(cfg: &Config, job: &Staged) -> Ran {
         timeout.saturating_sub(crate::dispatch::INNER_GRACE),
     );
     cmd.current_dir(&job.tree);
+    let launch = crate::herdr::Launch {
+        run: job.run.id,
+        project: &job.run.project,
+        agent: &job.run.agent,
+    };
     let finished = match crate::agent::restrict(&mut cmd, &job.agent_env)
-        .and_then(|()| crate::agent::run_limited(cmd, None, &job.log, timeout))
+        .and_then(|()| crate::herdr::run_limited(cfg, cmd, &job.log, timeout, &launch))
     {
         Ok(f) => f,
         Err(e) => {

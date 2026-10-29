@@ -61,6 +61,54 @@ pub fn progress(log: &str) -> Progress {
     p
 }
 
+/// One log line as a person reads it, for a run's herdr tab: a
+/// `stream-json` record becomes what the agent said and the tools it called,
+/// and a line that is not JSON is shown as it is.
+pub fn render(line: &str) -> Vec<String> {
+    let line = line.trim_end();
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+        return vec![line.to_string()];
+    };
+    match v["type"].as_str() {
+        Some("assistant") => v["message"]["content"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|part| match part["type"].as_str() {
+                Some("text") => part["text"]
+                    .as_str()
+                    .filter(|t| !t.trim().is_empty())
+                    .map(|t| format!("{}\n", t.trim())),
+                Some("tool_use") => {
+                    let input = &part["input"];
+                    let arg = ["command", "file_path", "pattern", "path", "url"]
+                        .iter()
+                        .find_map(|k| input[*k].as_str());
+                    let name = part["name"].as_str().unwrap_or("?");
+                    Some(match arg {
+                        Some(a) => format!("> {name}: {}", one_line(a, 160)),
+                        None => format!("> {name}"),
+                    })
+                }
+                _ => None,
+            })
+            .collect(),
+        Some("result") => {
+            let cost = v["total_cost_usd"]
+                .as_f64()
+                .map_or(String::new(), |c| format!(", ${c:.2}"));
+            let how = v["subtype"].as_str().unwrap_or("done");
+            vec![format!("-- {how}{cost}")]
+        }
+        Some("system") if v["subtype"] == "init" => {
+            let model = v["model"].as_str().unwrap_or("?");
+            vec![format!("-- started, {model}")]
+        }
+        // Tool results and the rest: the next call says what came of them.
+        _ => Vec::new(),
+    }
+}
+
 fn one_line(text: &str, max: usize) -> String {
     let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
     match flat.char_indices().nth(max) {
@@ -166,6 +214,17 @@ pub fn screen(state: &Path, jobs: &[Job], runs: &[Run], now: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A herdr tab shows what the agent said and did, not the JSON.
+    #[test]
+    fn a_stream_json_log_renders_for_a_person() {
+        let said = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Fixing it."},{"type":"tool_use","name":"Bash","input":{"command":"make\ntest"}}]}}"#;
+        assert_eq!(render(said), ["Fixing it.\n", "> Bash: make test"]);
+        let done = r#"{"type":"result","subtype":"success","total_cost_usd":0.123}"#;
+        assert_eq!(render(done), ["-- success, $0.12"]);
+        assert!(render(r#"{"type":"user","message":{}}"#).is_empty());
+        assert_eq!(render("plain text\n"), ["plain text"]);
+    }
 
     #[test]
     fn a_stream_is_read_for_tools_and_text() {

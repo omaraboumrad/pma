@@ -1442,6 +1442,13 @@ fn unmoved(run: &Run, seen: Option<&str>) -> Result<()> {
 }
 
 pub fn act(store: &Store, a: Action) -> Result<Outcome> {
+    let outcome = act_one(store, a);
+    // A run approved or rejected here no longer needs its herdr tab.
+    let _ = crate::herdr::sweep(store);
+    outcome
+}
+
+fn act_one(store: &Store, a: Action) -> Result<Outcome> {
     // A reviewer who commits, pushes or opens a pull request for a ready
     // run from a view has read it: it is approved first, as one act. Staging
     // is the review itself and takes a ready run as it is.
