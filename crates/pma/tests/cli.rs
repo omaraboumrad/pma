@@ -653,6 +653,38 @@ fn dispatch_env(s: &Scratch, scripts: &[(&str, &str)]) -> (Env, PathBuf, PathBuf
     (env, origin, alpha)
 }
 
+/// After the first scan, what reads the task list sees the file as it is now,
+/// and a read no one asked for adds no row to `pma history` unless it found a
+/// change.
+#[test]
+fn a_changed_todo_needs_no_scan() {
+    let s = Scratch::new("refresh");
+    let (env, _, alpha) = dispatch_env(&s, &[]);
+    let scans = |env: &Env| env.ok(&["history"]).lines().count();
+    let before = scans(&env);
+
+    env.ok(&["next"]);
+    assert_eq!(scans(&env), before, "nothing changed, so no row");
+
+    let todo = fs::read_to_string(alpha.join("TODO.md")).unwrap();
+    fs::write(
+        alpha.join("TODO.md"),
+        todo.replace("- [ ] third task #agent", "- [ ] new work #agent"),
+    )
+    .unwrap();
+    let next = env.ok(&["next"]);
+    assert!(next.contains("new work"), "{next}");
+    assert!(!next.contains("third task"), "{next}");
+    assert_eq!(scans(&env), before + 1, "that change is history");
+    env.ok(&["task", "alpha:7"]);
+
+    // A new repository under the root needs no scan either.
+    let root = alpha.parent().unwrap();
+    git(root, &["clone", "-q", "../origin.git", "beta"], None);
+    let listed = env.ok(&["status", "--all"]);
+    assert!(listed.contains("beta"), "{listed}");
+}
+
 /// `--local` starts from the clone and writes an edit that passes verify
 /// into it, unstaged; one that fails verify is discarded and the clone keeps
 /// none of it.

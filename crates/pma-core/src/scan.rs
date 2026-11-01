@@ -109,6 +109,35 @@ pub struct Facts {
     /// Not read, because git there would run a hook or setting a failed run
     /// found added. The store keeps what the last scan recorded, and `error`.
     pub held: bool,
+    /// What `stamp` said before this read, so a change during it is seen later.
+    pub stamp: String,
+}
+
+/// Changes when `TODO.md` or the repository's state does: a commit, a checkout,
+/// a stage, a fetch. An edit to a tracked file that is not staged does not
+/// change it, so `dirty` can lag until the next full scan.
+pub fn stamp(path: &Path) -> String {
+    [
+        "TODO.md",
+        ".git/index",
+        ".git/HEAD",
+        ".git/logs/HEAD",
+        ".git/FETCH_HEAD",
+    ]
+    .iter()
+    .map(|f| match std::fs::metadata(path.join(f)) {
+        Ok(m) => {
+            let at = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_nanos());
+            format!("{at}:{}", m.len())
+        }
+        Err(_) => "-".into(),
+    })
+    .collect::<Vec<_>>()
+    .join(" ")
 }
 
 impl Facts {
@@ -139,6 +168,7 @@ impl Facts {
             faults: Vec::new(),
             ci_read: false,
             held: false,
+            stamp: String::new(),
         }
     }
 }
@@ -292,6 +322,7 @@ pub fn scan_project(
     deps: bool,
 ) -> Facts {
     let mut facts = Facts::blank(name, path);
+    facts.stamp = stamp(path);
 
     let git = Git::new(path);
     let status = call(

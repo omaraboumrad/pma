@@ -290,7 +290,7 @@ function drawNav() {
       "data-tab": tab,
       "aria-keyshortcuts": b.key,
       onclick: () => run(b),
-    }, el("span", {}, meta.label), el("kbd", {}, b.key)));
+    }, el("span", {}, meta.label), el("kbd", {}, b.key === " " ? "Space" : b.key)));
   }
   nav.append(views);
   // Acts that apply on every view live here rather than on each toolbar.
@@ -386,7 +386,7 @@ function button(b, extraClass) {
     type: "button",
     "aria-keyshortcuts": b.key,
     onclick: () => run(b),
-  }, label(b.label), el("kbd", {}, b.key));
+  }, label(b.label), el("kbd", {}, b.key === " " ? "Space" : b.key));
 }
 
 function label(text) {

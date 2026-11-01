@@ -994,6 +994,18 @@ fn main() -> ExitCode {
         tags: Vec::new(),
         all: false,
     });
+    // What reads the task lists sees what the files say now.
+    if matches!(
+        command,
+        Command::Next { .. }
+            | Command::Matrix { .. }
+            | Command::Status { .. }
+            | Command::Task { .. }
+            | Command::Dispatch { detach: false, .. }
+    ) && let Err(e) = Store::open_default().and_then(|mut s| pma_core::refresh::changed(&mut s))
+    {
+        eprintln!("warning: projects not refreshed: {e}");
+    }
     let result = match command {
         Command::Next {
             projects,
@@ -1882,7 +1894,6 @@ fn configure(key: Option<&str>, value: Option<&str>, reset: bool) -> Result<()> 
 
 fn run_scan(names: &[String], tags: &[String], offline: bool, deps: bool) -> Result<()> {
     let mut store = Store::open_default()?;
-    let cfg = api::config(&store)?;
     let names = &select(&store, names, tags)?;
     let roots = store.roots()?;
     if roots.is_empty() {
@@ -1907,25 +1918,11 @@ fn run_scan(names: &[String], tags: &[String], offline: bool, deps: bool) -> Res
             .collect::<std::result::Result<_, _>>()?
     };
 
-    // `git status` in a clone holding a setting a failed run found would
-    // run it, so such a clone is not read.
-    let runs = store.runs()?;
-    let mut held = Vec::new();
-    let mut free = Vec::new();
-    for (name, path) in selected {
-        match dispatch::clone_held(&runs, &path) {
-            Ok(()) => free.push((name, path)),
-            Err(e) => held.push(scan::Facts::held(&name, &path, e.to_string())),
-        }
-    }
-
     let started = Instant::now();
-    let bar = progress::Bar::new(free.len());
-    let mut facts = scan::scan_all(&free, &cfg.activity_ignore, offline, deps, &|name| {
-        bar.done(name)
-    });
+    // `git status` in a clone holding a setting a failed run found would run it.
+    let bar = progress::Bar::new(selected.len());
+    let facts = pma_core::refresh::read(&store, selected, offline, deps, &|name| bar.done(name))?;
     bar.finish();
-    facts.extend(held);
     // Lint errors are listed after the scan, under "needs attention".
     for f in &facts {
         for (fault, why) in f.faults.iter().filter(|(k, _)| *k != scan::Fault::TodoLint) {
@@ -2370,8 +2367,9 @@ pub fn run_dispatch(
                     let t = tasks
                         .iter()
                         .find(|t| t.project == project && t.line == *line)
-                        .ok_or_else(|| {
-                            format!("{project}:{line} is not an open item at the last scan")
+                        .ok_or_else(|| match ticked_by_a_run(&store, row, *line) {
+                            true => format!("{project}:{line} already has a run; see `pma review`"),
+                            false => format!("{project}:{line} is not an open item"),
                         })?;
                     vec![task_row(t)]
                 }
@@ -2617,6 +2615,29 @@ fn push_clean(
     Ok(())
 }
 
+/// Whether `line` is an item a run in review has ticked in its clone, which
+/// has left the task list but is still that run's.
+fn ticked_by_a_run(store: &Store, row: &store::ProjectRow, line: i64) -> bool {
+    let Ok(text) = std::fs::read_to_string(row.path.join("TODO.md")) else {
+        return false;
+    };
+    let Some(item) = text
+        .lines()
+        .nth((line - 1).max(0) as usize)
+        .and_then(|l| l.trim_start().strip_prefix("- [x] "))
+    else {
+        return false;
+    };
+    let item = pma_core::todo::normal_text(item);
+    store.runs().is_ok_and(|runs| {
+        runs.iter().any(|r| {
+            r.project == row.name
+                && !r.state.is_final()
+                && item.starts_with(&pma_core::todo::normal_text(&r.text))
+        })
+    })
+}
+
 /// Rereads `TODO.md` in each `(project, clone)` a publish just ticked, so the
 /// task lists stop showing the item. A failure here leaves the publish done.
 fn rescan_ticked(mut ticked: Vec<(String, PathBuf)>) {
@@ -2627,28 +2648,8 @@ fn rescan_ticked(mut ticked: Vec<(String, PathBuf)>) {
     }
 }
 
-/// An offline scan that keeps each project's last CI, which it does not ask
-/// for and would otherwise record as unknown, and its run links.
 fn rescan(projects: &[(String, PathBuf)]) -> Result<()> {
-    if projects.is_empty() {
-        return Ok(());
-    }
-    let mut store = Store::open_default()?;
-    let cfg = api::config(&store)?;
-    let runs = store.runs()?;
-    let mut facts = Vec::new();
-    for (name, path) in projects {
-        if dispatch::clone_held(&runs, path).is_err() {
-            continue;
-        }
-        let mut f = scan::scan_project(name, path, &cfg.activity_ignore, true, false);
-        if let Some(row) = store.project(name)? {
-            (f.ci, f.ci_runs) = (row.ci, row.ci_runs);
-        }
-        facts.push(f);
-    }
-    store.save_scan(&facts, false, dates::now())?;
-    Ok(())
+    pma_core::refresh::rescan(&mut Store::open_default()?, projects)
 }
 
 /// The project's open items from the last scan, one priority or all of them.
@@ -4492,6 +4493,7 @@ fn run_tui() -> Result<()> {
     if !std::io::stdout().is_terminal() {
         return Err("pma tui needs a terminal; use `pma next` or `pma matrix` otherwise".into());
     }
+    pma_core::refresh::start(Store::open_default);
     tui::run(&Store::open_default()?)
 }
 
@@ -4511,6 +4513,7 @@ fn run_web(no_open: bool, app: bool, port: u16) -> Result<()> {
     if let Err(e) = opened {
         eprintln!("warning: {e}; open the address yourself");
     }
+    pma_core::refresh::start(Store::open_default);
     server.serve()
 }
 

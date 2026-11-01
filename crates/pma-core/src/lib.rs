@@ -26,6 +26,7 @@ pub mod progress;
 pub mod projects;
 pub mod publish;
 pub mod rank;
+pub mod refresh;
 pub mod report;
 pub mod report_runs;
 pub mod route;

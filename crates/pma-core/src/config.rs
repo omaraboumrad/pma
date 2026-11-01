@@ -23,6 +23,8 @@ pub struct Config {
     /// Days a lock may go unchanged, and a `--deps` measurement stay current,
     /// before a project is in stale deps.
     pub deps_days: i64,
+    /// Minutes between full scans while a front end is open; 0 turns them off.
+    pub scan_every: i64,
     /// Days without activity at which the activity signal reaches 1, per tier.
     pub activity_horizon: [i64; 5],
     /// The worker `pma dispatch` runs, by name in the `agents` table.
@@ -159,6 +161,7 @@ impl Default for Config {
             activity_ignore: vec![".github/**".into(), "*.lock".into(), "TODO.md".into()],
             activity_horizon: [30, 60, 120, 240, 365],
             deps_days: 30,
+            scan_every: 30,
             agent: "claude".into(),
             preset: None,
             default_tier: Some(5),
@@ -288,6 +291,7 @@ impl Config {
         keys.push("activity.ignore".into());
         keys.extend(per_tier("activity.horizon"));
         keys.push("deps.days".into());
+        keys.push("scan.every".into());
         keys.extend(
             [
                 "agent",
@@ -503,6 +507,7 @@ impl Config {
             }),
             Some(("activity", "ignore")) => Slot::List(&mut self.activity_ignore),
             Some(("deps", "days")) => Slot::Count(&mut self.deps_days, 0, i64::MAX),
+            Some(("scan", "every")) => Slot::Count(&mut self.scan_every, 0, i64::MAX),
             Some(("activity", rest)) => {
                 let t = rest.strip_prefix("horizon.")?;
                 Slot::Count(&mut self.activity_horizon[tier(t)?], 1, i64::MAX)
@@ -543,7 +548,7 @@ mod tests {
     #[test]
     fn every_key_reads_and_round_trips() {
         let keys = Config::keys();
-        assert_eq!(keys.len(), 36);
+        assert_eq!(keys.len(), 37);
         let defaults = Config::default();
         let mut copy = Config::default();
         for key in &keys {

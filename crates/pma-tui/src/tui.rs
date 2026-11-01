@@ -808,11 +808,12 @@ impl App {
     }
 
     pub fn render(&mut self, frame: &mut Frame) {
+        let foot = fold(self.footer(), frame.area().width);
         let [title, header, body, footer] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Min(6),
-            Constraint::Length(1),
+            Constraint::Length(foot.len() as u16),
         ])
         .areas(frame.area());
         frame.render_widget(self.title_bar(title.width), title);
@@ -842,7 +843,7 @@ impl App {
                 }
             }
         }
-        frame.render_widget(self.footer(), footer);
+        frame.render_widget(Text::from(foot), footer);
         match self.mode.clone() {
             Mode::Help => self.render_help(frame, body),
             Mode::Detail { screen: s, scroll } => {
@@ -1214,8 +1215,14 @@ impl App {
             None => Line::styled("Nothing selected.", p.muted()),
             Some((pane, item)) => {
                 let mut spans = Vec::new();
+                // The table shows the rest; a wide column is what it may cut.
+                let wide = item
+                    .cells
+                    .iter()
+                    .zip(&pane.columns)
+                    .any(|(c, col)| col.kind == Kind::Wide && !c.text.is_empty());
                 for (c, col) in item.cells.iter().zip(&pane.columns) {
-                    if c.text.is_empty() {
+                    if c.text.is_empty() || (wide && col.kind != Kind::Wide) {
                         continue;
                     }
                     spans.push(Span::styled(format!("{} ", col.title), p.muted()));
@@ -1255,7 +1262,13 @@ impl App {
             for (_, label, keys) in seen {
                 lines.push(Line::from(vec![
                     Span::styled(
-                        format!("{:>16}  ", keys.join(", ")),
+                        format!(
+                            "{:>16}  ",
+                            keys.iter()
+                                .map(|k| keys::shown(k))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
                         Style::new().add_modifier(Modifier::BOLD),
                     ),
                     Span::raw(label),
@@ -1540,11 +1553,54 @@ impl App {
 }
 
 /// Key hints: the key bold in the accent colour, its label plain.
+/// Breaks a footer into lines of `width`, so no key is cut off: between hints
+/// when it is a list of them, anywhere in a message.
+fn fold(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
+    let width = (width as usize).max(1);
+    let length = |spans: &[Span]| {
+        spans
+            .iter()
+            .map(|s| s.content.chars().count())
+            .sum::<usize>()
+    };
+    let mut lines = Vec::new();
+    match line.spans.as_slice() {
+        // A message: one styled span.
+        [only] => {
+            let chars: Vec<char> = only.content.chars().collect();
+            for part in chars.chunks(width) {
+                lines.push(Line::from(Span::styled(
+                    part.iter().collect::<String>(),
+                    only.style,
+                )));
+            }
+        }
+        [margin, hints @ ..] => {
+            let mut row = vec![margin.clone()];
+            for hint in hints.chunks(2) {
+                if row.len() > 1 && length(&row) + length(hint) > width {
+                    lines.push(Line::from(std::mem::replace(
+                        &mut row,
+                        vec![margin.clone()],
+                    )));
+                }
+                row.extend_from_slice(hint);
+            }
+            lines.push(Line::from(row));
+        }
+        [] => {}
+    }
+    if lines.is_empty() {
+        lines.push(Line::default());
+    }
+    lines
+}
+
 fn hints(p: Palette, pairs: &[(&str, &str)]) -> Line<'static> {
     let mut spans = vec![Span::raw(" ")];
     for (key, label) in pairs {
         spans.push(Span::styled(
-            key.to_string(),
+            keys::shown(key).to_string(),
             p.accent().add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::styled(format!(" {label}   "), p.muted()));
@@ -1628,8 +1684,10 @@ fn heights(panes: &[Pane], total: u16) -> Vec<u16> {
     let spare = total.saturating_sub(base);
     let weight: u16 = extra.iter().sum();
     if weight == 0 {
-        if let Some(first) = out.first_mut() {
-            *first += spare;
+        // To a pane with rows to show, not to an empty one above it.
+        let i = panes.iter().position(|p| !p.items.is_empty()).unwrap_or(0);
+        if let Some(h) = out.get_mut(i) {
+            *h += spare;
         }
     } else {
         for (h, e) in out.iter_mut().zip(&extra) {
@@ -2608,8 +2666,11 @@ mod tests {
             repo: None,
         }));
         let text = screen_text(&mut app);
-        let footer = text.lines().last().unwrap_or_default();
-        assert!(footer.trim_start().starts_with("m commit"), "{footer}");
+        // The footer now folds, so it opens a line above the screen's last.
+        assert!(
+            text.lines().any(|l| l.trim_start().starts_with("m commit")),
+            "{text}"
+        );
     }
 
     /// A run reaching review is named in the footer and Enter opens it;
@@ -2683,5 +2744,52 @@ mod tests {
                 b.key
             );
         }
+    }
+
+    fn pane_of(rows: usize) -> Pane {
+        Pane {
+            title: "p".into(),
+            columns: Vec::new(),
+            items: (0..rows)
+                .map(|_| Item {
+                    cells: Vec::new(),
+                    pick: Pick::Nothing,
+                })
+                .collect(),
+            empty: "none",
+        }
+    }
+
+    /// Spare rows go to what has rows to show, as when nothing waits on you
+    /// and three tasks do.
+    #[test]
+    fn an_empty_pane_takes_no_spare_rows() {
+        let panes = [pane_of(0), pane_of(0), pane_of(3)];
+        assert_eq!(heights(&panes, 40), vec![3, 3, 34]);
+        let none = [pane_of(0), pane_of(0)];
+        assert_eq!(heights(&none, 40), vec![37, 3]);
+    }
+
+    /// No key is cut off, a key stays with its label, and the space bar has a
+    /// name.
+    #[test]
+    fn the_footer_folds_between_hints() {
+        let p = App::new().palette;
+        let line = hints(p, &[(" ", "mark"), ("d", "dispatch"), ("c", "scan")]);
+        let text = |l: &Line| {
+            l.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        };
+        assert!(text(&line).contains("Space mark"), "{}", text(&line));
+        let lines = fold(line.clone(), 30);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(text(&lines[0]).contains("d dispatch"));
+        assert!(text(&lines[1]).contains("c scan"));
+        assert!(lines.iter().all(|l| text(l).chars().count() <= 30));
+        assert_eq!(fold(line, 200).len(), 1);
+        let message = Line::from(Span::raw("x".repeat(50)));
+        assert_eq!(fold(message, 20).len(), 3);
     }
 }

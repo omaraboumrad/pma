@@ -24,7 +24,7 @@ use crate::worker::{Parser, Worker};
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
-const VERSION: i64 = 47;
+const VERSION: i64 = 48;
 
 const SCHEMA: &str = "
 CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -467,6 +467,14 @@ WHERE state = 'ready' AND branch = '' AND workflow_instance IS NOT NULL;
 
 /// Version 47. What herdr last said of the agent in a run's pane.
 const HERDR_AGENT_STATE: &str = "ALTER TABLE runs ADD COLUMN agent_state TEXT;";
+
+/// What each project's files looked like when last read; `scan::stamp`.
+const PROJECT_STAMPS: &str = "
+CREATE TABLE IF NOT EXISTS project_stamps (
+    project TEXT PRIMARY KEY,
+    stamp TEXT NOT NULL
+);
+";
 
 /// Version 46. The herdr pane a run's last attempt ran in, and whether a
 /// person drives its agent there.
@@ -1045,6 +1053,7 @@ impl Store {
                     DENIED_AND_REVIEW_CLOCK,
                     HERDR_PANES,
                     HERDR_AGENT_STATE,
+                    PROJECT_STAMPS,
                 ];
                 let tx = conn.unchecked_transaction()?;
                 for step in &steps[version as usize..] {
@@ -1449,6 +1458,10 @@ impl Store {
                 ],
             )?;
             save_faults(&tx)?;
+            tx.execute(
+                "INSERT OR REPLACE INTO project_stamps (project, stamp) VALUES (?1, ?2)",
+                params![f.name, f.stamp],
+            )?;
             tx.execute("DELETE FROM ci_runs WHERE project = ?1", [&f.name])?;
             for (workflow, url) in &f.ci_runs {
                 tx.execute(
@@ -1633,6 +1646,48 @@ impl Store {
         // A project this scan added may have a tier or tags in the file.
         self.reapply_settings()?;
         Ok(absent)
+    }
+
+    /// `save_scan` for a read no person asked for, so `pma history` keeps what
+    /// changed rather than one row each time a file is touched. A quiet partial
+    /// read leaves no row; a quiet full one replaces the quiet full row before
+    /// it, so the time of the last full scan is kept.
+    pub fn save_quiet_scan(&mut self, facts: &[Facts], full: bool, now: i64) -> Result<()> {
+        self.save_scan(facts, full, now)?;
+        const QUIET: &str = "NOT EXISTS (SELECT 1 FROM scan_changes c WHERE c.scan = scans.id)";
+        let latest: i64 = self
+            .conn
+            .query_row("SELECT MAX(id) FROM scans", [], |r| r.get(0))?;
+        match full {
+            false => self.conn.execute(
+                &format!("DELETE FROM scans WHERE id = ?1 AND {QUIET}"),
+                [latest],
+            )?,
+            true => self.conn.execute(
+                &format!(
+                    "DELETE FROM scans WHERE id = ?1 - 1 AND full AND {QUIET}
+                       AND NOT EXISTS (SELECT 1 FROM scan_changes c WHERE c.scan = ?1)"
+                ),
+                [latest],
+            )?,
+        };
+        Ok(())
+    }
+
+    /// What each project's files looked like when last read.
+    pub fn project_stamps(&self) -> Result<HashMap<String, String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT project, stamp FROM project_stamps")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// When every project, and CI, was last read.
+    pub fn last_full_scan(&self) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row("SELECT MAX(at) FROM scans WHERE full", [], |r| r.get(0))?)
     }
 
     /// The latest `limit` scans, newest first, with their totals.
@@ -3742,6 +3797,7 @@ mod tests {
             ci_read: true,
             todo_unread: false,
             held: false,
+            stamp: String::new(),
         }
     }
 
@@ -4790,6 +4846,43 @@ mod tests {
         assert!(Session::acquire(&dir).is_ok(), "a brief hold is waited out");
         release.join().unwrap();
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_quiet_read_leaves_history_as_it_was() {
+        let dir = scratch("quiet");
+        let mut store = Store::open(&dir.join("p.db")).unwrap();
+        store
+            .save_scan(&[facts("one", vec![])], true, 1000)
+            .unwrap();
+        store
+            .save_scan(&[facts("one", vec![])], true, 1500)
+            .unwrap();
+        let count = |s: &Store| s.scans(10).unwrap().len();
+        assert_eq!(count(&store), 2);
+
+        store
+            .save_quiet_scan(&[facts("one", vec![])], false, 2000)
+            .unwrap();
+        assert_eq!(count(&store), 2, "a quiet partial read leaves no row");
+        assert_eq!(store.last_full_scan().unwrap(), Some(1500));
+        assert_eq!(store.last_scan().unwrap(), Some(2000));
+
+        store
+            .save_quiet_scan(&[facts("one", vec![])], true, 3000)
+            .unwrap();
+        assert_eq!(
+            count(&store),
+            2,
+            "a quiet full read replaces the one before"
+        );
+        assert_eq!(store.last_full_scan().unwrap(), Some(3000));
+
+        store
+            .save_quiet_scan(&[facts("two", vec![])], false, 4000)
+            .unwrap();
+        assert_eq!(count(&store), 3, "a new project is news");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Unlike `deps`, the slug is read on every scan, so the last scan wins

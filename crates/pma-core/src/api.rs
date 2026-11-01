@@ -737,7 +737,8 @@ pub fn portfolio(store: &Store, of: &Selection, all: bool) -> Result<Portfolio> 
         tasks,
         untiered,
         ranked_as,
-        scanned_ago: now - last,
+        // A changed file refreshes one project; this says how old the rest is.
+        scanned_ago: now - store.last_full_scan()?.unwrap_or(last),
     })
 }
 
@@ -1198,7 +1199,15 @@ pub fn query(store: &Store, q: Query) -> Result<View> {
                 ),
                 Some(_) => {
                     let p = portfolio(store, &of, false)?;
-                    (p.header(), next_lists(store, &p)?)
+                    // Only tagged items are listed, which a long TODO.md hides.
+                    let items = || p.tasks.iter().filter(|t| t.line.is_some());
+                    let tagged = items().filter(|t| t.eligible || t.manual).count();
+                    let header = format!(
+                        "{}; {tagged} of {} open items tagged #agent or #manual",
+                        p.header(),
+                        items().count()
+                    );
+                    (header, next_lists(store, &p)?)
                 }
             };
             View::Inbox {

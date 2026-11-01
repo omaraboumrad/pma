@@ -211,7 +211,7 @@ pma web --no-open --port 9000   # for `ssh -L 9000:127.0.0.1:9000 host` from ano
 pma note add "move CI to a reusable workflow"
 ```
 
-`next`, `matrix`, `status`, `history` and `tui` read the last scan. They do not rescan.
+After the first scan you rarely need to scan again. `next`, `matrix`, `status`, `task` and `dispatch` re-read a project whose `TODO.md` or git state changed, and the TUI and web do so every 5 seconds, plus a full scan with CI every `scan.every` minutes (30; 0 turns it off). An unstaged edit shows at the next full scan. See [docs/dev/refresh.md](docs/dev/refresh.md).
 
 Agents, models and presets:
 

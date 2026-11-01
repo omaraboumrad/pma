@@ -814,6 +814,15 @@ pub fn on_tab(tab: Tab) -> Vec<&'static Binding> {
         .collect()
 }
 
+/// A key as a person reads it. The table names keys as `KeyboardEvent.key`
+/// does, and that name for the space bar is a blank.
+pub fn shown(key: &str) -> &str {
+    match key {
+        " " => "Space",
+        k => k,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

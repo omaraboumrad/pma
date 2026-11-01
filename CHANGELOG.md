@@ -8,6 +8,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - **`pma integrate herdr`** runs every agent in a herdr pane: a tab per run in a `pma: <project>` workspace, closed when the run is decided. Headless by default, which keeps cost, budget and verdict; `I` or `--interactive` gives a live `claude` that reports none of them. `H` opens a run's pane and `T` opens an interactive agent on its directory. A single `integration` setting, since integrations exclude each other. Over the socket API, with an `events.subscribe` connection per run: a blocked agent shows on the run and raises a toast, and closing a pane ends its run at once. Design: `docs/dev/herdr-integration.md`.
 
+- After the first `pma scan`, a changed `TODO.md`, a commit or a new repository is picked up on its own: every 5 seconds with the TUI or web open, and before `next`, `matrix`, `status`, `task` and `dispatch`. CI is re-read every `scan.every` minutes (30; 0 turns it off) while a front end is open. Checking file times over running `git status` everywhere takes 61 ms instead of 3.38 s on 112 projects, and leaves an unstaged edit unseen until the next full scan. See [docs/dev/refresh.md](docs/dev/refresh.md).
+
+- The inbox header says how many open items are tagged `#agent` or `#manual`, since only those are listed.
+
 - An interactive run brings its herdr tab to the front, and an agent blocked on a person raises a notice in the TUI and web, with `H` on the run to open its pane. Claude has no flag to skip its folder-trust question, and writing `hasTrustDialogAccepted` to `~/.claude.json` would edit an undocumented file and hide the warning about a repo's pre-approved permissions.
 
 - `D` in the TUI and web dispatches a task and pushes the run if its gates are clean, as `pma dispatch --push` does.
