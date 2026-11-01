@@ -1784,6 +1784,15 @@ fn an_interactive_run_skips_the_baseline_and_keeps_its_commit() {
         git_out(&origin, &["log", "-1", "--format=%s", "main"]),
         "by hand\n"
     );
+    // The hand commit ticked nothing, so pma ticks the item in the clone,
+    // uncommitted, and the task leaves the lists.
+    let todo = fs::read_to_string(alpha.join("TODO.md")).unwrap();
+    assert!(todo.contains("- [x]"), "{todo}");
+    assert!(
+        git_out(&alpha, &["status", "--porcelain"]).contains("TODO.md"),
+        "left for the user to commit"
+    );
+    assert!(!env.ok(&["next"]).contains("alpha:5"));
 }
 
 /// Jobs in different projects run at once, and what is live in one project is
@@ -2588,10 +2597,16 @@ fn a_run_with_no_changes_is_not_published() {
     env.ok(&["review", "1", "--approve"]);
     let (out, _, success) = env.run(&["push", "1"]);
     assert!(
-        !success && out.contains("nothing to stage: no changes"),
+        !success && out.contains("nothing to stage: run #1 changed nothing; `pma close 1`"),
         "{out}"
     );
     assert_eq!(git_out(&origin, &["log", "--format=%s", "main"]), "init\n");
+    // The lists say to close it, not to publish it.
+    let next = env.ok(&["next"]);
+    assert!(
+        next.contains("no changes: close") && next.contains("pma close 1"),
+        "{next}"
+    );
 }
 
 #[test]

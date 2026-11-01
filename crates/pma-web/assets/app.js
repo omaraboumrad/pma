@@ -24,10 +24,13 @@ const S = {
   by: 1,
   finished: 0, // the place in keys.finished the activity tab filters to
   screens: {},
+  shown: {}, // per tab: the screen last drawn, as text, so an equal one is not redrawn
+  tfilter: {}, // per tab: the fuzzy filter its tables are narrowed by
   pane: {},
   sel: {},
   detail: null, // an open run or job: { screen, pick, acts }, over the tab
   project: "", // the project the project view shows
+  scope: "", // the tag every view is narrowed to and portfolio acts act within
   previous: "inbox", // the view it was opened from
   projects: [], // every project, worst first: { name, tier, state, tone }
   filter: "",
@@ -108,6 +111,42 @@ function onTab() {
   return S.keys.bindings.filter((b) => b.tabs.length === 0 || b.tabs.includes(S.tab));
 }
 
+// ---------------------------------------------------------------- fuzzy
+
+// pma_core::fuzzy, kept in step: the needle's characters appear in order,
+// and a match scores higher when they sit together or start words. `null`
+// when they do not appear; 0 for an empty needle.
+function fuzzyScore(needle, hay) {
+  needle = needle.toLowerCase();
+  hay = hay.toLowerCase();
+  if (!needle) return 0;
+  let score = 0;
+  let at = 0;
+  let last = -1;
+  for (const c of needle) {
+    const found = hay.indexOf(c, at);
+    if (found < 0) return null;
+    score += 2;
+    if (last >= 0 && found === last + 1) score += 3;
+    else if (last >= 0) score -= Math.min(found - last - 1, 10);
+    else score -= Math.min(found, 10);
+    if (found === 0 || !/[\p{L}\p{N}]/u.test(hay[found - 1])) score += 2;
+    last = found;
+    at = found + 1;
+  }
+  return Math.max(score, 0);
+}
+
+// The indices of `rows` the needle matches, best first; every index, in
+// order, for an empty needle. A row matches when one of its cells does.
+function fuzzyRank(needle, rows, cells) {
+  const best = (r) => cells(r).map((c) => fuzzyScore(needle, c)).filter((s) => s !== null)
+    .reduce((a, s) => (a === null || s > a ? s : a), null);
+  const scored = rows.map((r, i) => [best(r), i]).filter(([s]) => s !== null);
+  if (needle) scored.sort((a, b) => b[0] - a[0] || a[1] - b[1]);
+  return scored.map(([, i]) => i);
+}
+
 function acts(row) {
   const seen = new Set();
   return onTab().filter((b) => {
@@ -132,9 +171,29 @@ function rowButtons(toolbar, own, next) {
     el("div", { class: "more-menu", role: "group", "aria-label": "More actions" }, rest.map((b) => button(b)))));
 }
 
-function panes() {
+// The tab's tables as the server sent them.
+function rawPanes() {
   const s = S.screens[S.tab];
   return s && s.body && s.body.panes ? s.body.panes : [];
+}
+
+// The tab's tables through its filter: each keeps the rows the filter
+// matches, best first.
+function panes() {
+  const f = S.tfilter[S.tab];
+  const ps = rawPanes();
+  if (!f) return ps;
+  return ps.map((p) => ({
+    ...p,
+    items: fuzzyRank(f, p.items, (it) => it.cells.map((c) => c.text)).map((i) => p.items[i]),
+  }));
+}
+
+// Rows a page moves by: what the content area shows, less one.
+function pageRows() {
+  const tr = document.querySelector("tbody tr");
+  const row = tr ? tr.offsetHeight : 36;
+  return Math.max(1, Math.floor($("content").clientHeight / row) - 1);
 }
 
 function selected() {
@@ -164,17 +223,34 @@ const markable = (pick) => pick.kind === "task" || (pick.kind === "manual" && S.
   || (pick.kind === "run" && CLOSABLE.includes(pick.state));
 const isMarked = (pick) => S.marks.some((m) => sameTask(m, pick));
 
-function toggleMark(pick) {
+// Marks `pick`, or unmarks it; `quiet` leaves the drawing to the caller.
+function toggleMark(pick, quiet) {
   if (!markable(pick)) {
     toast("Only a task, a project or an open run can be marked.", "warn");
-    return;
+    return false;
   }
   // An act takes one kind of row, and a mark is not lost to another.
   if (S.marks.some((m) => (m.kind === "run") !== (pick.kind === "run"))) {
     toast("Another kind of row is marked; clear it first.", "warn");
-    return;
+    return false;
   }
   S.marks = isMarked(pick) ? S.marks.filter((m) => !sameTask(m, pick)) : S.marks.concat(pick);
+  if (!quiet) draw();
+  return true;
+}
+
+// Marks every row the focused table shows, or unmarks them all.
+function toggleAllMarks() {
+  const pane = panes()[S.pane[S.tab] || 0];
+  const picks = pane ? pane.items.map((it) => it.pick).filter(markable) : [];
+  if (!picks.length) {
+    toast("Nothing shown that can be marked.", "warn");
+    return;
+  }
+  const all = picks.every(isMarked);
+  for (const pick of picks) {
+    if (isMarked(pick) === all && !toggleMark(pick, true)) break;
+  }
   draw();
 }
 
@@ -198,6 +274,7 @@ function currentActs() {
 // the launch token.
 function address() {
   const q = new URLSearchParams({ tab: S.tab });
+  if (S.scope) q.set("scope", S.scope);
   if (S.tab === "project") q.set("project", S.project);
   if (S.tab === "report" && S.by) q.set("by", S.keys.by[S.by]);
   if (S.tab === "activity" && S.finished) q.set("finished", S.keys.finished[S.finished]);
@@ -225,7 +302,7 @@ function pickNamed(open) {
   if (i < 0 || !v) return null;
   if (["run", "job", "scan"].includes(kind) && !Number.isInteger(n)) return null;
   return {
-    run: { kind, id: n, clean: false, fixing: false, state: "", project: "" },
+    run: { kind, id: n, clean: false, fixing: false, empty: false, state: "", project: "" },
     job: { kind, id: n, awaiting: false },
     scan: { kind, id: n },
     route: { kind, revision: n, active: false },
@@ -241,6 +318,7 @@ async function restore() {
   const tabs = S.keys.tabs;
   S.tab = tab && tabs.includes(tab) && TABS[tab] ? tab : "inbox";
   S.project = q.get("project") || "";
+  S.scope = q.get("scope") || "";
   if (S.tab === "project" && !S.project) S.tab = "inbox";
   const by = S.keys.by.indexOf(q.get("by"));
   S.by = by >= 0 ? by : 1;
@@ -260,15 +338,23 @@ async function restore() {
 
 // ---------------------------------------------------------------- loading
 
-async function load() {
+// Loads the tab. From a refresh (`ifChanged`), a screen equal to the one
+// shown is not drawn again, so a tick moves nothing on a page being read.
+async function load(ifChanged) {
   const by = S.keys.by[S.by];
   const project = encodeURIComponent(S.project);
   const finished = S.keys.finished[S.finished];
+  let screen;
   try {
-    S.screens[S.tab] = await api(`/api/screen?tab=${S.tab}&by=${by}&project=${project}&finished=${finished}`);
+    const tag = encodeURIComponent(S.scope);
+    screen = await api(`/api/screen?tab=${S.tab}&by=${by}&project=${project}&finished=${finished}&tag=${tag}`);
   } catch (e) {
-    S.screens[S.tab] = { error: e.message };
+    screen = { error: e.message };
   }
+  const text = JSON.stringify(screen);
+  if (ifChanged && S.shown[S.tab] === text) return;
+  S.shown[S.tab] = text;
+  S.screens[S.tab] = screen;
   const ps = panes();
   const sel = S.sel[S.tab] || [];
   S.sel[S.tab] = ps.map((p, i) => Math.min(sel[i] || 0, Math.max(p.items.length - 1, 0)));
@@ -348,11 +434,15 @@ async function loadProjects() {
   try {
     const s = await api("/api/screen?tab=projects");
     const items = (s.body.panes && s.body.panes[0] ? s.body.panes[0].items : []);
+    const text = JSON.stringify(items);
+    if (S.shownProjects === text) return;
+    S.shownProjects = text;
     S.projects = items.map((it) => ({
       name: it.cells[0].text,
       tier: it.cells[1].text,
-      state: it.cells[2].text,
-      tone: it.cells[2].tone,
+      tags: it.cells[2].text,
+      state: it.cells[3].text,
+      tone: it.cells[3].tone,
     }));
   } catch (_) {
     S.projects = [];
@@ -362,6 +452,7 @@ async function loadProjects() {
 
 function openProject(name) {
   S.marks = [];
+  delete S.tfilter.project;
   if (S.tab !== "project") S.previous = S.tab;
   S.tab = "project";
   S.project = name;
@@ -371,15 +462,16 @@ function openProject(name) {
 
 // Opens the run or job `pick` names over the tab, from a row, a toast or a
 // key.
-// Row kinds a detail opens for anywhere; a task opens in its project.
-const OPENABLE = ["run", "job", "scan", "route", "campaign"];
+// Row kinds a detail opens for: a task's description is what the agent is
+// given, so it opens wherever it is listed.
+const OPENABLE = ["run", "job", "scan", "route", "campaign", "task"];
 
 function opens(pick) {
-  return OPENABLE.includes(pick.kind) || (pick.kind === "task" && S.tab === "project");
+  return OPENABLE.includes(pick.kind);
 }
 
 async function openDetail(pick) {
-  if (!OPENABLE.includes(pick.kind) && pick.kind !== "task") return;
+  if (!OPENABLE.includes(pick.kind)) return;
   try {
     const screen = await api("/api/open", { pick });
     const d = screen.body.detail;
@@ -413,9 +505,10 @@ function draw() {
   const s = S.screens[S.tab];
   const title = S.tab === "project" ? S.project : meta.label;
   $("title").textContent = title;
-  $("subtitle").textContent = s && s.header
+  const subtitle = s && s.header
     ? (S.tab === "project" ? s.header.replace(`${S.project}  `, "") : s.header)
     : meta.about;
+  $("subtitle").textContent = S.scope ? `scope #${S.scope}  ${subtitle}` : subtitle;
   document.title = `${title} - pma`;
   remember();
   drawProjects();
@@ -423,12 +516,22 @@ function draw() {
   const toolbar = $("toolbar");
   toolbar.replaceChildren();
   const content = $("content");
+  // Kept across a redraw of the same detail, so a refresh does not send a
+  // diff being read back to its top.
+  const top = content.scrollTop;
   content.replaceChildren();
   content.className = "content";
   if (S.detail) {
     drawDetail(toolbar, content);
+    content.scrollTop = top;
     return;
   }
+  drawToolbar(toolbar);
+  drawContent(content);
+}
+
+// The view's own acts, the filter, the marks' acts and the selected row's.
+function drawToolbar(toolbar) {
   if (S.tab === "report") {
     S.keys.by.forEach((name, i) => {
       toolbar.append(el("button", {
@@ -450,6 +553,28 @@ function draw() {
     });
   }
   for (const b of acts(false).filter((b) => b.tabs.length)) toolbar.append(button(b));
+  // The tab's filter, while one is typed or kept; Escape in it clears it.
+  if (S.tfilter[S.tab] !== undefined) {
+    toolbar.append(el("input", {
+      id: "table-filter",
+      class: "filter",
+      type: "search",
+      value: S.tfilter[S.tab],
+      placeholder: "Filter rows",
+      "aria-label": "Filter rows",
+      oninput: (e) => {
+        S.tfilter[S.tab] = e.target.value;
+        draw();
+        const again = $("table-filter");
+        again.focus();
+        again.setSelectionRange(again.value.length, again.value.length);
+      },
+      onkeydown: (e) => {
+        if (e.key === "Escape") { delete S.tfilter[S.tab]; draw(); }
+        if (e.key === "Enter") { if (!e.target.value) delete S.tfilter[S.tab]; e.target.blur(); draw(); }
+      },
+    }));
+  }
   if (S.marks.length) {
     const dispatch = acts(true).find((b) => b.command.act === "Dispatch");
     const back = onTab().find((b) => b.command.kind === "Back");
@@ -497,7 +622,11 @@ function draw() {
         `Open ${named}`, el("kbd", {}, openable ? proj.key : "Enter")));
     }
   }
+}
 
+// The tab's tables, or its summary and tables.
+function drawContent(content) {
+  const s = S.screens[S.tab];
   if (!s) {
     content.append(el("p", { class: "empty" }, "Loading..."));
   } else if (s.error) {
@@ -578,8 +707,11 @@ function shownNode(c, col) {
 function card(p, pi) {
   const focused = pi === (S.pane[S.tab] || 0);
   const id = `pane-${pi}`;
+  const raw = rawPanes()[pi];
+  const total = raw ? raw.items.length : p.items.length;
+  const count = S.tfilter[S.tab] ? `${p.items.length} of ${total}` : String(p.items.length);
   const box = el("section", { class: `card ${focused ? "focused" : ""}`, id: `card-${pi}`, "aria-labelledby": id },
-    el("header", { class: "card-head" }, el("h2", { id }, p.title), el("span", { class: "count" }, p.items.length)));
+    el("header", { class: "card-head" }, el("h2", { id }, p.title), el("span", { class: "count" }, count)));
   if (!p.items.length) {
     box.append(el("p", { class: "empty" }, p.empty));
     return box;
@@ -612,17 +744,41 @@ function card(p, pi) {
     },
     markable ? el("td", { class: "mark" }, box) : null,
     shown.map((i) => el("td", { class: p.columns[i].kind }, cellNode(item.cells[i], p.columns[i]))));
+    tr.dataset.i = ii;
     (total ? foot : body).append(tr);
-    if (sel) requestAnimationFrame(() => tr.scrollIntoView({ block: "nearest" }));
   });
   box.append(el("div", { class: "table-wrap" }, el("table", {}, el("thead", {}, head), body, foot)));
   return box;
 }
 
-function select(pi, ii) {
+// Moves the selection. Within the focused table only two rows change and
+// the toolbar follows; the tables are not rebuilt, so a `j` on 1,200 rows
+// costs what two rows cost. `scroll` brings the row into view: from a key,
+// never from a refresh.
+function select(pi, ii, scroll) {
+  const was = S.pane[S.tab] || 0;
   S.pane[S.tab] = pi;
   S.sel[S.tab][pi] = ii;
-  draw();
+  const card = $(`card-${pi}`);
+  if (was !== pi || !card || S.tab === "projects") {
+    draw();
+    if (scroll) revealSelection();
+    return;
+  }
+  for (const tr of card.querySelectorAll("tr[data-i]")) {
+    tr.setAttribute("aria-selected", String(Number(tr.dataset.i) === ii));
+  }
+  if (scroll) revealSelection();
+  const toolbar = $("toolbar");
+  toolbar.replaceChildren();
+  drawToolbar(toolbar);
+}
+
+// Scrolls the selected row into view.
+function revealSelection() {
+  const pi = S.pane[S.tab] || 0;
+  const tr = document.querySelector(`#card-${pi} tr[data-i="${(S.sel[S.tab] || [])[pi] || 0}"]`);
+  if (tr) tr.scrollIntoView({ block: "nearest" });
 }
 
 function fieldList(pairs) {
@@ -658,26 +814,28 @@ function toast(text, tone, open) {
 function chooser(asked, name) {
   const box = el("div", { class: "chooser" });
   const list = el("div", { class: "options", role: "radiogroup", "aria-label": name });
-  asked.options.forEach((o, i) => list.append(el("label", { class: "option", "data-name": o.name.toLowerCase() },
+  asked.options.forEach((o, i) => list.append(el("label", { class: "option", "data-name": o.name, "data-about": o.about },
     el("input", { type: "radio", name: "choice", value: o.name, checked: i === 0 }),
     el("span", { class: "option-name" }, o.name),
     el("span", { class: "option-about" }, ...inline(o.about)))));
   const rows = [...list.children];
-  const shown = () => rows.filter((r) => !r.hidden);
+  const shown = () => [...list.children].filter((r) => !r.hidden);
   const choose = (r) => {
     if (!r) return;
     r.querySelector("input").checked = true;
     r.scrollIntoView({ block: "nearest" });
   };
-  // Typing filters by name; the arrows move among what is shown.
+  // Typing filters by name and description, best match first; the arrows
+  // move among what is shown.
   const filter = el("input", {
     type: "search",
     class: "filter",
-    placeholder: "Filter by name",
-    "aria-label": "Filter by name",
+    placeholder: "Filter",
+    "aria-label": "Filter",
     oninput: () => {
-      const f = filter.value.toLowerCase();
-      for (const r of rows) r.hidden = !r.dataset.name.includes(f);
+      const kept = fuzzyRank(filter.value, rows, (r) => [r.dataset.name, r.dataset.about]);
+      for (const r of rows) r.hidden = true;
+      for (const i of kept) { rows[i].hidden = false; list.append(rows[i]); }
       const c = box.querySelector("input[name=choice]:checked");
       if (!c || c.closest(".option").hidden) choose(shown()[0]);
     },
@@ -773,7 +931,7 @@ function shortcuts() {
 async function act(b) {
   const name = b.command.act;
   const overMarks = runsMarked() ? name === "ForgetRun"
-    : MARK_ACTS.includes(name) || (name === "Run" && S.tab === "projects");
+    : MARK_ACTS.includes(name) || ((name === "Run" || name === "Configure") && S.tab === "projects");
   const marked = overMarks && S.marks.length > 0 && !S.detail;
   // A decision from a run's detail: the next ready run follows it.
   let decided = S.detail && b.command.decides ? S.detail.pick.id : null;
@@ -781,7 +939,7 @@ async function act(b) {
   let input = "";
   try {
     if (b.ask.kind !== "nothing") {
-      const asked = await api("/api/ask", { tab: S.tab, act: name, pick, project: S.project });
+      const asked = await api("/api/ask", { tab: S.tab, act: name, pick, project: S.project, tag: S.scope });
       if (b.ask.kind === "confirm" || (b.ask.confirm && !asked.items.length)) {
         const yes = await dialog({
           title: label(asked.question),
@@ -810,7 +968,7 @@ async function act(b) {
       }
     }
     const pending = toast(`${label(b.label)}...`, "accent");
-    const out = await api("/api/act", { tab: S.tab, act: name, pick, input, project: S.project })
+    const out = await api("/api/act", { tab: S.tab, act: name, pick, input, project: S.project, tag: S.scope })
       .finally(() => pending.remove());
     if (marked) S.marks = [];
     const lines = out.said.concat(out.warnings.map((w) => `Warning: ${w}`));
@@ -836,17 +994,58 @@ async function run(b) {
   const p = S.pane[t] || 0;
   const sel = S.sel[t] || [];
   const len = (panes()[p] || { items: [] }).items.length;
-  const move = (i) => { if (len) sel[p] = i; };
+  const move = (i) => { if (len) select(p, i, true); };
   switch (b.command.kind) {
     case "tab":
       S.tab = b.command.tab;
       S.detail = null;
       S.marks = [];
+      await load();
+      return revealSelection();
+    case "Down": return move(Math.min((sel[p] || 0) + 1, len - 1));
+    case "Up": return move(Math.max((sel[p] || 0) - 1, 0));
+    case "PageDown": return move(Math.min((sel[p] || 0) + pageRows(), len - 1));
+    case "PageUp": return move(Math.max((sel[p] || 0) - pageRows(), 0));
+    case "First": return move(0);
+    case "Last": return move(len - 1);
+    case "Filter":
+      if (S.tfilter[t] === undefined) S.tfilter[t] = "";
+      draw();
+      $("table-filter").focus();
+      return;
+    case "Jump": {
+      // Every project by name and tags, as the sidebar knows them.
+      const asked = {
+        options: S.projects.map((pr) => ({ name: pr.name, about: [pr.tags, pr.state].filter(Boolean).join("  ") })),
+        flags: [],
+      };
+      const node = chooser(asked, "Project");
+      const chosen = await dialog({ title: "Go to project", text: node, ok: "Open", cancel: true, read: node.read });
+      if (chosen) openProject(chosen);
+      return;
+    }
+    case "MarkAll": return toggleAllMarks();
+    case "Scope": {
+      // The tags in use, and no scope at all; the choice narrows every view.
+      let asked;
+      try { asked = await api("/api/tags"); } catch (e) { toast(e.message, "bad"); break; }
+      asked.options.unshift({ name: "*", about: "every project" });
+      const node = chooser(asked, "Tag");
+      const chosen = await dialog({ title: "Scope to a tag", text: node, ok: "Scope", cancel: true, read: node.read });
+      if (chosen === null) break;
+      S.scope = chosen === "*" ? "" : chosen;
+      S.marks = [];
       return load();
-    case "Down": move(Math.min((sel[p] || 0) + 1, len - 1)); break;
-    case "Up": move(Math.max((sel[p] || 0) - 1, 0)); break;
-    case "First": move(0); break;
-    case "Last": move(len - 1); break;
+    }
+    case "ViewDiff": {
+      // The detail, scrolled to its diff; the browser's find does the rest.
+      const pick = currentPick();
+      if (pick.kind !== "run") { toast("Select a run first.", "warn"); break; }
+      if (!S.detail) await openDetail(pick);
+      const diff = document.querySelector(".diff");
+      if (diff) diff.scrollIntoView({ block: "start" });
+      return;
+    }
     case "NextPane": S.pane[t] = (p + 1) % Math.max(panes().length, 1); break;
     case "PrevPane": S.pane[t] = (p + panes().length - 1) % Math.max(panes().length, 1); break;
     case "Back":
@@ -854,6 +1053,8 @@ async function run(b) {
         S.detail = null;
       } else if (S.marks.length) {
         S.marks = [];
+      } else if (S.tfilter[t] !== undefined) {
+        delete S.tfilter[t];
       } else if (S.tab === "project") {
         S.tab = S.previous;
         return load();
@@ -878,7 +1079,6 @@ async function run(b) {
     case "Open": {
       const pick = currentPick();
       if (OPENABLE.includes(pick.kind)) return openDetail(pick);
-      if (pick.kind === "task" && S.tab === "project") return openDetail(pick);
       if (pick.project) return openProject(pick.project);
       break;
     }
@@ -945,11 +1145,18 @@ async function start() {
   window.addEventListener("popstate", () => { if (!$("dialog").open) restore(); });
   await restore();
   const events = new EventSource("/api/events");
+  // The first tick comes at once and says only whether agents are working;
+  // the view was loaded from the address a moment ago.
+  let first = true;
   const heard = (e) => {
     let d = {};
     try { d = JSON.parse(e.data); } catch (_) { /* keep the defaults */ }
     setBusy(d.busy ? "Agents working" : "Idle", d.busy ? "working" : "");
     for (const t of d.transitions || []) toast(t.line, transitionTone(t), t.pick);
+    if (first) {
+      first = false;
+      return;
+    }
     refresh();
   };
   events.addEventListener("tick", heard);
@@ -963,10 +1170,12 @@ async function start() {
 async function refresh() {
   if ($("dialog").open) return;
   const open = S.detail ? S.detail.pick : null;
-  await Promise.all([load(), loadProjects()]);
+  await Promise.all([load(true), loadProjects()]);
   if (open && S.detail) {
     try {
       const screen = await api("/api/open", { pick: open });
+      // The same detail is not drawn again: that would move its scroll.
+      if (JSON.stringify(screen) === JSON.stringify(S.detail.screen)) return;
       const d = screen.body.detail;
       S.detail = { screen, pick: d.pick, acts: d.acts };
       draw();

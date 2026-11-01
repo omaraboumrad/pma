@@ -16,6 +16,7 @@ pub mod config;
 pub mod dates;
 pub mod deps;
 pub mod dispatch;
+pub mod fuzzy;
 pub mod herdr;
 pub mod history;
 pub mod jobs;

@@ -145,6 +145,8 @@ pub enum View {
         header: String,
         portfolio: Box<Portfolio>,
         explain: bool,
+        /// Each project's tags, for a column a filter can match.
+        tags: BTreeMap<String, Vec<String>>,
         /// The latest scans, newest first.
         scans: Vec<crate::history::Scan>,
         /// What the latest scan changed, in the selected projects.
@@ -456,10 +458,12 @@ pub enum Action {
     RetryRun {
         id: i64,
     },
-    /// `pma run <name> <project>`: a named job over one project.
+    /// `pma run <name> <project>`: a named job over one project, or over
+    /// every project carrying a tag.
     Run {
         name: String,
         projects: Vec<String>,
+        tags: Vec<String>,
         review: bool,
         worktree: bool,
         push: bool,
@@ -536,12 +540,13 @@ pub enum Action {
     RemoveCampaign {
         name: String,
     },
+    /// One or several projects, as marks give them.
     SetTier {
-        project: String,
+        projects: Vec<String>,
         tier: Option<u8>,
     },
     Tag {
-        project: String,
+        projects: Vec<String>,
         tag: String,
         add: bool,
     },
@@ -864,6 +869,7 @@ impl Transition {
                 id: self.id,
                 clean: false,
                 fixing: false,
+                empty: false,
                 // A blocked run is still running, which is what its acts go by.
                 state: match self.state.as_str() {
                     BLOCKED => "running".into(),
@@ -1059,6 +1065,62 @@ pub fn checklist(store: &Store, act: Act, pick: &screen::Pick) -> Result<Vec<(St
     }
 }
 
+/// Each present project's tags, by name.
+pub fn project_tags(store: &Store) -> Result<BTreeMap<String, Vec<String>>> {
+    let mut tags: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (project, tag) in store.project_tags()? {
+        tags.entry(project).or_default().push(tag);
+    }
+    Ok(tags)
+}
+
+/// Every present project, for a front end's `Jump`: its name, and its tags
+/// and tier to match and to tell them apart.
+pub fn project_choices(store: &Store) -> Result<Choices> {
+    let tags = project_tags(store)?;
+    let options = store
+        .projects()?
+        .into_iter()
+        .filter(|r| r.absent_since.is_none())
+        .map(|r| {
+            let mut about: Vec<String> = tags.get(&r.name).cloned().unwrap_or_default();
+            if let Some(t) = r.tier {
+                about.push(format!("T{t}"));
+            }
+            crate::catalog::Choice {
+                name: r.name,
+                reads: "project".into(),
+                about: about.join(" "),
+            }
+        })
+        .collect();
+    Ok(Choices {
+        options,
+        flags: Vec::new(),
+    })
+}
+
+/// Every tag in use with how many projects carry it, for a front end's
+/// scope. The front end adds the choice of no scope itself.
+pub fn tag_choices(store: &Store) -> Result<Choices> {
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for (_, tag) in store.project_tags()? {
+        *counts.entry(tag).or_default() += 1;
+    }
+    let options = counts
+        .into_iter()
+        .map(|(tag, n)| crate::catalog::Choice {
+            name: tag,
+            reads: "tag".into(),
+            about: format!("{n} project{}", if n == 1 { "" } else { "s" }),
+        })
+        .collect();
+    Ok(Choices {
+        options,
+        flags: Vec::new(),
+    })
+}
+
 /// What a front end lists for an act that asks `Ask::Choose`.
 pub fn choices(store: &Store, act: Act) -> Result<Choices> {
     match act {
@@ -1188,6 +1250,7 @@ pub fn query(store: &Store, q: Query) -> Result<View> {
                 header: p.header(),
                 portfolio: Box::new(p),
                 explain,
+                tags: project_tags(store)?,
                 scans,
                 changes,
                 since: store.failing_since()?,
@@ -1741,10 +1804,6 @@ pub fn act(store: &Store, a: Action) -> Result<Outcome> {
             })?;
             out
         }
-        Action::MergePr { id } => {
-            let mut run = store.run(id)?;
-            Outcome::said(publish::merge(store, &mut run)?)
-        }
         Action::StopJob { id } => Outcome::said(jobs::stop(store, id)?),
         Action::ApproveJob { id } => Outcome::said(jobs::approve(store, id)?),
         Action::StopWorkflow { instance } => {
@@ -1910,29 +1969,37 @@ pub fn act(store: &Store, a: Action) -> Result<Outcome> {
             }
             Outcome::default()
         }
-        Action::SetTier { project, tier } => {
-            let row = store
-                .project(&project)?
-                .ok_or_else(|| format!("unknown project `{project}`"))?;
-            store.set_tier(&project, &row.path, tier)?;
-            Outcome::said(match tier {
-                Some(t) => format!("{project}: tier {t}"),
-                None => format!("{project}: untiered"),
-            })
+        Action::SetTier { projects, tier } => {
+            let mut out = Outcome::default();
+            for project in projects {
+                let row = store
+                    .project(&project)?
+                    .ok_or_else(|| format!("unknown project `{project}`"))?;
+                store.set_tier(&project, &row.path, tier)?;
+                out.said.push(match tier {
+                    Some(t) => format!("{project}: tier {t}"),
+                    None => format!("{project}: untiered"),
+                });
+            }
+            out
         }
-        Action::Tag { project, tag, add } => {
+        Action::Tag { projects, tag, add } => {
             let tag = crate::projects::normal_tag(&tag)?;
-            store
-                .project(&project)?
-                .ok_or_else(|| format!("unknown project `{project}`"))?;
-            Outcome::said(match add {
-                true if store.add_project_tag(&project, &tag)? => format!("{project}: #{tag}"),
-                true => format!("{project} already carries `{tag}`"),
-                false if store.remove_project_tag(&project, &tag)? => {
-                    format!("{project}: `{tag}` removed")
-                }
-                false => format!("{project} does not carry `{tag}`"),
-            })
+            let mut out = Outcome::default();
+            for project in projects {
+                store
+                    .project(&project)?
+                    .ok_or_else(|| format!("unknown project `{project}`"))?;
+                out.said.push(match add {
+                    true if store.add_project_tag(&project, &tag)? => format!("{project}: #{tag}"),
+                    true => format!("{project} already carries `{tag}`"),
+                    false if store.remove_project_tag(&project, &tag)? => {
+                        format!("{project}: `{tag}` removed")
+                    }
+                    false => format!("{project} does not carry `{tag}`"),
+                });
+            }
+            out
         }
         Action::Prune { project } => {
             let row = store
@@ -2004,7 +2071,9 @@ pub fn act(store: &Store, a: Action) -> Result<Outcome> {
 fn run_project(store: &Store, a: &Action) -> Result<Option<String>> {
     let ids = match a {
         Action::Publish { ids, .. } => ids.clone(),
-        Action::ReworkRun { id, .. } | Action::RetryRun { id } => vec![*id],
+        Action::ReworkRun { id, .. } | Action::RetryRun { id } | Action::MergePr { id } => {
+            vec![*id]
+        }
         _ => return Ok(None),
     };
     let mut projects = Vec::new();
@@ -2191,6 +2260,7 @@ pub fn command_line(a: &Action) -> Option<Vec<String>> {
         Action::Run {
             name,
             projects,
+            tags: by_tag,
             review,
             worktree,
             push,
@@ -2198,6 +2268,10 @@ pub fn command_line(a: &Action) -> Option<Vec<String>> {
         } => {
             v.extend(["run".to_string(), name.clone()]);
             v.extend(projects.iter().cloned());
+            tags(&mut v, by_tag);
+            // A bulk selection stops at its plan unless told not to; a job
+            // has no one to answer.
+            flag(&mut v, !by_tag.is_empty(), "--yes");
             flag(&mut v, *review, "--review");
             flag(&mut v, *worktree, "--worktree");
             flag(&mut v, *push, "--push");
@@ -2238,6 +2312,8 @@ pub fn command_line(a: &Action) -> Option<Vec<String>> {
             v.extend(["campaign".to_string(), "run".into(), name.clone()]);
             opt(&mut v, "--count", &count.map(|n| n.to_string()));
         }
+        // A network call with no timeout: a job, so a front end does not wait on it.
+        Action::MergePr { id } => v.extend(["merge".to_string(), id.to_string()]),
         Action::Sync { of, apply } => {
             push("sync");
             v.extend(of.projects.iter().cloned());
@@ -2255,7 +2331,6 @@ pub fn command_line(a: &Action) -> Option<Vec<String>> {
         | Action::RejectRun { .. }
         | Action::AddReviewTime { .. }
         | Action::SettlePrs
-        | Action::MergePr { .. }
         | Action::StopJob { .. }
         | Action::ApproveJob { .. }
         | Action::StopWorkflow { .. }
@@ -2317,6 +2392,7 @@ mod tests {
             line(Action::Run {
                 name: "fix-ci".into(),
                 projects: vec!["spore".into()],
+                tags: vec![],
                 review: false,
                 worktree: true,
                 push: true,

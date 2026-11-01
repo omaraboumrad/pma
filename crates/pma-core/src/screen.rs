@@ -46,6 +46,9 @@ pub enum Pick {
         clean: bool,
         /// A conflict fix, which publishes only to its open pull request.
         fixing: bool,
+        /// The agent changed nothing, so there is nothing to approve or
+        /// publish: closing is the one step left.
+        empty: bool,
         /// The state the row showed. Approving or rejecting is refused once
         /// the run has left it, so no one acts on a run they did not see.
         state: String,
@@ -169,6 +172,12 @@ pub fn fits(act: Act, pick: &Pick) -> bool {
         }
         Act::Verify => matches!(pick, Pick::Task { .. } | Pick::Manual { .. }),
         Act::AddReviewTime => matches!(pick, Pick::Run { .. }),
+        // Nothing to approve or publish; `X` is what is left.
+        Act::ApproveRun | Act::Stage | Act::Commit | Act::Pr | Act::Push
+            if matches!(pick, Pick::Run { empty: true, .. }) =>
+        {
+            false
+        }
         Act::ApproveRun
         | Act::RejectRun
         | Act::ForgetRun
@@ -219,7 +228,13 @@ fn run_allows(act: Act, state: &str) -> bool {
 /// keeps in view: a staged run commits next, a committed one pushes.
 pub fn next_act(pick: &Pick) -> Option<Act> {
     match pick {
-        Pick::Run { state, fixing, .. } => match state.as_str() {
+        Pick::Run {
+            state,
+            fixing,
+            empty,
+            ..
+        } => match state.as_str() {
+            "ready" | "approved" if *empty => Some(Act::ForgetRun),
             "approved" if *fixing => Some(Act::Pr),
             "ready" => Some(Act::ApproveRun),
             "failed" => Some(Act::RetryRun),
@@ -471,12 +486,14 @@ fn next_pick(s: &next::Subject) -> Pick {
         next::Subject::Run {
             id,
             fixing,
+            empty,
             state,
             project,
         } => Pick::Run {
             id: *id,
             clean: false,
             fixing: *fixing,
+            empty: *empty,
             state: state.clone(),
             project: project.clone(),
         },
@@ -616,6 +633,7 @@ fn run_pick(r: &Run) -> Pick {
         id: r.id,
         clean: r.state == RunState::Ready && accept::review_reasons(r).is_empty(),
         fixing: r.fixing_pr().is_some(),
+        empty: r.changed_nothing(),
         state: r.state.name().into(),
         project: r.project.clone(),
     }
@@ -1432,6 +1450,7 @@ pub fn screen(view: View) -> Screen {
         View::Status {
             header,
             portfolio: p,
+            tags,
             scans,
             changes,
             since,
@@ -1464,6 +1483,11 @@ pub fn screen(view: View) -> Screen {
                     cells[5] = linked(
                         cells[5].clone(),
                         url.map(|u| format!("{u}/actions")).as_deref(),
+                    );
+                    // After the tier: what a filter matches a set by.
+                    cells.insert(
+                        2,
+                        muted(tags.get(&name).map_or(String::new(), |t| t.join(" "))),
                     );
                     Item {
                         pick: Pick::Manual { project: name },
@@ -1513,6 +1537,7 @@ pub fn screen(view: View) -> Screen {
                         columns: vec![
                             col("project", Kind::Text),
                             col("tier", Kind::Text),
+                            col("tags", Kind::Text),
                             col("state", Kind::Badge),
                             col("open", Kind::Number),
                             col("idle", Kind::Number),
@@ -2345,12 +2370,30 @@ pub fn action_in(
     input: &str,
     project: &str,
 ) -> Result<Action, String> {
+    action_scoped(act, pick, pane, input, project, &[])
+}
+
+/// `action_in`, within a scope: the tags the front end's views are narrowed
+/// to. A scan or a sync covers them; a run or a workflow with no project
+/// named goes over them, as `--tag` does.
+pub fn action_scoped(
+    act: Act,
+    pick: &Pick,
+    pane: &[Item],
+    input: &str,
+    project: &str,
+    scope: &[String],
+) -> Result<Action, String> {
     let input = input.trim();
     let worker = WorkerChoice::default();
     let need = |what: &str| Err(format!("select {what} first"));
+    let scoped = || Selection {
+        projects: Vec::new(),
+        tags: scope.to_vec(),
+    };
     Ok(match (act, pick) {
         (Act::Scan, _) => Action::Scan {
-            of: Selection::default(),
+            of: scoped(),
             offline: false,
             deps: false,
         },
@@ -2385,18 +2428,12 @@ pub fn action_in(
             }
         }
         (Act::Sync, _) => Action::Sync {
-            of: Selection::default(),
+            of: scoped(),
             apply: true,
         },
         (Act::AddNote, _) => Action::AddNote { text: input.into() },
         (Act::SettlePrs, _) => Action::SettlePrs,
         (Act::Run, pick) => {
-            let projects = match (pick, pick.project()) {
-                (Pick::Projects { names }, _) => names.clone(),
-                (_, Some(p)) => vec![p.to_string()],
-                (_, None) if !project.is_empty() => vec![project.to_string()],
-                (_, None) => return Err("open a project, or select a row that names one".into()),
-            };
             let mut words = input.split_whitespace();
             let name = words
                 .next()
@@ -2404,11 +2441,13 @@ pub fn action_in(
                 .to_string();
             let (mut review, mut worktree, mut push, mut agent, mut model) =
                 (false, false, false, None, None);
+            let mut tags = Vec::new();
             for w in words {
                 match w {
                     "--review" => review = true,
                     "--worktree" => worktree = true,
                     "--push" => push = true,
+                    _ if w.starts_with("--tag=") => tags.push(w[6..].to_string()),
                     _ if w.starts_with("--worker=") || w.starts_with("-w=") => {
                         let v = w.split_once('=').map_or("", |(_, v)| v);
                         let (a, m) = v.split_once(':').map_or((v, None), |(a, m)| (a, Some(m)));
@@ -2418,9 +2457,25 @@ pub fn action_in(
                     _ => return Err(format!("unknown flag `{w}`")),
                 }
             }
+            // A typed tag, else the row's project, the project in view, or
+            // the scope's tags.
+            let projects = match (tags.is_empty(), pick, pick.project()) {
+                (false, _, _) => Vec::new(),
+                (true, Pick::Projects { names }, _) => names.clone(),
+                (true, _, Some(p)) => vec![p.to_string()],
+                (true, _, None) if !project.is_empty() => vec![project.to_string()],
+                (true, _, None) if !scope.is_empty() => {
+                    tags = scope.to_vec();
+                    Vec::new()
+                }
+                (true, _, None) => {
+                    return Err("open a project, or select a row that names one".into());
+                }
+            };
             Action::Run {
                 name,
                 projects,
+                tags,
                 review,
                 worktree,
                 push,
@@ -2438,21 +2493,26 @@ pub fn action_in(
                 .ok_or("type a workflow name, then its target")?
                 .to_string();
             let (mut projects, mut set) = (Vec::new(), Vec::new());
-            let (mut local, mut unattended, mut model) = (false, false, None);
+            let (mut local, mut unattended, mut model, mut tag) = (false, false, None, None);
             for w in words {
                 match w {
                     "--local" => local = true,
                     "--unattended" => unattended = true,
                     _ if w.starts_with("--model=") => model = Some(w[8..].to_string()),
                     _ if w.starts_with("--set=") => set.push(w[6..].to_string()),
+                    _ if w.starts_with("--tag=") => tag = Some(w[6..].to_string()),
                     _ if w.starts_with('-') => return Err(format!("unknown flag `{w}`")),
                     _ => projects.push(w.to_string()),
                 }
             }
+            // With no target named, the scope's tag is the target.
+            if projects.is_empty() && tag.is_none() {
+                tag = scope.first().cloned();
+            }
             Action::WorkflowRun {
                 name,
                 projects,
-                tag: None,
+                tag,
                 instance: None,
                 set,
                 approve: None,
@@ -2466,10 +2526,12 @@ pub fn action_in(
             }
         }
         (Act::Configure, pick) => {
-            let project = match pick.project() {
-                Some(p) => p.to_string(),
-                None if !project.is_empty() => project.to_string(),
-                None => return Err("open a project first".into()),
+            // The marked projects, else the row's, else the one in view.
+            let projects = match (pick, pick.project()) {
+                (Pick::Projects { names }, _) => names.clone(),
+                (_, Some(p)) => vec![p.to_string()],
+                (_, None) if !project.is_empty() => vec![project.to_string()],
+                (_, None) => return Err("open a project first".into()),
             };
             let (what, value) = input
                 .split_once(char::is_whitespace)
@@ -2486,23 +2548,26 @@ pub fn action_in(
                                 .ok_or("tier must be 1 to 5, or none")?,
                         ),
                     },
-                    project,
+                    projects,
                 },
                 "tag" => match value.split_at_checked(1) {
                     Some(("+", tag)) if !tag.is_empty() => Action::Tag {
-                        project,
+                        projects,
                         tag: tag.to_string(),
                         add: true,
                     },
                     Some(("-", tag)) if !tag.is_empty() => Action::Tag {
-                        project,
+                        projects,
                         tag: tag.to_string(),
                         add: false,
                     },
                     _ => return Err("`tag +name` adds a tag, `tag -name` removes one".into()),
                 },
+                "verify" | "sandbox" if projects.len() > 1 => {
+                    return Err(format!("`{what}` is set one project at a time"));
+                }
                 "verify" | "sandbox" => Action::SetConfig {
-                    key: format!("projects.{project}.{what}"),
+                    key: format!("projects.{}.{what}", projects[0]),
                     value: value.to_string(),
                 },
                 _ => {
@@ -2736,6 +2801,17 @@ pub fn action_in(
         (Act::Dispatch | Act::DispatchPush | Act::DispatchInteractive | Act::Verify, _) => {
             return need("a task");
         }
+        (
+            Act::ApproveRun | Act::Stage | Act::Commit | Act::Pr | Act::Push,
+            Pick::Run {
+                id, empty: true, ..
+            },
+        ) => {
+            return Err(format!(
+                "run #{id} changed nothing, so there is nothing to approve or publish; \
+                 X closes it"
+            ));
+        }
         (Act::ApproveRun, Pick::Run { id, state, .. }) => Action::ApproveRun {
             id: *id,
             seen: Some(state.clone()),
@@ -2878,6 +2954,7 @@ mod tests {
             cells: vec![plain(format!("#{id}"))],
             pick: Pick::Run {
                 fixing: false,
+                empty: false,
                 id,
                 clean,
                 state: "ready".into(),
@@ -2939,6 +3016,27 @@ mod tests {
         assert!(fits(Act::DispatchPush, &task));
     }
 
+    /// A run that changed nothing offers closing and nothing to approve or
+    /// publish, whatever its state says.
+    #[test]
+    fn a_run_that_changed_nothing_offers_closing_only() {
+        let pick = Pick::Run {
+            id: 9,
+            clean: false,
+            fixing: false,
+            empty: true,
+            state: "approved".into(),
+            project: "p".into(),
+        };
+        assert_eq!(next_act(&pick), Some(Act::ForgetRun));
+        assert!(fits(Act::ForgetRun, &pick) && fits(Act::RejectRun, &pick));
+        for act in [Act::ApproveRun, Act::Stage, Act::Commit, Act::Pr, Act::Push] {
+            assert!(!fits(act, &pick), "{act:?}");
+            let err = action(act, &pick, &[], "").unwrap_err();
+            assert!(err.contains("changed nothing"), "{act:?}: {err}");
+        }
+    }
+
     /// `U` pushes what has been read: never a ready run, nor one fixing a
     /// pull request's conflicts.
     #[test]
@@ -2949,6 +3047,7 @@ mod tests {
                 fixing,
                 id,
                 clean: true,
+                empty: false,
                 state: state.into(),
                 project: "p".into(),
             },
@@ -2978,6 +3077,7 @@ mod tests {
         let drop = |state: &str, input| {
             let pick = Pick::Run {
                 fixing: false,
+                empty: false,
                 id: 1,
                 clean: false,
                 state: state.into(),
@@ -3000,6 +3100,7 @@ mod tests {
             id: 1,
             clean: false,
             fixing: false,
+            empty: false,
             state: state.into(),
             project: "p".into(),
         };
@@ -3023,6 +3124,7 @@ mod tests {
                 id: 1,
                 clean: false,
                 fixing: false,
+                empty: false,
                 state: state.into(),
                 project: "p".into(),
             };
@@ -3146,6 +3248,7 @@ mod tests {
             id: 3,
             clean: false,
             fixing: false,
+            empty: false,
             state: "ready".into(),
             project: "a".into(),
         };
@@ -3172,6 +3275,7 @@ mod tests {
             id: 1,
             clean: false,
             fixing: false,
+            empty: false,
             state: "ready".into(),
             project: "a".into(),
         };
@@ -3250,6 +3354,7 @@ mod tests {
                     id: 2,
                     clean: false,
                     fixing: false,
+                    empty: false,
                     state: "ready".into(),
                     project: "p".into()
                 },
@@ -3265,6 +3370,7 @@ mod tests {
                     id: 2,
                     clean: false,
                     fixing: false,
+                    empty: false,
                     state: "ready".into(),
                     project: "p".into()
                 },
@@ -3288,6 +3394,7 @@ mod tests {
             id: 1,
             clean: true,
             fixing: false,
+            empty: false,
             state: "ready".into(),
             project: "a".into(),
         };
@@ -3370,6 +3477,7 @@ mod tests {
             worktree,
             push,
             worker,
+            ..
         }) = action(Act::Run, &row, &[], "fix-ci --push --worker=claude:haiku")
         else {
             panic!("a run");
@@ -3387,6 +3495,38 @@ mod tests {
             panic!("a run on the project in view");
         };
         assert_eq!(projects, ["argdec"]);
+        // With no project, the scope's tags are the target; a typed tag wins
+        // over a row.
+        let audio = ["audio".to_string()];
+        let Ok(Action::Run { projects, tags, .. }) =
+            action_scoped(Act::Run, &Pick::Nothing, &[], "review", "", &audio)
+        else {
+            panic!("a run over the scope");
+        };
+        assert!(projects.is_empty() && tags == audio);
+        let Ok(Action::Run { projects, tags, .. }) =
+            action_scoped(Act::Run, &row, &[], "review --tag=ai", "", &audio)
+        else {
+            panic!("a run over a typed tag");
+        };
+        assert!(projects.is_empty() && tags == ["ai"]);
+        let Ok(Action::WorkflowRun { tag, .. }) = action_scoped(
+            Act::StartWorkflow,
+            &Pick::Nothing,
+            &[],
+            "triage --local",
+            "",
+            &audio,
+        ) else {
+            panic!("a workflow over the scope");
+        };
+        assert_eq!(tag.as_deref(), Some("audio"));
+        let Ok(Action::Scan { of, .. }) =
+            action_scoped(Act::Scan, &Pick::Nothing, &[], "", "", &audio)
+        else {
+            panic!("a scan within the scope");
+        };
+        assert_eq!(of.tags, audio);
         // Marked projects are one run over them all.
         let marks = [
             Pick::Manual {
@@ -3459,6 +3599,7 @@ mod tests {
             id: 7,
             clean: false,
             fixing: false,
+            empty: false,
             state: "ready".into(),
             project: "p".into(),
         };
@@ -3474,18 +3615,31 @@ mod tests {
         assert_eq!(
             action_in(Act::Configure, &none, &[], "tier 2", "argdec"),
             Ok(Action::SetTier {
-                project: "argdec".into(),
+                projects: vec!["argdec".into()],
                 tier: Some(2)
             })
         );
         assert_eq!(
             action_in(Act::Configure, &none, &[], "tag +oss", "argdec"),
             Ok(Action::Tag {
-                project: "argdec".into(),
+                projects: vec!["argdec".into()],
                 tag: "oss".into(),
                 add: true
             })
         );
+        // Marked projects take a tier or a tag together; a verify command is
+        // one project's.
+        let marked = Pick::Projects {
+            names: vec!["a".into(), "b".into()],
+        };
+        assert_eq!(
+            action_in(Act::Configure, &marked, &[], "tier 1", ""),
+            Ok(Action::SetTier {
+                projects: vec!["a".into(), "b".into()],
+                tier: Some(1)
+            })
+        );
+        assert!(action_in(Act::Configure, &marked, &[], "verify make test", "").is_err());
         assert_eq!(
             action_in(Act::Configure, &none, &[], "verify make test", "argdec"),
             Ok(Action::SetConfig {

@@ -31,14 +31,18 @@ use pma_core::store::Store;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
+/// The scope chooser's first option: every project. No tag is spelled so.
+const NO_SCOPE: &str = "*";
+
 /// What the run loop does for a key.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Request {
     Load(Query),
     Act(Action),
-    /// The list `api::choices` gives for an act, to choose from.
+    /// A list to choose from: what `api::choices` gives for an act, the
+    /// projects, to open one, or the tags, to scope the views to one.
     Choose {
-        act: Act,
+        what: Choosing,
         pick: Pick,
         label: &'static str,
     },
@@ -54,7 +58,22 @@ pub enum Request {
         pick: Pick,
         label: &'static str,
     },
+    /// The run's diff in `$PAGER`, with the terminal handed over meanwhile.
+    Pager {
+        id: i64,
+    },
     Quit,
+}
+
+/// What a chooser's list is of.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Choosing {
+    /// The options an act offers (`api::choices`).
+    Act(Act),
+    /// A project to open (`api::project_choices`).
+    Project,
+    /// A tag to scope every view to (`api::tag_choices`), or none.
+    Scope,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -76,10 +95,10 @@ enum Mode {
         input: String,
         pick: Pick,
     },
-    /// A list to choose from, with flags to toggle, for an act. `at` is a
-    /// place among the options `filter` keeps; `/` starts the filter.
+    /// A list to choose from, with flags to toggle. `at` is a place among
+    /// the options `filter` keeps; `/` starts the filter.
     Choose {
-        act: Act,
+        what: Choosing,
         label: &'static str,
         pick: Pick,
         choices: api::Choices,
@@ -87,6 +106,8 @@ enum Mode {
         on: Vec<bool>,
         filter: Option<String>,
     },
+    /// Typing the tab's filter; Enter keeps it, Escape clears it.
+    Filter,
     /// Rows to check or uncheck for an act, such as a bundle's items before
     /// its approval.
     Check {
@@ -148,10 +169,23 @@ pub struct App {
     by: usize,
     /// The place in `api::FINISHED` the activity tab filters to.
     finished: usize,
+    /// Per tab: what is shown, which is `full` with `filter` applied.
     screens: Vec<Option<std::result::Result<Screen, String>>>,
+    full: Vec<Option<std::result::Result<Screen, String>>>,
+    /// Per tab: the fuzzy filter its tables are narrowed by, if any.
+    filter: Vec<Option<String>>,
     /// Per tab: the focused pane, and the selection in each pane.
     pane: Vec<usize>,
     selected: Vec<Vec<TableState>>,
+    /// Per tab and pane: the rows the last draw had room for, so a page is
+    /// what is seen.
+    rows: Vec<Vec<u16>>,
+    /// The open detail as last drawn: its lines once wrapped, and the rows
+    /// it had, so a page and the end are what is seen.
+    extent: (usize, u16),
+    /// The tags every view is narrowed to, and every act over the portfolio
+    /// acts within; empty is every project.
+    scope: Vec<String>,
     mode: Mode,
     status: Option<(String, Tone)>,
     /// Runs and jobs the footer names, oldest first; Enter opens the first.
@@ -185,8 +219,13 @@ impl App {
             by: 1,
             finished: 0,
             screens: vec![None; n],
+            full: vec![None; n],
+            filter: vec![None; n],
             pane: vec![0; n],
             selected: vec![Vec::new(); n],
+            rows: vec![Vec::new(); n],
+            extent: (0, 20),
+            scope: Vec::new(),
             mode: Mode::Normal,
             status: None,
             notices: Vec::new(),
@@ -197,13 +236,22 @@ impl App {
         }
     }
 
-    /// The query that fills the current tab.
+    /// The query that fills the current tab, within the scope.
     pub fn query(&self) -> Query {
         self.tab.query(
+            self.selection(),
             By::ALL[self.by].1,
             &self.project,
             api::FINISHED[self.finished],
         )
+    }
+
+    /// The scope as a selection: the tags every view is narrowed to.
+    fn selection(&self) -> api::Selection {
+        api::Selection {
+            projects: Vec::new(),
+            tags: self.scope.clone(),
+        }
     }
 
     /// Whether a refresh may replace what is shown: not while a prompt, a
@@ -279,6 +327,7 @@ impl App {
             Ok(v) => screen::screen(v),
             Err(e) => {
                 let t = index(self.tab);
+                self.full[t] = Some(Err(e.clone()));
                 self.screens[t] = Some(Err(e));
                 return;
             }
@@ -291,6 +340,29 @@ impl App {
             return;
         };
         let t = index(tab);
+        self.full[t] = Some(Ok(s));
+        self.refilter(t);
+    }
+
+    /// Shows tab `t`'s screen through its filter: each table keeps the rows
+    /// the filter matches, best first. The selection stays within what is
+    /// shown, and a mark on a row no longer shown is dropped.
+    fn refilter(&mut self, t: usize) {
+        let Some(Ok(full)) = &self.full[t] else {
+            self.screens[t] = self.full[t].clone();
+            return;
+        };
+        let mut s = full.clone();
+        if let (Some(f), Body::Panes(panes)) = (self.filter[t].as_deref(), &mut s.body)
+            && !f.is_empty()
+        {
+            for pane in panes.iter_mut() {
+                let kept = pma_core::fuzzy::rank(f, &pane.items, |i| {
+                    i.texts().iter().map(|t| t.to_string()).collect()
+                });
+                pane.items = kept.into_iter().map(|i| pane.items[i].clone()).collect();
+            }
+        }
         if let Body::Panes(panes) = &s.body {
             // Keep each selection where it was, within the new length.
             let states = &mut self.selected[t];
@@ -312,7 +384,7 @@ impl App {
         }
         // A mark on a row no longer shown would be dispatched unseen. One
         // still shown takes the row's pick as it is now: its `retry` moves.
-        if tab == self.tab
+        if t == index(self.tab)
             && let Body::Panes(panes) = &s.body
         {
             let rows: Vec<&Pick> = panes
@@ -329,20 +401,34 @@ impl App {
         self.screens[t] = Some(Ok(s));
     }
 
-    /// The list for an act arrived, or failed to.
+    /// The list for an act arrived, or failed to. A scope's list starts with
+    /// the choice of no scope, so it is never empty.
     pub fn offered(
         &mut self,
-        act: Act,
+        what: Choosing,
         pick: Pick,
         label: &'static str,
         choices: std::result::Result<api::Choices, String>,
     ) {
+        let choices = choices.map(|mut c| {
+            if what == Choosing::Scope {
+                c.options.insert(
+                    0,
+                    pma_core::catalog::Choice {
+                        name: NO_SCOPE.into(),
+                        reads: "tag".into(),
+                        about: "every project".into(),
+                    },
+                );
+            }
+            c
+        });
         match choices {
             Ok(choices) if choices.options.is_empty() => self.say("Nothing to choose.", Tone::Warn),
             Ok(choices) => {
                 let on = vec![false; choices.flags.len()];
                 self.mode = Mode::Choose {
-                    act,
+                    what,
                     label,
                     pick,
                     choices,
@@ -444,12 +530,16 @@ impl App {
                 return None;
             }
             Mode::Detail { scroll, screen } => {
+                // The last row the view can start at and still be full.
+                let (total, rows) = self.extent;
+                let end = total.saturating_sub(rows as usize).min(u16::MAX as usize) as u16;
                 match key {
-                    "j" | "ArrowDown" => *scroll = scroll.saturating_add(1),
+                    "j" | "ArrowDown" => *scroll = scroll.saturating_add(1).min(end),
                     "k" | "ArrowUp" => *scroll = scroll.saturating_sub(1),
                     "g" | "Home" => *scroll = 0,
-                    "PageDown" | " " => *scroll = scroll.saturating_add(20),
-                    "PageUp" => *scroll = scroll.saturating_sub(20),
+                    "G" | "End" => *scroll = end,
+                    "PageDown" | " " => *scroll = scroll.saturating_add(rows).min(end),
+                    "PageUp" => *scroll = scroll.saturating_sub(rows),
                     "Escape" | "q" | "Enter" => self.mode = Mode::Normal,
                     _ => {
                         // An act that fits what the detail shows applies
@@ -459,6 +549,11 @@ impl App {
                         };
                         let pick = d.pick.clone();
                         let b = keys::lookup(key, self.tab, &pick)?;
+                        if b.command == Command::ViewDiff
+                            && let Pick::Run { id, .. } = pick
+                        {
+                            return Some(Request::Pager { id });
+                        }
                         if let Command::Act(act) = b.command
                             && act.on_row()
                             && screen::fits(act, &pick)
@@ -541,7 +636,7 @@ impl App {
                     }
                     ("Enter", _) => {
                         let Mode::Choose {
-                            act,
+                            what,
                             pick,
                             choices,
                             at,
@@ -556,7 +651,20 @@ impl App {
                             self.say("Nothing matches.", Tone::Warn);
                             return None;
                         };
-                        let input = choices.line(&choices.options[i].name, &on);
+                        let name = choices.options[i].name.clone();
+                        let act = match what {
+                            Choosing::Act(act) => act,
+                            Choosing::Project => return Some(self.open_project(name)),
+                            Choosing::Scope => {
+                                self.scope = match name.as_str() {
+                                    NO_SCOPE => Vec::new(),
+                                    tag => vec![tag.to_string()],
+                                };
+                                self.marks.clear();
+                                return Some(Request::Load(self.query()));
+                            }
+                        };
+                        let input = choices.line(&name, &on);
                         let (_, pane) = self.pick();
                         return self.ask_done(act, &pick, &pane, &input);
                     }
@@ -568,6 +676,47 @@ impl App {
                         if let Some(i) = choices.flags.iter().position(|f| f.key == k) {
                             on[i] = !on[i];
                         }
+                    }
+                    _ => {}
+                }
+                return None;
+            }
+            Mode::Filter => {
+                let t = index(self.tab);
+                match key {
+                    "Escape" => {
+                        self.filter[t] = None;
+                        self.refilter(t);
+                        self.mode = Mode::Normal;
+                        self.say("Filter cleared.", Tone::Muted);
+                    }
+                    "Enter" => {
+                        if self.filter[t].as_deref().is_some_and(str::is_empty) {
+                            self.filter[t] = None;
+                        }
+                        self.mode = Mode::Normal;
+                    }
+                    "Backspace" => {
+                        if let Some(f) = &mut self.filter[t] {
+                            f.pop();
+                        }
+                        self.refilter(t);
+                    }
+                    "ArrowDown" | "ArrowUp" => {
+                        let len = self.panes().get(self.pane[t]).map_or(0, |p| p.items.len());
+                        if let Some(state) = self.selected[t].get_mut(self.pane[t])
+                            && len > 0
+                        {
+                            let at = state.selected().unwrap_or(0);
+                            state.select(Some(match key {
+                                "ArrowDown" => (at + 1).min(len - 1),
+                                _ => at.saturating_sub(1),
+                            }));
+                        }
+                    }
+                    k if k.chars().count() == 1 => {
+                        self.filter[t].get_or_insert_default().push_str(k);
+                        self.refilter(t);
                     }
                     _ => {}
                 }
@@ -625,9 +774,16 @@ impl App {
                 self.marks.clear();
                 return Some(Request::Load(self.query()));
             }
-            Command::Down | Command::Up | Command::First | Command::Last => {
+            Command::Down
+            | Command::Up
+            | Command::First
+            | Command::Last
+            | Command::PageDown
+            | Command::PageUp => {
                 let len = self.panes().get(self.pane[t]).map_or(0, |p| p.items.len());
                 let p = self.pane[t];
+                // A page is what the last draw had room for; 10 before one.
+                let page = self.rows[t].get(p).copied().unwrap_or(10).max(1) as usize;
                 if let Some(state) = self.selected[t].get_mut(p)
                     && len > 0
                 {
@@ -635,11 +791,36 @@ impl App {
                     state.select(Some(match binding.command {
                         Command::Down => (at + 1).min(len - 1),
                         Command::Up => at.saturating_sub(1),
+                        Command::PageDown => (at + page).min(len - 1),
+                        Command::PageUp => at.saturating_sub(page),
                         Command::First => 0,
                         _ => len - 1,
                     }));
                 }
             }
+            Command::Filter => {
+                self.status = None;
+                self.filter[t].get_or_insert_default();
+                self.mode = Mode::Filter;
+            }
+            Command::Jump => {
+                return Some(Request::Choose {
+                    what: Choosing::Project,
+                    pick: Pick::Nothing,
+                    label: "go to project",
+                });
+            }
+            Command::Scope => {
+                return Some(Request::Choose {
+                    what: Choosing::Scope,
+                    pick: Pick::Nothing,
+                    label: "scope to a tag",
+                });
+            }
+            Command::ViewDiff => match self.pick().0 {
+                Pick::Run { id, .. } => return Some(Request::Pager { id }),
+                _ => self.say("Select a run first.", Tone::Warn),
+            },
             Command::NextPane | Command::PrevPane => {
                 let n = self.panes().len().max(1);
                 self.pane[t] = match binding.command {
@@ -651,13 +832,12 @@ impl App {
                 return match self.pick().0 {
                     Pick::Run { id, .. } => Some(Request::Load(Query::Run { id })),
                     Pick::Job { id, .. } => Some(Request::Load(Query::JobLog { id })),
-                    // In its project, a task opens in full; elsewhere Enter
-                    // on a task is `o`: the project is what there is to open.
+                    // A task opens in full wherever it is listed: its
+                    // description is what the agent is given. `o` opens
+                    // its project.
                     Pick::Task {
                         project, target, ..
-                    } if self.tab == Tab::Project => {
-                        Some(Request::Load(Query::task(&project, &target)))
-                    }
+                    } => Some(Request::Load(Query::task(&project, &target))),
                     Pick::Scan { id } => Some(Request::Load(Query::Scan { id })),
                     Pick::Route { revision, .. } => {
                         Some(Request::Load(Query::RouteDoc { revision }))
@@ -671,6 +851,10 @@ impl App {
                 if !self.marks.is_empty() {
                     self.marks.clear();
                     self.say("Marks cleared.", Tone::Muted);
+                } else if self.filter[t].is_some() {
+                    self.filter[t] = None;
+                    self.refilter(t);
+                    self.say("Filter cleared.", Tone::Muted);
                 } else if self.tab == Tab::Project {
                     self.tab = self.previous;
                     return Some(Request::Load(self.query()));
@@ -692,45 +876,45 @@ impl App {
             Command::Quit => return Some(Request::Quit),
             Command::Mark => {
                 let pick = self.pick().0;
-                let markable = match &pick {
-                    Pick::Task { .. } => true,
-                    Pick::Manual { .. } => self.tab == Tab::Projects,
-                    Pick::Run { .. } => screen::fits(Act::ForgetRun, &pick),
-                    _ => false,
-                };
-                if !markable {
+                if !self.markable(&pick) {
                     self.say(
                         "Only a task, a project or an open run can be marked.",
                         Tone::Warn,
                     );
                     return None;
                 }
-                // An act takes one kind of row, and a mark is not lost to another.
-                let is_run = |p: &Pick| matches!(p, Pick::Run { .. });
-                if self.marks.iter().any(|m| is_run(m) != is_run(&pick)) {
-                    self.say(
-                        "Another kind of row is marked; Esc clears it first.",
-                        Tone::Warn,
-                    );
+                if let Err(e) = self.toggle_mark(&pick) {
+                    self.say(e, Tone::Warn);
                     return None;
                 }
-                match self.marks.iter().position(|m| same_task(m, &pick)) {
-                    Some(i) => {
-                        self.marks.remove(i);
+                self.say_marks(&pick);
+            }
+            Command::MarkAll => {
+                let picks: Vec<Pick> = self
+                    .pick()
+                    .1
+                    .into_iter()
+                    .map(|i| i.pick)
+                    .filter(|p| self.markable(p))
+                    .collect();
+                if picks.is_empty() {
+                    self.say("Nothing shown that can be marked.", Tone::Warn);
+                    return None;
+                }
+                // Every shown row marked already: unmark them all.
+                let all = picks
+                    .iter()
+                    .all(|p| self.marks.iter().any(|m| same_task(m, p)));
+                for pick in &picks {
+                    let marked = self.marks.iter().any(|m| same_task(m, pick));
+                    if marked == all
+                        && let Err(e) = self.toggle_mark(pick)
+                    {
+                        self.say(e, Tone::Warn);
+                        return None;
                     }
-                    None => self.marks.push(pick.clone()),
                 }
-                match self.marks.len() {
-                    0 => self.say("Nothing marked.", Tone::Muted),
-                    n if is_run(&pick) => self.say(
-                        format!("{n} marked; X closes them, leaving their files. Esc clears."),
-                        Tone::Accent,
-                    ),
-                    n => self.say(
-                        format!("{n} marked; d dispatches them, one run per project. Esc clears."),
-                        Tone::Accent,
-                    ),
-                }
+                self.say_marks(&picks[0]);
             }
             Command::Act(act) => {
                 let (mut pick, pane) = self.pick();
@@ -738,7 +922,7 @@ impl App {
                 let over_marks = match act {
                     Act::ForgetRun => runs_marked,
                     Act::Dispatch | Act::DispatchPush | Act::DispatchInteractive => !runs_marked,
-                    Act::Run => self.tab == Tab::Projects,
+                    Act::Run | Act::Configure => self.tab == Tab::Projects,
                     _ => false,
                 };
                 if over_marks && !self.marks.is_empty() {
@@ -751,10 +935,57 @@ impl App {
         None
     }
 
+    /// Whether a row can be marked here: a task, a project on the projects
+    /// tab, or a run that can be closed.
+    fn markable(&self, pick: &Pick) -> bool {
+        match pick {
+            Pick::Task { .. } => true,
+            Pick::Manual { .. } => self.tab == Tab::Projects,
+            Pick::Run { .. } => screen::fits(Act::ForgetRun, pick),
+            _ => false,
+        }
+    }
+
+    /// Marks `pick`, or unmarks it. An act takes one kind of row, so a mark
+    /// of another kind is refused rather than lost.
+    fn toggle_mark(&mut self, pick: &Pick) -> std::result::Result<(), &'static str> {
+        let is_run = |p: &Pick| matches!(p, Pick::Run { .. });
+        if self.marks.iter().any(|m| is_run(m) != is_run(pick)) {
+            return Err("Another kind of row is marked; Esc clears it first.");
+        }
+        match self.marks.iter().position(|m| same_task(m, pick)) {
+            Some(i) => {
+                self.marks.remove(i);
+            }
+            None => self.marks.push(pick.clone()),
+        }
+        Ok(())
+    }
+
+    /// Says how many rows are marked and what acts on them.
+    fn say_marks(&mut self, kind: &Pick) {
+        match self.marks.len() {
+            0 => self.say("Nothing marked.", Tone::Muted),
+            n if matches!(kind, Pick::Run { .. }) => self.say(
+                format!("{n} marked; X closes them, leaving their files. Esc clears."),
+                Tone::Accent,
+            ),
+            n if matches!(kind, Pick::Manual { .. }) => self.say(
+                format!("{n} marked; z runs one name over them. Esc clears."),
+                Tone::Accent,
+            ),
+            n => self.say(
+                format!("{n} marked; d dispatches them, one run per project. Esc clears."),
+                Tone::Accent,
+            ),
+        }
+    }
+
     /// Opens `name`'s project view, remembering where it was opened from.
     fn open_project(&mut self, name: String) -> Request {
         self.project = name;
         self.marks.clear();
+        self.filter[index(Tab::Project)] = None;
         if self.tab != Tab::Project {
             self.previous = self.tab;
         }
@@ -776,29 +1007,35 @@ impl App {
                 };
                 None
             }
-            Ask::Choose(label) => Some(Request::Choose { act, pick, label }),
+            Ask::Choose(label) => Some(Request::Choose {
+                what: Choosing::Act(act),
+                pick,
+                label,
+            }),
             Ask::Check(label) | Ask::CheckOrConfirm(label) => {
                 Some(Request::Check { act, pick, label })
             }
-            Ask::Confirm => match screen::action_in(act, &pick, &pane, "", &self.project) {
-                Ok(action) => {
-                    self.mode = Mode::Confirm {
-                        action,
-                        question: screen::question(act, &pick),
-                    };
-                    None
+            Ask::Confirm => {
+                match screen::action_scoped(act, &pick, &pane, "", &self.project, &self.scope) {
+                    Ok(action) => {
+                        self.mode = Mode::Confirm {
+                            action,
+                            question: screen::question(act, &pick),
+                        };
+                        None
+                    }
+                    Err(e) => {
+                        self.say(e, Tone::Bad);
+                        None
+                    }
                 }
-                Err(e) => {
-                    self.say(e, Tone::Bad);
-                    None
-                }
-            },
+            }
             Ask::Nothing => self.ask_done(act, &pick, &pane, ""),
         }
     }
 
     fn ask_done(&mut self, act: Act, pick: &Pick, pane: &[Item], input: &str) -> Option<Request> {
-        match screen::action_in(act, pick, pane, input, &self.project) {
+        match screen::action_scoped(act, pick, pane, input, &self.project, &self.scope) {
             Ok(a) => {
                 if matches!(a, Action::Run { .. }) {
                     self.marks.clear();
@@ -888,7 +1125,8 @@ impl App {
                 at,
                 ..
             } => self.render_check(frame, body, label, &items, &on, at),
-            Mode::Normal => {}
+            // The filter shows in each pane's title as it is typed.
+            Mode::Normal | Mode::Filter => {}
         }
     }
 
@@ -927,6 +1165,12 @@ impl App {
                     .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
             ));
         }
+        for tag in &self.scope {
+            spans.push(Span::styled(
+                format!("  #{tag} "),
+                p.tone(Tone::Warn).add_modifier(Modifier::BOLD),
+            ));
+        }
         let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
         let busy = match self.busy {
             true => (
@@ -946,6 +1190,17 @@ impl App {
         match &self.mode {
             Mode::Prompt { .. } => {
                 return hints(p, &[("Enter", "submit"), ("Esc", "cancel")]);
+            }
+            Mode::Filter => {
+                return hints(
+                    p,
+                    &[
+                        ("type", "filter"),
+                        ("Up/Down", "move"),
+                        ("Enter", "keep"),
+                        ("Esc", "clear"),
+                    ],
+                );
             }
             Mode::Confirm { .. } => return hints(p, &[("y", "yes"), ("any key", "no")]),
             Mode::Choose {
@@ -981,7 +1236,15 @@ impl App {
                     .collect();
                 next_first(&mut fit, &pick);
                 let mut pairs: Vec<(&str, &str)> = fit.iter().map(|b| (b.key, b.label)).collect();
-                pairs.extend([("j/k", "scroll"), ("PgDn/PgUp", "page"), ("Esc", "close")]);
+                if matches!(pick, Pick::Run { .. }) {
+                    pairs.push(("v", "diff in pager"));
+                }
+                pairs.extend([
+                    ("j/k", "scroll"),
+                    ("PgDn/PgUp", "page"),
+                    ("G", "end"),
+                    ("Esc", "close"),
+                ]);
                 return hints(p, &pairs);
             }
             Mode::Check { .. } => {
@@ -1001,8 +1264,11 @@ impl App {
         if let Some((text, tone)) = &self.status {
             return Line::from(Span::styled(format!(" {text}"), p.tone(*tone)));
         }
-        // The acts that fit the selected row, then the ones that need none.
+        // The acts that fit the selected row. The ones that need no row are
+        // the same on every row and live in `?`; they show only where there
+        // is no row, so an empty tab still says what it can do.
         let pick = self.pick().0;
+        let none = pick == Pick::Nothing;
         let mut fit: Vec<&keys::Binding> = keys::on_tab(self.tab)
             .iter()
             .filter(|b| match b.command {
@@ -1018,17 +1284,14 @@ impl App {
                     ) || pick.project().is_some()
                 }
                 Command::OpenProject => pick.project().is_some(),
-                Command::Mark => {
-                    matches!(pick, Pick::Task { .. })
-                        || (self.tab == Tab::Projects && matches!(pick, Pick::Manual { .. }))
-                        || (matches!(pick, Pick::Run { .. }) && screen::fits(Act::ForgetRun, &pick))
-                }
+                Command::ViewDiff => matches!(pick, Pick::Run { .. }),
+                Command::Mark => self.markable(&pick),
                 _ => false,
             })
             .chain(
                 keys::on_tab(self.tab)
                     .iter()
-                    .filter(|b| matches!(b.command, Command::Act(a) if !a.on_row())),
+                    .filter(|b| none && matches!(b.command, Command::Act(a) if !a.on_row())),
             )
             .copied()
             .collect();
@@ -1064,10 +1327,13 @@ impl App {
             .split(lists)
             .to_vec(),
         };
+        self.rows[t].resize(panes.len(), 0);
         for (i, (pane, area)) in panes.iter().zip(areas).enumerate() {
             let focused = i == self.pane[t];
-            let block = self.pane_block(pane, focused);
+            let block = self.pane_block(pane, i, focused);
             let inner = block.inner(area);
+            // Less the header row: what a page moves by.
+            self.rows[t][i] = inner.height.saturating_sub(1);
             frame.render_widget(block, area);
             if pane.items.is_empty() {
                 frame.render_widget(
@@ -1109,11 +1375,25 @@ impl App {
         );
     }
 
-    fn pane_block(&self, pane: &Pane, focused: bool) -> Block<'static> {
+    /// A pane's frame: its title and count, and under a filter the filter
+    /// and how many of its rows it keeps.
+    fn pane_block(&self, pane: &Pane, i: usize, focused: bool) -> Block<'static> {
         let p = self.palette;
         let border = match focused {
             true => p.accent(),
             false => p.muted(),
+        };
+        let t = index(self.tab);
+        let total = match &self.full[t] {
+            Some(Ok(Screen {
+                body: Body::Panes(full),
+                ..
+            })) => full.get(i).map_or(pane.items.len(), |f| f.items.len()),
+            _ => pane.items.len(),
+        };
+        let count = match self.filter[t].as_deref() {
+            Some(f) if !f.is_empty() => format!("{} of {total} /{f} ", pane.items.len()),
+            _ => format!("{} ", pane.items.len()),
         };
         let title = Line::from(vec![
             Span::styled(
@@ -1123,7 +1403,7 @@ impl App {
                     false => Style::new().add_modifier(Modifier::BOLD),
                 },
             ),
-            Span::styled(format!("{} ", pane.items.len()), p.muted()),
+            Span::styled(count, p.muted()),
         ]);
         Block::bordered()
             .border_type(BorderType::Rounded)
@@ -1332,7 +1612,7 @@ impl App {
     }
 
     fn render_detail(
-        &self,
+        &mut self,
         frame: &mut Frame,
         area: Rect,
         d: &Detail,
@@ -1381,6 +1661,12 @@ impl App {
         if let Some(h) = header {
             title.push(Span::styled(format!(" {h} "), p.muted()));
         }
+        // The border and padding take 4 columns and 2 rows. A line wider
+        // than the inside wraps onto more rows; the count is what a page and
+        // the end move by.
+        let inner = area.width.saturating_sub(4).max(1) as usize;
+        let total: usize = lines.iter().map(|l| l.width().div_ceil(inner).max(1)).sum();
+        self.extent = (total, area.height.saturating_sub(2).max(1));
         frame.render_widget(Clear, area);
         frame.render_widget(
             Paragraph::new(lines)
@@ -1780,13 +2066,12 @@ fn next_first(bindings: &mut [&keys::Binding], pick: &Pick) {
     }
 }
 
-/// The options of `choices` whose name holds `filter`, ignoring case: every
-/// one without a filter.
+/// The options of `choices` that `filter` matches, by name and description,
+/// best first: every one, in order, without a filter.
 fn kept(choices: &api::Choices, filter: Option<&str>) -> Vec<usize> {
-    let f = filter.unwrap_or_default().to_lowercase();
-    (0..choices.options.len())
-        .filter(|&i| choices.options[i].name.to_lowercase().contains(&f))
-        .collect()
+    pma_core::fuzzy::rank(filter.unwrap_or_default(), &choices.options, |c| {
+        vec![c.name.clone(), c.about.clone()]
+    })
 }
 
 /// Sends a request through the API and gives the app the result. An action is
@@ -1806,13 +2091,13 @@ fn execute(store: &Store, app: &mut App, request: Request) {
                 execute(store, app, next);
             }
         }
-        Request::Choose { act, pick, label } => {
-            app.offered(
-                act,
-                pick,
-                label,
-                api::choices(store, act).map_err(|e| e.to_string()),
-            );
+        Request::Choose { what, pick, label } => {
+            let choices = match what {
+                Choosing::Act(act) => api::choices(store, act),
+                Choosing::Project => api::project_choices(store),
+                Choosing::Scope => api::tag_choices(store),
+            };
+            app.offered(what, pick, label, choices.map_err(|e| e.to_string()));
         }
         Request::Prompt { act, pick, label } => {
             let input = api::initial_input(store, act, &pick).map_err(|e| e.to_string());
@@ -1824,7 +2109,61 @@ fn execute(store: &Store, app: &mut App, request: Request) {
                 execute(store, app, next);
             }
         }
-        Request::Quit => {}
+        // The run loop hands the terminal over for these.
+        Request::Pager { .. } | Request::Quit => {}
+    }
+}
+
+/// A run's diff as text for a pager: a heading, then the diff with ANSI
+/// colour unless `NO_COLOR` is set.
+fn pager_text(store: &Store, id: i64) -> Result<String> {
+    let View::Run { run, diff, .. } = api::query(store, Query::Run { id })? else {
+        return Err(format!("#{id} is not a run").into());
+    };
+    let colour = Palette::from_env().color;
+    let paint = |code: &str, l: &str| match colour {
+        true => format!("\x1b[{code}m{l}\x1b[0m"),
+        false => l.to_string(),
+    };
+    let mut out = format!(
+        "{}\n{}\n\n",
+        paint("1", &format!("#{} {}: {}", run.id, run.project, run.text)),
+        run.diffstat.as_deref().unwrap_or("")
+    );
+    for l in diff.lines() {
+        let line = if l.starts_with("+++") || l.starts_with("---") || l.starts_with("diff ") {
+            paint("1", l)
+        } else if l.starts_with('+') {
+            paint("32", l)
+        } else if l.starts_with('-') {
+            paint("31", l)
+        } else if l.starts_with("@@") {
+            paint("36", l)
+        } else {
+            l.to_string()
+        };
+        out.push_str(&line);
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+/// Shows `text` in `$PAGER`, `less -R` by default, and waits for it to close.
+/// The caller has restored the terminal first and takes it back after.
+fn show_in_pager(id: i64, text: &str) -> Result<()> {
+    let file = std::env::temp_dir().join(format!("pma-review-{id}-{}.diff", std::process::id()));
+    std::fs::write(&file, text).map_err(|e| format!("{}: {e}", file.display()))?;
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(r#"${PAGER:-less -R} "$1""#)
+        .arg("sh")
+        .arg(&file)
+        .status();
+    let _ = std::fs::remove_file(&file);
+    match status {
+        Ok(s) if s.success() => Ok(()),
+        Ok(s) => Err(format!("the pager exited with {s}").into()),
+        Err(e) => Err(format!("could not start the pager: {e}").into()),
     }
 }
 
@@ -1886,6 +2225,21 @@ pub fn run(store: &Store) -> Result<()> {
             };
             match app.key(&name) {
                 Some(Request::Quit) => return Ok(()),
+                Some(Request::Pager { id }) => {
+                    // The pager has the terminal until it exits; the view is
+                    // drawn afresh after.
+                    let shown = pager_text(store, id).and_then(|text| {
+                        ratatui::try_restore()?;
+                        let shown = show_in_pager(id, &text);
+                        terminal = ratatui::try_init()?;
+                        terminal.clear()?;
+                        shown
+                    });
+                    match shown {
+                        Ok(()) => app.status = None,
+                        Err(e) => app.say(e.to_string(), Tone::Bad),
+                    }
+                }
                 Some(request) => {
                     // Draw "working" before a slow action blocks the loop.
                     terminal.draw(|f| app.render(f))?;
@@ -1986,6 +2340,7 @@ mod tests {
                 command: Some("pma review 4".into()),
                 subject: Subject::Run {
                     fixing: false,
+                    empty: false,
                     id: 4,
                     state: "ready".into(),
                     project: "b".into(),
@@ -2017,7 +2372,10 @@ mod tests {
     #[test]
     fn tabs_load_and_keys_act_on_the_selection() {
         let mut app = App::new();
-        assert_eq!(app.query(), Tab::Inbox.query(By::Class, "", None));
+        assert_eq!(
+            app.query(),
+            Tab::Inbox.query(api::Selection::default(), By::Class, "", None)
+        );
         app.loaded(Ok(next_view()));
         let out = screen_text(&mut app);
         assert!(
@@ -2255,11 +2613,10 @@ mod tests {
         app.loaded(Ok(next_view()));
         assert_eq!(
             app.key("Enter"),
-            Some(Request::Load(Query::Project { name: "a".into() })),
-            "Enter on a task is `o`"
+            Some(Request::Load(Query::task("a", "a:5"))),
+            "Enter opens the task wherever it is listed"
         );
-        assert_eq!(app.tab, Tab::Project);
-        app.key("Escape");
+        assert_eq!(app.tab, Tab::Inbox);
         assert_eq!(
             app.key("o"),
             Some(Request::Load(Query::Project { name: "a".into() }))
@@ -2271,12 +2628,12 @@ mod tests {
         );
         // `r` lists what a rescan can do; the first choice is a plain scan
         // of that project, not the portfolio.
-        let Some(Request::Choose { act, .. }) = app.key("r") else {
+        let Some(Request::Choose { what, .. }) = app.key("r") else {
             panic!("a rescan list");
         };
-        assert_eq!(act, Act::ScanProject);
+        assert_eq!(what, Choosing::Act(Act::ScanProject));
         app.offered(
-            Act::ScanProject,
+            Choosing::Act(Act::ScanProject),
             Pick::Nothing,
             "rescan",
             Ok(api::Choices {
@@ -2468,6 +2825,8 @@ mod tests {
                         | Command::Last
                         | Command::NextPane
                         | Command::PrevPane
+                        | Command::PageDown
+                        | Command::PageUp
                         | Command::Back
                         | Command::Open
                 );
@@ -2505,7 +2864,7 @@ mod tests {
                     pick: Pick::Nothing,
                 },
                 Mode::Choose {
-                    act: Act::Run,
+                    what: Choosing::Act(Act::Run),
                     label: "run",
                     pick: Pick::Nothing,
                     choices: api::Choices {
@@ -2546,10 +2905,10 @@ mod tests {
         let mut app = App::new();
         app.tab = Tab::Project;
         app.project = "spore".into();
-        let Some(Request::Choose { act, label, .. }) = app.key("z") else {
+        let Some(Request::Choose { what, label, .. }) = app.key("z") else {
             panic!("a list");
         };
-        assert_eq!((act, label), (Act::Run, "run"));
+        assert_eq!((what, label), (Choosing::Act(Act::Run), "run"));
         let choice = |name: &str, about: &str| pma_core::catalog::Choice {
             name: name.into(),
             reads: "project".into(),
@@ -2566,7 +2925,12 @@ mod tests {
                 label: "push when clean",
             }],
         };
-        app.offered(Act::Run, Pick::Nothing, "run", Ok(choices.clone()));
+        app.offered(
+            Choosing::Act(Act::Run),
+            Pick::Nothing,
+            "run",
+            Ok(choices.clone()),
+        );
         assert!(!app.idle());
         let out = screen_text(&mut app);
         assert!(
@@ -2591,7 +2955,7 @@ mod tests {
         );
 
         // `/` filters by name; letters then type rather than move or toggle.
-        app.offered(Act::Run, Pick::Nothing, "run", Ok(choices));
+        app.offered(Choosing::Act(Act::Run), Pick::Nothing, "run", Ok(choices));
         for k in ["/", "F", "i", "x"] {
             app.key(k);
         }
@@ -2604,7 +2968,12 @@ mod tests {
             panic!("a run");
         };
         assert_eq!((name.as_str(), push), ("fix-ci", false));
-        app.offered(Act::Run, Pick::Nothing, "run", Err("no store".into()));
+        app.offered(
+            Choosing::Act(Act::Run),
+            Pick::Nothing,
+            "run",
+            Err("no store".into()),
+        );
         assert!(app.status.as_ref().unwrap().0.contains("no store"));
         assert!(app.idle());
     }
@@ -2738,8 +3107,8 @@ mod tests {
         app.key("j");
         assert_eq!(
             app.key("Enter"),
-            Some(Request::Load(Query::Project { name: "a".into() })),
-            "the notice is gone; Enter opens the task's project"
+            Some(Request::Load(Query::task("a", "a:5"))),
+            "the notice is gone; Enter opens the task"
         );
     }
 
@@ -2760,13 +3129,244 @@ mod tests {
                         "ArrowDown",
                         "ArrowUp",
                         "Home",
-                        "End"
+                        "End",
+                        "PageDown",
+                        "PageUp"
                     ]
                     .contains(&b.key),
                 "the TUI cannot send `{}`",
                 b.key
             );
         }
+    }
+
+    /// A view of `n` tasks, `a:1` to `a:n`, each titled `task <n>`.
+    fn tasks_view(n: usize) -> View {
+        let mut lists = next_view_lists();
+        let first = lists.agents[0].clone();
+        lists.agents = (1..=n)
+            .map(|i| {
+                let mut row = first.clone();
+                row.cells[0] = format!("a:{i}");
+                row.cells[4] = format!("task {i}");
+                row.subject = Subject::Task {
+                    project: "a".into(),
+                    target: format!("a:{i}"),
+                    retry: false,
+                };
+                row
+            })
+            .collect();
+        View::Next {
+            header: String::new(),
+            limit: None,
+            lists,
+            repos: Default::default(),
+        }
+    }
+
+    /// `/` filters the tab's tables by a fuzzy match over each row, best
+    /// first, and says how many of the rows it keeps; Enter keeps it, `*`
+    /// marks what it shows, and Escape clears marks, then the filter.
+    #[test]
+    fn a_filter_narrows_the_rows_and_star_marks_them() {
+        let mut app = App::new();
+        app.loaded(Ok(tasks_view(12)));
+        assert_eq!(app.key("/"), None);
+        assert_eq!(app.mode, Mode::Filter);
+        for c in ["t", "1", "2"] {
+            app.key(c);
+        }
+        let shown: Vec<String> = app.panes()[0]
+            .items
+            .iter()
+            .map(|i| i.cells[0].text.clone())
+            .collect();
+        // `a:12` has the run `t12` split only by a space; `a:2` reaches the
+        // `2` through its `T1`.
+        assert_eq!(shown, ["a:12", "a:2"]);
+        assert!(screen_text(&mut app).contains("2 of 12 /t12"));
+        app.key("Enter");
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(
+            app.panes()[0].items.len(),
+            shown.len(),
+            "Enter keeps the filter"
+        );
+        app.key("*");
+        assert_eq!(app.marks.len(), shown.len());
+        app.key("*");
+        assert!(app.marks.is_empty(), "again unmarks them all");
+        app.key("*");
+        app.key("Escape");
+        assert!(app.marks.is_empty() && app.panes()[0].items.len() == shown.len());
+        app.key("Escape");
+        assert_eq!(app.panes()[0].items.len(), 12, "then the filter goes");
+        // A refresh keeps the filter.
+        app.key("/");
+        for c in ["t", "1", "2"] {
+            app.key(c);
+        }
+        app.key("Enter");
+        app.loaded(Ok(tasks_view(12)));
+        assert_eq!(app.panes()[0].items.len(), 2);
+    }
+
+    /// A page is what the last draw had room for.
+    #[test]
+    fn page_keys_move_by_what_was_drawn() {
+        let mut app = App::new();
+        app.loaded(Ok(tasks_view(40)));
+        screen_text(&mut app);
+        let page = app.rows[index(Tab::Inbox)][0] as usize;
+        assert!(page > 1, "{page}");
+        app.key("PageDown");
+        assert_eq!(app.selected[index(Tab::Inbox)][0].selected(), Some(page));
+        app.key("PageUp");
+        assert_eq!(app.selected[index(Tab::Inbox)][0].selected(), Some(0));
+    }
+
+    /// A detail pages by the rows it was drawn with and `G` reaches its end;
+    /// `v` on a run, in a list or in its detail, asks for the pager.
+    #[test]
+    fn a_detail_pages_by_its_height_and_v_asks_for_the_pager() {
+        let mut app = App::new();
+        app.loaded(Ok(next_view()));
+        app.key("Tab");
+        assert_eq!(app.key("v"), Some(Request::Pager { id: 4 }));
+        let pick = Pick::Run {
+            id: 4,
+            clean: false,
+            fixing: false,
+            empty: false,
+            state: "ready".into(),
+            project: "b".into(),
+        };
+        let diff = (0..200)
+            .map(|i| format!("+line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.mode = Mode::Detail {
+            screen: Screen {
+                tab: None,
+                header: None,
+                summary: Vec::new(),
+                body: Body::Detail(Box::new(Detail {
+                    title: "#4".into(),
+                    pick,
+                    badge: None,
+                    notice: None,
+                    fields: Vec::new(),
+                    sections: vec![("Diff".into(), Section::Diff, diff)],
+                })),
+            },
+            scroll: 0,
+        };
+        screen_text(&mut app);
+        let (total, rows) = app.extent;
+        assert!(total > 200 && rows > 5, "{total} {rows}");
+        let scroll = |app: &App| match &app.mode {
+            Mode::Detail { scroll, .. } => *scroll,
+            _ => panic!("a detail"),
+        };
+        app.key("PageDown");
+        assert_eq!(scroll(&app), rows);
+        app.key("G");
+        assert_eq!(scroll(&app) as usize, total - rows as usize);
+        app.key("j");
+        assert_eq!(scroll(&app) as usize, total - rows as usize, "no further");
+        app.key("g");
+        assert_eq!(scroll(&app), 0);
+        assert_eq!(
+            app.key("v"),
+            Some(Request::Pager { id: 4 }),
+            "from the detail"
+        );
+    }
+
+    /// `#` lists the tags in use, and no scope first; the chosen tag narrows
+    /// every view's query, shows in the title bar, and bounds a scan.
+    #[test]
+    fn a_scope_narrows_the_views_and_the_acts_over_them() {
+        let mut app = App::new();
+        app.loaded(Ok(next_view()));
+        let Some(Request::Choose {
+            what: Choosing::Scope,
+            ..
+        }) = app.key("#")
+        else {
+            panic!("a tag list");
+        };
+        let choice = |name: &str, about: &str| pma_core::catalog::Choice {
+            name: name.into(),
+            reads: "tag".into(),
+            about: about.into(),
+        };
+        let tags = api::Choices {
+            options: vec![choice("audio", "5 projects")],
+            flags: vec![],
+        };
+        app.offered(Choosing::Scope, Pick::Nothing, "scope", Ok(tags.clone()));
+        let Mode::Choose { choices, .. } = &app.mode else {
+            panic!("a list");
+        };
+        assert_eq!(choices.options[0].name, NO_SCOPE, "no scope comes first");
+        app.key("j");
+        let Some(Request::Load(Query::Inbox { of })) = app.key("Enter") else {
+            panic!("a reload within the scope");
+        };
+        assert_eq!(of.tags, ["audio"]);
+        assert!(screen_text(&mut app).contains("#audio"));
+        let Some(Request::Act(Action::Scan { of, .. })) = app.key("c") else {
+            panic!("a scan");
+        };
+        assert_eq!(of.tags, ["audio"]);
+        // Back to every project.
+        app.key("#");
+        app.offered(Choosing::Scope, Pick::Nothing, "scope", Ok(tags));
+        let Some(Request::Load(Query::Inbox { of })) = app.key("Enter") else {
+            panic!("a reload");
+        };
+        assert!(of.tags.is_empty() && app.scope.is_empty());
+    }
+
+    /// `O` lists every project; the chosen one opens.
+    #[test]
+    fn jump_opens_the_chosen_project() {
+        let mut app = App::new();
+        app.loaded(Ok(next_view()));
+        let Some(Request::Choose {
+            what: Choosing::Project,
+            ..
+        }) = app.key("O")
+        else {
+            panic!("a project list");
+        };
+        let choice = |name: &str, about: &str| pma_core::catalog::Choice {
+            name: name.into(),
+            reads: "project".into(),
+            about: about.into(),
+        };
+        app.offered(
+            Choosing::Project,
+            Pick::Nothing,
+            "go to project",
+            Ok(api::Choices {
+                options: vec![choice("alpha", "audio T1"), choice("margo", "")],
+                flags: vec![],
+            }),
+        );
+        app.key("/");
+        for c in ["m", "g"] {
+            app.key(c);
+        }
+        assert_eq!(
+            app.key("Enter"),
+            Some(Request::Load(Query::Project {
+                name: "margo".into()
+            }))
+        );
+        assert_eq!(app.tab, Tab::Project);
     }
 
     fn pane_of(rows: usize) -> Pane {
@@ -2790,6 +3390,7 @@ mod tests {
             id,
             clean: false,
             fixing: false,
+            empty: false,
             state: state.into(),
             project: "p".into(),
         };

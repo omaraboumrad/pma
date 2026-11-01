@@ -203,13 +203,21 @@ fn route(req: &Request, ctx: &Ctx) -> Response {
                 .into_iter()
                 .flatten()
                 .find(|s| s.name() == named);
+            let of = scope(req.param("tag").as_deref());
             answer(ctx, |store| {
                 Ok(screen_json(&screen::screen(api::query(
                     store,
-                    tab.query(by, &project, finished),
+                    tab.query(of, by, &project, finished),
                 )?)))
             })
         }
+        ("GET", "/api/tags") => answer(ctx, |store| {
+            let c = api::tag_choices(store)?;
+            Ok(json!({
+                "options": c.options.iter().map(|o| json!({ "name": o.name, "about": o.about })).collect::<Vec<_>>(),
+                "flags": [],
+            }))
+        }),
         ("POST", "/api/ask") => {
             let Ok(b) = body() else {
                 return Response::status(400);
@@ -229,12 +237,13 @@ fn route(req: &Request, ctx: &Ctx) -> Response {
                         && matches!(b.ask, Ask::Confirm | Ask::CheckOrConfirm(_))
                 });
                 if confirm {
-                    screen::action_in(
+                    screen::action_scoped(
                         act,
                         &pick,
                         &rows(store, tab, act, &b)?,
                         "",
                         b["project"].as_str().unwrap_or(""),
+                        &scope(b["tag"].as_str()).tags,
                     )?;
                 }
                 let mut out = json!({
@@ -302,19 +311,20 @@ fn route(req: &Request, ctx: &Ctx) -> Response {
             };
             let input = b["input"].as_str().unwrap_or("").to_string();
             answer(ctx, |store| {
-                let action = screen::action_in(
+                let action = screen::action_scoped(
                     act,
                     &pick,
                     &rows(store, tab, act, &b)?,
                     &input,
                     b["project"].as_str().unwrap_or(""),
+                    &scope(b["tag"].as_str()).tags,
                 )?;
                 let out = api::act(store, action)?;
                 Ok(json!({ "said": out.said, "warnings": out.warnings }))
             })
         }
         (_, "/" | "/app.js" | "/app.css" | "/session" | "/api/keys" | "/api/screen")
-        | (_, "/api/ask" | "/api/open" | "/api/act") => Response::status(405),
+        | (_, "/api/ask" | "/api/open" | "/api/act" | "/api/tags") => Response::status(405),
         _ => Response::status(404),
     }
 }
@@ -326,12 +336,25 @@ fn rows(store: &Store, tab: Tab, act: Act, body: &Value) -> Result<Vec<Item>> {
         return Ok(Vec::new());
     }
     let project = body["project"].as_str().unwrap_or("");
+    let of = scope(body["tag"].as_str());
     Ok(
-        match screen::screen(api::query(store, tab.query(By::Class, project, None))?).body {
+        match screen::screen(api::query(store, tab.query(of, By::Class, project, None))?).body {
             Body::Panes(panes) => panes.into_iter().flat_map(|p| p.items).collect(),
             Body::Detail(_) => Vec::new(),
         },
     )
+}
+
+/// The page's scope as a selection: the one tag it is narrowed to, if any.
+fn scope(tag: Option<&str>) -> api::Selection {
+    api::Selection {
+        projects: Vec::new(),
+        tags: tag
+            .filter(|t| !t.is_empty())
+            .map(String::from)
+            .into_iter()
+            .collect(),
+    }
 }
 
 /// Runs `f` against a store opened for this request. An error goes back as
@@ -533,10 +556,11 @@ fn pick_json(p: &Pick) -> Value {
             id,
             clean,
             fixing,
+            empty,
             state,
             project,
         } => {
-            json!({ "kind": "run", "id": id, "clean": clean, "fixing": fixing, "state": state, "project": project })
+            json!({ "kind": "run", "id": id, "clean": clean, "fixing": fixing, "empty": empty, "state": state, "project": project })
         }
         Pick::Job { id, awaiting } => json!({ "kind": "job", "id": id, "awaiting": awaiting }),
         Pick::Instance { id, workflow, open } => {
@@ -605,6 +629,7 @@ fn pick_from(v: &Value) -> Option<Pick> {
             id: n("id")?,
             clean: b("clean")?,
             fixing: b("fixing")?,
+            empty: b("empty").unwrap_or(false),
             state: s("state")?,
             project: s("project")?,
         },

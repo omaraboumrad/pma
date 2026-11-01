@@ -101,6 +101,18 @@ Configuring from the front ends, 2026-10-26:
 
 - The agent field setter moved to `worker::set_field`, so the CLI and `api::act` validate the same way. Every configuring action runs in place; only `deps refresh` is queued, with the project's path resolved by `act` rather than written into the command line.
 
+Reaching a project and acting on a set, 2026-11-01 (`REVIEW.md` U2, U3):
+
+- Five commands that are not acts: `Jump` (`O`), `Filter` (`/`), `MarkAll` (`*`), `Scope` (`#`) and `ViewDiff` (`v`), with `PageDown` and `PageUp`. `pma_core::fuzzy` is the one matcher, ported line for line into `app.js`; a row matches by one of its cells, best first.
+
+- `Tab::query` takes a `Selection`: the scope. `screen::action_scoped` takes it too, so a scan or sync covers it and a run or workflow with no target goes over it. `action_in` is the unscoped form the tests use.
+
+- The TUI keeps the loaded screen in `App::full` and shows `App::screens`, the same through the filter; a chooser is `Choosing::{Act, Project, Scope}`. The web keeps the filter and the scope per tab and in the address (`?scope=audio`), and moves a selection by changing two rows' `aria-selected` rather than rebuilding the tables.
+
+- `Pick::Run` carries `empty`: the agent changed nothing, so approving and publishing do not fit, and `next_act` is closing.
+
+- `v` is the one command with a TUI-only body: the run loop restores the terminal, runs `${PAGER:-less -R}` on the diff, and takes the terminal back. The web scrolls the detail to its diff.
+
 ## Goal
 
 Three ways to run `pma`:

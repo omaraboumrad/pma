@@ -31,7 +31,7 @@ pma push 1                     # commit and push it; or `pma pr 1` after --appro
 
 - Failing CI, outdated dependencies, idle repositories and dirty working trees appear as tasks beside the written ones.
 
-- Two front ends with the same views and actions: `pma tui` in a terminal, over SSH too, and `pma web` in a local browser, on 127.0.0.1 behind a one-time token. Both act on what is selected: dispatch a task, approve or reject a run, approve a plan, stop a job. Space marks tasks, and `d` dispatches the marked ones, one run per project. On the projects tab, Space marks projects, and `z` runs one name over them. `P` in a project view dispatches a prompt you type.
+- Two front ends with the same views and actions: `pma tui` in a terminal, over SSH too, and `pma web` in a local browser, on 127.0.0.1 behind a one-time token. Both act on what is selected: dispatch a task, approve or reject a run, approve a plan, stop a job. Space marks tasks, and `d` dispatches the marked ones, one run per project. On the projects tab, Space marks projects, `z` runs one name over them and `e` sets their tier or tag together. `P` in a project view dispatches a prompt you type. `O` opens a project by a few letters of its name or a tag, `/` filters any list the same way and `*` marks what it keeps, `#` scopes every view and portfolio act to a tag, and `v` reads a run's diff in your pager.
 
 - A view of each project: its state and why, CI, dependencies, local changes, open tasks and every run, with how old the scan behind it is. `pma project show <name>`, or `o` on any row.
 
@@ -203,7 +203,7 @@ pma status --all --html s.html  # the same, with the last scan's changes, as one
 pma history                     # past scans; `pma history last` for what the latest changed
 pma stale                       # open items by age, oldest first
 pma task myproject:12           # one task in full; Enter on it in the TUI and web
-pma tui                         # every view and action; 1-8 switch tabs, ? lists keys, q quits
+pma tui                         # every view and action; 1-8 switch tabs, / filters, O jumps, # scopes, ? lists keys
 pma web                         # the same in a browser, on 127.0.0.1 behind a one-time token
 pma web --app                   # as an app window, in Chrome or Chromium
 pma project show myproject      # one project: state, open tasks, runs and jobs; `o` in the TUI and web

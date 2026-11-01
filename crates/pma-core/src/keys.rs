@@ -60,10 +60,10 @@ impl Tab {
     }
 
     /// What the tab shows. Lists are not cut short: a front end scrolls.
+    /// `of` is the front end's scope, the tags its views are narrowed to;
     /// `project` names the project the project tab shows; `finished`, the
     /// state the activity tab's finished runs are filtered to.
-    pub fn query(self, by: By, project: &str, finished: Option<RunState>) -> Query {
-        let of = Selection::default();
+    pub fn query(self, of: Selection, by: By, project: &str, finished: Option<RunState>) -> Query {
         match self {
             Tab::Inbox => Query::Inbox { of },
             // Every project, untiered ones too: it is the list a project is
@@ -387,8 +387,26 @@ pub enum Command {
     Finished,
     /// The project of the selected row.
     OpenProject,
+    /// A project by name, from a fuzzy chooser over every project's name and
+    /// tags: the `cd` of working by hand.
+    Jump,
+    /// The scope: a tag every view is narrowed to and every act over the
+    /// portfolio acts within, chosen from the tags in use. `--tag` in the
+    /// front ends.
+    Scope,
+    /// Filters the tab's tables by a typed fuzzy match over each row's
+    /// cells; Escape clears it.
+    Filter,
+    /// The selected run's diff in `$PAGER`, in the TUI; the web scrolls its
+    /// detail to the diff. Reading is the long step, and a pager has search.
+    ViewDiff,
     /// Marks the selected task, project or run, or unmarks it, for an act on several.
     Mark,
+    /// Marks every row the focused list shows, or unmarks them all.
+    MarkAll,
+    /// A page of rows down or up.
+    PageDown,
+    PageUp,
     Help,
     /// The TUI only; a browser tab is closed by the browser.
     Quit,
@@ -477,6 +495,11 @@ pub const BINDINGS: &[Binding] = &[
     bind("Home", Command::First, "first"),
     bind("G", Command::Last, "last"),
     bind("End", Command::Last, "last"),
+    bind("PageDown", Command::PageDown, "page down"),
+    bind("PageUp", Command::PageUp, "page up"),
+    bind("/", Command::Filter, "filter"),
+    bind("O", Command::Jump, "go to project"),
+    bind("#", Command::Scope, "scope to a tag"),
     Binding {
         tabs: PANES,
         ..bind("Tab", Command::NextPane, "next list")
@@ -533,9 +556,10 @@ pub const BINDINGS: &[Binding] = &[
         Ask::Choose("rescan"),
         "rescan project",
     ),
+    // On the projects tab it takes the selected project, or the marked ones.
     on(
         "e",
-        &[Tab::Project],
+        &[Tab::Project, Tab::Projects],
         Act::Configure,
         Ask::Text("tier 1-5|none, tag +name|-name, verify <command>, or sandbox on|off"),
         "project settings",
@@ -567,6 +591,10 @@ pub const BINDINGS: &[Binding] = &[
         tabs: MARKS,
         ..bind(" ", Command::Mark, "mark")
     },
+    Binding {
+        tabs: MARKS,
+        ..bind("*", Command::MarkAll, "mark all shown")
+    },
     on("d", TASKS, Act::Dispatch, Ask::Confirm, "dispatch"),
     on(
         "D",
@@ -576,6 +604,11 @@ pub const BINDINGS: &[Binding] = &[
         "dispatch and push",
     ),
     on("v", TASKS, Act::Verify, Ask::Nothing, "verify project"),
+    // On a run `v` is the diff: `lookup` tells the rows apart.
+    Binding {
+        tabs: RUNS,
+        ..bind("v", Command::ViewDiff, "diff in pager")
+    },
     on(
         "I",
         TASKS,
@@ -602,7 +635,8 @@ pub const BINDINGS: &[Binding] = &[
         Ask::Text("minutes"),
         "review time",
     ),
-    on("s", RUNS, Act::Stage, Ask::Confirm, "stage"),
+    // Staging is undone by `git reset`, so it asks nothing.
+    on("s", RUNS, Act::Stage, Ask::Nothing, "stage"),
     on(
         "m",
         RUNS,
@@ -623,7 +657,8 @@ pub const BINDINGS: &[Binding] = &[
     on("M", RUNS, Act::Merge, Ask::Confirm, "merge PR"),
     on("F", RUNS, Act::FixConflicts, Ask::Confirm, "fix conflicts"),
     on("H", RUNS, Act::OpenPane, Ask::Nothing, "open in herdr"),
-    on("T", RUNS, Act::TakeOver, Ask::Confirm, "take over in herdr"),
+    // Opening a pane publishes nothing and spends nothing until it is used.
+    on("T", RUNS, Act::TakeOver, Ask::Nothing, "take over in herdr"),
     on(
         "X",
         RUNS,
@@ -869,6 +904,7 @@ mod tests {
                 id: 1,
                 clean: true,
                 fixing: false,
+                empty: false,
                 state: "ready".into(),
                 project: "p".into(),
             },
@@ -959,6 +995,7 @@ mod tests {
             id: 1,
             clean: true,
             fixing: false,
+            empty: false,
             state: "ready".into(),
             project: "p".into(),
         };

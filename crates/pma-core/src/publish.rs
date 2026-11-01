@@ -247,7 +247,11 @@ fn stage(home: &std::path::Path, run: &mut Run) -> Result<String> {
     // Before the tick, which alone is not a change.
     let from = crate::dispatch::from(run).to_string();
     if tree == wt_git(run, &["rev-parse", &format!("{from}^{{tree}}")])? {
-        return Err("nothing to stage: no changes".into());
+        return Err(format!(
+            "nothing to stage: run #{} changed nothing; `pma close {}` or X ends it",
+            run.id, run.id
+        )
+        .into());
     }
     if run.workspace == Workspace::Clone {
         return stage_in_clone(home, run, &tree);
@@ -602,7 +606,11 @@ fn publish_one(cfg: &Config, run: &Run) -> Result<String> {
         return Err("`pma pr` needs `gh` on PATH; `pma push` pushes without it".into());
     }
     if approved == &wt_git(run, &["rev-parse", &format!("{}^{{tree}}", run.base)])? {
-        return Err("nothing to publish: no changes".into());
+        return Err(format!(
+            "nothing to publish: run #{} changed nothing; `pma close {}` or X ends it",
+            run.id, run.id
+        )
+        .into());
     }
     let message = message(cfg, run, None);
 
@@ -861,13 +869,40 @@ pub fn settle_committed(store: &Store) -> Result<Vec<Run>> {
             continue;
         }
         let mut run = run.clone();
-        run.outcome = Some(format!("{sha} found on {branch}"));
+        let mut outcome = format!("{sha} found on {branch}");
+        if let Some(note) = tick_in_clone(&run)? {
+            outcome.push_str(&note);
+        }
+        run.outcome = Some(outcome);
         run.enter(RunState::Pushed);
         if store.update_run_from(&run, RunState::Committed).is_ok() {
             settled.push(run);
         }
     }
     Ok(settled)
+}
+
+/// Ticks the run's items in the clone's `TODO.md`, uncommitted, as `pma
+/// sync` leaves its edits. A commit made by hand ticked nothing, so without
+/// this the task stays listed and is dispatched again. `None` when every
+/// item is already done, or the clone has no `TODO.md` file.
+fn tick_in_clone(run: &Run) -> Result<Option<String>> {
+    if crate::dispatch::closes(run).is_empty() {
+        return Ok(None);
+    }
+    let path = run.repo.join("TODO.md");
+    // A symlink would point the read and the write outside the clone.
+    if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Ok(None);
+    }
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Ok(None);
+    };
+    let Some(edited) = ticked(run, &text) else {
+        return Ok(None);
+    };
+    todo::save(&path, &edited).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(Some("; its item ticked in TODO.md, uncommitted".into()))
 }
 
 /// An interactive run whose work is already committed needs no stage or commit
@@ -895,10 +930,13 @@ pub fn settle_interactive(store: &Store) -> Result<()> {
         }
         let read = run.state;
         let mut run = run.clone();
-        run.outcome = Some(format!(
-            "committed {} in its session",
-            &head[..7.min(head.len())]
-        ));
+        let mut outcome = format!("committed {} in its session", &head[..7.min(head.len())]);
+        // The session's commit ticked nothing; the clone is clean, so the
+        // tick is the one change left in it.
+        if let Some(note) = tick_in_clone(&run)? {
+            outcome.push_str(&note);
+        }
+        run.outcome = Some(outcome);
         run.error = None;
         run.enter(RunState::Committed);
         // Only from the state it was read in: this holds no lock on the run's

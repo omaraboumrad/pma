@@ -52,6 +52,10 @@
 
 ## Low
 
+- [ ] Agent logs are re-read whole on every 2 s refresh `watch::agents` reads and parses each running agent's `stream-json` log in the TUI, the web server and its event thread (`crates/pma-core/src/watch.rs`). Read the tail for the last tool and text, and cache the tool count by file offset. (REVIEW.md U7, 2026-11-01)
+
+- [ ] A run detail in the `margo` clone takes 0.65 s where one elsewhere takes 0.10 s `pma review 9` against `pma review 10`, release build, 2026-11-01. `Query::Run` runs `dispatch::tree` twice and `dispatch::diff` on the clone; the TUI's one thread waits on it when the detail opens. Measure which call, then cache the tree by the clone's index mtime or compute it once.
+
 - [ ] Mark commands without a recorded pilot as experimental in `--help` and the README 34 top-level commands; routes and campaigns have no recorded runs. (REVIEW.md U11)
 
 - [ ] Date or range the README's scan time It says 95 repositories in about 15 s; 80 took 24.6 s on 2026-10-25. (REVIEW.md U12)

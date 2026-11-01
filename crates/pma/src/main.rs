@@ -2954,7 +2954,9 @@ fn run_review(
 fn run_merge(id: i64, fix: bool) -> Result<()> {
     let store = Store::open_default()?;
     if !fix {
-        say(api::act(&store, Action::MergePr { id })?);
+        // In the foreground: this is the command a front end's merge queues.
+        let mut run = store.run(id)?;
+        println!("{}", publish::merge(&store, &mut run)?);
         return Ok(());
     }
     let project = store.run(id)?.project;

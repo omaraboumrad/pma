@@ -3582,6 +3582,13 @@ impl Run {
         self.review_seconds.or(self.review_measured)
     }
 
+    /// The agent changed nothing: no path and no diff. Such a run has nothing
+    /// to approve or publish.
+    pub fn changed_nothing(&self) -> bool {
+        self.changed_paths.as_ref().is_some_and(|p| p.is_empty())
+            || self.diffstat.as_deref() == Some("no changes")
+    }
+
     /// The open pull request a conflict fix under review will update. A
     /// publish to the clone would leave it open and untracked.
     pub fn fixing_pr(&self) -> Option<&str> {

@@ -6,6 +6,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Reaching a project, and acting on a set of them**, in the TUI and web. `O` opens a project by name or tag from a fuzzy chooser over every project. `/` filters any table by a fuzzy match over each row's cells, best first, and `*` marks every row it keeps, so the five `audio` projects are `/audio`, `*`, `z`. The projects tab gains a tags column. PageDown and PageUp move by a page. Fuzzy over substring because a few letters of a name are enough; a match is within one cell, since across a row five letters find a path through most rows. `e` on marked projects sets their tier or tag together.
+
+- **`#` scopes the TUI and web to a tag.** Every view shows that tag's projects, scan and sync cover them, and `z` and `f` with no project named run over them, as `--tag` does; `--tag=<t>` is also accepted in their typed lines. The scope shows in the title bar and in the web address. Up to now every view showed every project, and `--tag` had no counterpart in the front ends.
+
+- `v` on a run opens its diff in `$PAGER`, `less -R` by default, with the TUI suspended until it exits; the web scrolls the detail to its diff. A detail pages by its height, and `G` reaches its end; it paged by 20 lines whatever the height, with no key to the end.
+
 - **`pma integrate herdr`** runs every agent in a herdr pane: a tab per run in a `pma: <project>` workspace, closed when the run is decided. Headless by default, which keeps cost, budget and verdict; `I` or `--interactive` gives a live `claude` that reports none of them. `H` opens a run's pane and `T` opens an interactive agent on its directory. A single `integration` setting, since integrations exclude each other. Over the socket API, with an `events.subscribe` connection per run: a blocked agent shows on the run and raises a toast, and closing a pane ends its run at once. Design: `docs/dev/herdr-integration.md`.
 
 - Space marks open runs in the TUI and a checkbox does in the web; `X` then closes them all, leaving their files. `pma close` was the only way to close several.
@@ -83,6 +89,16 @@ pma workflow run find-issues --tag nightly --unattended
 
 ### Changed
 
+- Enter on a task opens the task wherever it is listed; `o` opens its project. In the inbox and the matrix it opened the project, so the description an agent is given was two navigations away.
+
+- The TUI footer lists the selected row's acts only, next act first. The acts that need no row are the same on every row and sit in `?`; they show when nothing is selected. A ready run's footer was 23 hints, 3 to 5 lines.
+
+- `s` (stage) and `T` (take over) ask no confirmation: `git reset` undoes a stage, and a pane publishes nothing.
+
+- `M` merges as a job, as the other network acts run, so neither front end waits on `gh`.
+
+- The web page redraws only the two rows a selection move touches, scrolls on a key and never on a refresh, and skips a screen or detail that did not change, so a diff being read stays where it was. A `j` on the matrix went from 146 ms to 33 ms on 1,272 rows, and a refresh every 2 s no longer rebuilds 20,000 nodes. The inbox and project list are also no longer loaded twice at start.
+
 - A run whose agent was denied an action is not clean, and `pma review` lists what was denied. Auto mode skips a blocked action and carries on, so such a run could otherwise pass `b` and `--push` with work undone. Reads the result's `permission_denials` and classifier tool results, since no run has yet shown the classifier filling that list.
 
 - **`claude` runs with `--permission-mode auto`** instead of `acceptEdits`. Headless runs have no one to ask, so any command outside the verify allowlist was denied: 10 denials across 5 recorded runs, 2 of them the changelog draft pma's own prompt asks for. Auto over a wider allowlist because the denied commands were compound. Schema 44 rewrites that flag in every row running `claude`, and leaves another mode alone. A model without auto mode starts in Manual, where `-p` denies what needs approval.
@@ -102,6 +118,10 @@ pma workflow run find-issues --tag nightly --unattended
 - The TUI footer queues transitions: three runs reaching review within a second name the first with "2 more", and each Enter opens the next. Before, only the last was named.
 
 ### Fixed
+
+- **A run whose agent changed nothing offers closing, not approval or publication.** Its inbox row says `no changes: close`, `X` is its next act, and `a`, `s`, `m`, `p` and `u` refuse it with the reason. `D` left such a run in review and `u` then queued a push that failed with "nothing to stage". A run whose publish failed shows the error on its row.
+
+- **A hand-committed interactive run ticks its item when it settles.** The tick goes into the clone's `TODO.md`, uncommitted, as `pma sync` leaves its edits. Nothing ticked it before, so the task stayed listed and was dispatched again: $0.38 and 46 s for an agent to find the work already in `HEAD`.
 
 - An interactive run no longer runs the base check before opening its pane. That check was 94% of the wait from key to agent, 44 s on `margo`, and a person judges the run.
 

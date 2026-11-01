@@ -172,6 +172,7 @@ nav { display: flex; flex-direction: column; gap: 14px; }
 .heading p { margin: 2px 0 0; color: var(--text-3); font-size: 13px; }
 .toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
 .toolbar .sep { width: 1px; height: 22px; background: var(--border-strong); margin: 0 4px; }
+.toolbar .filter { width: 18ch; margin: 0; }
 .more { position: relative; }
 .more summary { list-style: none; }
 .more summary::-webkit-details-marker { display: none; }

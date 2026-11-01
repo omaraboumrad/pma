@@ -21,6 +21,7 @@ fn picks_round_trip_through_json() {
             id: 3,
             clean: true,
             fixing: false,
+            empty: false,
             state: "ready".into(),
             project: "socket.io".into(),
         },

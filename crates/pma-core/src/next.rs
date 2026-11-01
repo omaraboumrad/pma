@@ -49,6 +49,8 @@ pub enum Subject {
     Run {
         id: i64,
         fixing: bool,
+        /// The agent changed nothing.
+        empty: bool,
         state: String,
         project: String,
     },
@@ -147,23 +149,35 @@ pub fn build(
     waiting.sort_by_key(|r| (order(r), r.id));
     for r in waiting {
         let (what, command) = match r.state {
+            // Nothing to approve or publish; its summary says why.
+            RunState::Ready | RunState::Approved if r.changed_nothing() => (
+                "no changes: close".to_string(),
+                format!("pma close {}", r.id),
+            ),
             RunState::Approved if r.fixing_pr().is_some() => {
-                ("to publish", format!("pma pr {}", r.id))
+                ("to publish".to_string(), format!("pma pr {}", r.id))
             }
-            RunState::Approved => ("to publish", format!("pma pr {} | pma push {}", r.id, r.id)),
+            // A publish that failed says so where the next one is offered.
+            RunState::Approved => (
+                match &r.error {
+                    Some(e) => format!("publish failed: {}", report::truncate(e, 60)),
+                    None => "to publish".to_string(),
+                },
+                format!("pma pr {} | pma push {}", r.id, r.id),
+            ),
             RunState::PrOpen => (
-                "to merge",
+                "to merge".to_string(),
                 r.outcome
                     .clone()
                     .unwrap_or_else(|| "its pull request".into()),
             ),
-            _ => ("to review", format!("pma review {}", r.id)),
+            _ => ("to review".to_string(), format!("pma review {}", r.id)),
         };
         next.runs.push(Row {
             cells: vec![
                 format!("#{}", r.id),
                 r.state.name().to_string(),
-                what.to_string(),
+                what,
                 r.project.clone(),
                 report::truncate(&r.text, 80),
             ],
@@ -172,6 +186,7 @@ pub fn build(
             subject: Subject::Run {
                 id: r.id,
                 fixing: r.fixing_pr().is_some(),
+                empty: r.changed_nothing(),
                 state: r.state.name().into(),
                 project: r.project.clone(),
             },
@@ -342,6 +357,38 @@ mod tests {
                 ("#1", "https://x/pull/1"),
             ]
         );
+    }
+
+    /// A run whose agent changed nothing has nothing to approve or publish, so
+    /// its row says to close it; a run whose publish failed says so where the
+    /// next one is offered.
+    #[test]
+    fn a_run_that_changed_nothing_is_closed_not_published() {
+        let mut empty = run(1, RunState::Approved);
+        empty.diffstat = Some("no changes".into());
+        let mut failed = run(2, RunState::Approved);
+        failed.error = Some("push: rejected".into());
+        let next = build(&[], &[empty, failed], 100, |_| Taken::Free);
+        let got: Vec<(&str, &str)> = next
+            .runs
+            .iter()
+            .map(|r| (r.cells[2].as_str(), r.command.as_deref().unwrap_or("")))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("no changes: close", "pma close 1"),
+                ("publish failed: push: rejected", "pma pr 2 | pma push 2"),
+            ]
+        );
+        assert!(matches!(
+            next.runs[0].subject,
+            Subject::Run { empty: true, .. }
+        ));
+        assert!(matches!(
+            next.runs[1].subject,
+            Subject::Run { empty: false, .. }
+        ));
     }
 
     #[test]
