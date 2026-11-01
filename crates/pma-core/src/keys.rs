@@ -306,6 +306,7 @@ impl Act {
             Action::ApproveRun { .. } => &[Act::ApproveRun],
             Action::ApproveRuns { .. } => &[Act::ApproveRuns],
             Action::RejectRun { .. } => &[Act::RejectRun, Act::ForgetRun],
+            Action::CloseRuns { .. } => &[Act::ForgetRun],
             Action::AddReviewTime { .. } => &[Act::AddReviewTime],
             Action::SettlePrs => &[Act::SettlePrs],
             Action::MergePr { .. } => &[Act::Merge],
@@ -386,7 +387,7 @@ pub enum Command {
     Finished,
     /// The project of the selected row.
     OpenProject,
-    /// Marks the selected task or project, or unmarks it, for an act on several.
+    /// Marks the selected task, project or run, or unmarks it, for an act on several.
     Mark,
     Help,
     /// The TUI only; a browser tab is closed by the browser.

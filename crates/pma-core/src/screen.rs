@@ -29,6 +29,10 @@ pub enum Pick {
         retry: bool,
     },
     /// Projects marked together, for one `pma run` over them all.
+    /// The runs marked to close.
+    Runs {
+        ids: Vec<i64>,
+    },
     Projects {
         names: Vec<String>,
     },
@@ -156,6 +160,7 @@ pub fn fits(act: Act, pick: &Pick) -> bool {
             matches!(pick, Pick::Task { .. } | Pick::Tasks { .. })
         }
         // A decision closes the pane, so later states have none to open.
+        Act::ForgetRun if matches!(pick, Pick::Runs { .. }) => true,
         Act::OpenPane => {
             matches!(pick, Pick::Run { state, .. } if ["running", "ready", "failed"].contains(&state.as_str()))
         }
@@ -245,6 +250,7 @@ pub fn marked(marks: &[Pick]) -> Pick {
     let mut targets = Vec::new();
     let mut names = Vec::new();
     let mut again = false;
+    let mut runs = Vec::new();
     for m in marks {
         match m {
             Pick::Task { target, retry, .. } => {
@@ -252,6 +258,7 @@ pub fn marked(marks: &[Pick]) -> Pick {
                 again |= retry;
             }
             Pick::Manual { project } => names.push(project.clone()),
+            Pick::Run { id, .. } => runs.push(*id),
             _ => {}
         }
     }
@@ -261,6 +268,7 @@ pub fn marked(marks: &[Pick]) -> Pick {
             retry: again,
         },
         (true, false) => Pick::Projects { names },
+        (true, true) if !runs.is_empty() => Pick::Runs { ids: runs },
         (true, true) => Pick::Nothing,
     }
 }
@@ -616,6 +624,9 @@ fn run_pick(r: &Run) -> Pick {
 /// Runs and jobs in one list: under way first, then newest first. A running
 /// agent's row says what its log last showed. `with_project` adds the
 /// project column, for a list across projects.
+/// How long a finished job stays in an activity list, in seconds.
+const FINISHED_JOB_SHOWN: i64 = 3 * 86_400;
+
 fn activity_pane(
     state: &std::path::Path,
     runs: &[Run],
@@ -623,6 +634,23 @@ fn activity_pane(
     now: i64,
     with_project: bool,
 ) -> Pane {
+    // An old finished job says nothing a person can act on, but a project's
+    // latest one says how its last command went. `pma job` keeps them all.
+    let latest = |j: &Job| {
+        jobs.iter()
+            .filter(|o| o.project == j.project)
+            .map(|o| o.id)
+            .max()
+            == Some(j.id)
+    };
+    let jobs: Vec<&Job> = jobs
+        .iter()
+        .filter(|j| {
+            matches!(j.state.as_str(), "queued" | "running" | "awaiting-approval")
+                || now - j.created_at < FINISHED_JOB_SHOWN
+                || latest(j)
+        })
+        .collect();
     let agents = watch::agents(state, runs, now);
     let doing = |r: &Run| -> String {
         let Some(a) = agents.iter().find(|a| a.run.id == r.id) else {
@@ -2245,6 +2273,14 @@ pub fn question(act: Act, pick: &Pick) -> String {
             format!("{} tasks ({})", targets.len(), targets.join(", "))
         }
         Pick::Projects { names } => names.join(", "),
+        Pick::Runs { ids } => format!(
+            "{} runs ({})",
+            ids.len(),
+            ids.iter()
+                .map(|id| format!("#{id}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         Pick::Manual { project } => project.clone(),
         Pick::Run { id, .. } | Pick::Job { id, .. } | Pick::Note { id, .. } => format!("#{id}"),
         Pick::Instance { id, .. } => format!("instance {id}"),
@@ -2705,6 +2741,12 @@ pub fn action_in(
             seen: Some(state.clone()),
             drop: unchecked(input)?,
         },
+        (Act::ForgetRun, Pick::Runs { ids }) => Action::CloseRuns { ids: ids.clone() },
+        (Act::RejectRun | Act::ForgetRun, Pick::Job { id, .. }) => {
+            return Err(format!(
+                "job #{id} is a record of a command and holds nothing up; it needs no closing"
+            ));
+        }
         (Act::RejectRun | Act::ForgetRun, Pick::Run { id, state, .. }) => Action::RejectRun {
             id: *id,
             keep_git_changes: false,
@@ -2845,6 +2887,43 @@ mod tests {
     }
 
     /// `D` is `d` with the push; `d` stays without it.
+    /// An old finished job leaves the list unless it is its project's latest;
+    /// one still under way never does.
+    #[test]
+    fn old_finished_jobs_leave_the_activity_list() {
+        let now = 100 * 86_400;
+        let job = |id: i64, state: &str, days: i64, project: &str| Job {
+            id,
+            args: vec!["scan".into()],
+            cwd: "/".into(),
+            state: state.into(),
+            created_at: now - days * 86_400,
+            started_at: None,
+            finished_at: None,
+            pid: None,
+            exit_code: None,
+            awaiting: None,
+            project: Some(project.into()),
+        };
+        let jobs = [
+            job(1, "failed", 9, "a"),
+            job(2, "running", 9, "a"),
+            job(3, "failed", 1, "a"),
+            job(4, "done", 9, "b"),
+        ];
+        let pane = activity_pane(std::path::Path::new("/none"), &[], &jobs, now, true);
+        let mut shown: Vec<i64> = pane
+            .items
+            .iter()
+            .filter_map(|i| match i.pick {
+                Pick::Job { id, .. } => Some(id),
+                _ => None,
+            })
+            .collect();
+        shown.sort();
+        assert_eq!(shown, [2, 3, 4]);
+    }
+
     #[test]
     fn dispatch_push_says_so() {
         let task = Pick::Task {
@@ -3096,7 +3175,11 @@ mod tests {
             state: "ready".into(),
             project: "a".into(),
         };
-        assert_eq!(marked(std::slice::from_ref(&run)), Pick::Nothing);
+        assert_eq!(
+            marked(std::slice::from_ref(&run)),
+            Pick::Runs { ids: vec![1] }
+        );
+        assert_eq!(marked(&[]), Pick::Nothing);
         let pick = marked(&[task("a:5", false), run, task("b:2", true)]);
         assert_eq!(
             pick,

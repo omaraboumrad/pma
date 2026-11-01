@@ -527,6 +527,7 @@ fn pick_json(p: &Pick) -> Value {
             json!({ "kind": "tasks", "targets": targets, "retry": retry })
         }
         Pick::Projects { names } => json!({ "kind": "projects", "names": names }),
+        Pick::Runs { ids } => json!({ "kind": "runs", "ids": ids }),
         Pick::Manual { project } => json!({ "kind": "manual", "project": project }),
         Pick::Run {
             id,
@@ -582,6 +583,12 @@ fn pick_from(v: &Value) -> Option<Pick> {
                 .collect::<Option<Vec<_>>>()
                 .filter(|t| !t.is_empty())?,
             retry: b("retry")?,
+        },
+        "runs" => Pick::Runs {
+            ids: v["ids"]
+                .as_array()
+                .map(|a| a.iter().filter_map(Value::as_i64).collect())
+                .unwrap_or_default(),
         },
         "projects" => Pick::Projects {
             names: v["names"]

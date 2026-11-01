@@ -8,6 +8,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - **`pma integrate herdr`** runs every agent in a herdr pane: a tab per run in a `pma: <project>` workspace, closed when the run is decided. Headless by default, which keeps cost, budget and verdict; `I` or `--interactive` gives a live `claude` that reports none of them. `H` opens a run's pane and `T` opens an interactive agent on its directory. A single `integration` setting, since integrations exclude each other. Over the socket API, with an `events.subscribe` connection per run: a blocked agent shows on the run and raises a toast, and closing a pane ends its run at once. Design: `docs/dev/herdr-integration.md`.
 
+- Space marks open runs in the TUI and a checkbox does in the web; `X` then closes them all, leaving their files. `pma close` was the only way to close several.
+
+- Activity lists drop a finished job after 3 days unless it is its project's latest, since nothing can be done with one; `pma job` lists them all. `X` on a job now says it needs no closing.
+
 - Jobs in different projects run at once, up to `max_parallel`; an interactive job does not count. A run takes a lock on its project instead of a global one, so an `I` on one project no longer blocks a push, reject or dispatch on another. `flock` is what proves a run is live, so a crash leaves nothing stale, over a pid that could be reused. See [docs/dev/project-locks.md](docs/dev/project-locks.md).
 
 - A dispatch whose clone holds another run waits in the queue instead of failing after its turn came, and the job's notice says what it waits for and how long its base took.

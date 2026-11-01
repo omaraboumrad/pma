@@ -97,7 +97,8 @@ function lookup(key) {
   const fit = S.keys.bindings.filter((b) => b.key === key);
   const onTab = fit.filter((b) => b.tabs.includes(S.tab));
   const cands = onTab.length ? onTab : fit.filter((b) => b.tabs.length === 0);
-  const fits = S.marks.length && !S.detail ? currentActs().concat(MARK_ACTS) : currentActs();
+  const marks = S.marks.length && !S.detail;
+  const fits = marks ? currentActs().concat(runsMarked() ? ["ForgetRun"] : MARK_ACTS) : currentActs();
   return cands.find((b) => b.command.kind === "act" && fits.includes(b.command.act))
     || cands.find((b) => b.command.kind !== "act")
     || cands[0];
@@ -153,14 +154,24 @@ function currentPick() {
 // ---------------------------------------------------------------- marks
 
 const sameTask = (a, b) => (a.kind === "task" && b.kind === "task" && a.target === b.target)
-  || (a.kind === "manual" && b.kind === "manual" && a.project === b.project);
+  || (a.kind === "manual" && b.kind === "manual" && a.project === b.project)
+  || (a.kind === "run" && b.kind === "run" && a.id === b.id);
+// The states `screen::run_allows` lets `ForgetRun` close.
+const CLOSABLE = ["ready", "failed", "approved", "staged", "committed"];
+const runsMarked = () => S.marks.some((m) => m.kind === "run");
 const MARK_ACTS = ["Dispatch", "DispatchPush", "DispatchInteractive"];
-const markable = (pick) => pick.kind === "task" || (pick.kind === "manual" && S.tab === "projects");
+const markable = (pick) => pick.kind === "task" || (pick.kind === "manual" && S.tab === "projects")
+  || (pick.kind === "run" && CLOSABLE.includes(pick.state));
 const isMarked = (pick) => S.marks.some((m) => sameTask(m, pick));
 
 function toggleMark(pick) {
   if (!markable(pick)) {
-    toast("Only a task or a project can be marked.", "warn");
+    toast("Only a task, a project or an open run can be marked.", "warn");
+    return;
+  }
+  // An act takes one kind of row, and a mark is not lost to another.
+  if (S.marks.some((m) => (m.kind === "run") !== (pick.kind === "run"))) {
+    toast("Another kind of row is marked; clear it first.", "warn");
     return;
   }
   S.marks = isMarked(pick) ? S.marks.filter((m) => !sameTask(m, pick)) : S.marks.concat(pick);
@@ -169,6 +180,7 @@ function toggleMark(pick) {
 
 // The marked tasks as one pick, as `screen::marked` builds it.
 function markedPick() {
+  if (runsMarked()) return { kind: "runs", ids: S.marks.map((m) => m.id) };
   if (S.marks[0].kind === "manual") return { kind: "projects", names: S.marks.map((m) => m.project) };
   return { kind: "tasks", targets: S.marks.map((m) => m.target), retry: S.marks.some((m) => m.retry) };
 }
@@ -442,7 +454,12 @@ function draw() {
     const dispatch = acts(true).find((b) => b.command.act === "Dispatch");
     const back = onTab().find((b) => b.command.kind === "Back");
     toolbar.append(el("span", { class: "sep", "aria-hidden": "true" }));
-    if (dispatch) {
+    const closes = acts(true).concat(acts(false)).find((b) => b.command.act === "ForgetRun");
+    if (runsMarked() && closes) {
+      toolbar.append(el("button", { class: "button danger", type: "button", onclick: () => act(closes) },
+        `Close ${S.marks.length} marked`, el("kbd", {}, closes.key)));
+    }
+    if (dispatch && !runsMarked()) {
       toolbar.append(el("button", { class: "button primary", type: "button", onclick: () => act(dispatch) },
         `Dispatch ${S.marks.length} marked`, el("kbd", {}, dispatch.key)));
     }
@@ -458,7 +475,8 @@ function draw() {
   // With tasks marked, dispatch is theirs, above.
   const sel = selected();
   if (sel) {
-    const fit = sel.item.acts.filter((a) => !(S.marks.length && MARK_ACTS.includes(a)));
+    const fit = sel.item.acts.filter((a) => !(S.marks.length
+      && (runsMarked() ? a === "ForgetRun" : MARK_ACTS.includes(a))));
     const own = acts(true).filter((b) => fit.includes(b.command.act));
     const proj = onTab().find((b) => b.command.kind === "OpenProject");
     const open = onTab().find((b) => b.command.kind === "Open");
@@ -754,7 +772,8 @@ function shortcuts() {
 
 async function act(b) {
   const name = b.command.act;
-  const overMarks = MARK_ACTS.includes(name) || (name === "Run" && S.tab === "projects");
+  const overMarks = runsMarked() ? name === "ForgetRun"
+    : MARK_ACTS.includes(name) || (name === "Run" && S.tab === "projects");
   const marked = overMarks && S.marks.length > 0 && !S.detail;
   // A decision from a run's detail: the next ready run follows it.
   let decided = S.detail && b.command.decides ? S.detail.pick.id : null;

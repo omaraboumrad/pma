@@ -478,7 +478,7 @@ impl App {
                 self.mode = Mode::Normal;
                 return match key {
                     "y" => {
-                        if matches!(action, Action::Dispatch { .. }) {
+                        if matches!(action, Action::Dispatch { .. } | Action::CloseRuns { .. }) {
                             self.marks.clear();
                         }
                         Some(Request::Act(action))
@@ -695,20 +695,37 @@ impl App {
                 let markable = match &pick {
                     Pick::Task { .. } => true,
                     Pick::Manual { .. } => self.tab == Tab::Projects,
+                    Pick::Run { .. } => screen::fits(Act::ForgetRun, &pick),
                     _ => false,
                 };
                 if !markable {
-                    self.say("Only a task or a project can be marked.", Tone::Warn);
+                    self.say(
+                        "Only a task, a project or an open run can be marked.",
+                        Tone::Warn,
+                    );
+                    return None;
+                }
+                // An act takes one kind of row, and a mark is not lost to another.
+                let is_run = |p: &Pick| matches!(p, Pick::Run { .. });
+                if self.marks.iter().any(|m| is_run(m) != is_run(&pick)) {
+                    self.say(
+                        "Another kind of row is marked; Esc clears it first.",
+                        Tone::Warn,
+                    );
                     return None;
                 }
                 match self.marks.iter().position(|m| same_task(m, &pick)) {
                     Some(i) => {
                         self.marks.remove(i);
                     }
-                    None => self.marks.push(pick),
+                    None => self.marks.push(pick.clone()),
                 }
                 match self.marks.len() {
-                    0 => self.say("No task marked.", Tone::Muted),
+                    0 => self.say("Nothing marked.", Tone::Muted),
+                    n if is_run(&pick) => self.say(
+                        format!("{n} marked; X closes them, leaving their files. Esc clears."),
+                        Tone::Accent,
+                    ),
                     n => self.say(
                         format!("{n} marked; d dispatches them, one run per project. Esc clears."),
                         Tone::Accent,
@@ -717,10 +734,13 @@ impl App {
             }
             Command::Act(act) => {
                 let (mut pick, pane) = self.pick();
-                let over_marks = matches!(
-                    act,
-                    Act::Dispatch | Act::DispatchPush | Act::DispatchInteractive
-                ) || (act == Act::Run && self.tab == Tab::Projects);
+                let runs_marked = self.marks.iter().any(|m| matches!(m, Pick::Run { .. }));
+                let over_marks = match act {
+                    Act::ForgetRun => runs_marked,
+                    Act::Dispatch | Act::DispatchPush | Act::DispatchInteractive => !runs_marked,
+                    Act::Run => self.tab == Tab::Projects,
+                    _ => false,
+                };
                 if over_marks && !self.marks.is_empty() {
                     pick = screen::marked(&self.marks);
                 }
@@ -1001,6 +1021,7 @@ impl App {
                 Command::Mark => {
                     matches!(pick, Pick::Task { .. })
                         || (self.tab == Tab::Projects && matches!(pick, Pick::Manual { .. }))
+                        || (matches!(pick, Pick::Run { .. }) && screen::fits(Act::ForgetRun, &pick))
                 }
                 _ => false,
             })
@@ -1746,6 +1767,7 @@ fn same_task(a: &Pick, b: &Pick) -> bool {
     match (a, b) {
         (Pick::Task { target: x, .. }, Pick::Task { target: y, .. }) => x == y,
         (Pick::Manual { project: x }, Pick::Manual { project: y }) => x == y,
+        (Pick::Run { id: x, .. }, Pick::Run { id: y, .. }) => x == y,
         _ => false,
     }
 }
@@ -2115,9 +2137,10 @@ mod tests {
         app.key("Tab");
         app.key(" ");
         assert!(
-            app.status.as_ref().unwrap().0.contains("Only a task"),
-            "a run is not marked"
+            app.status.as_ref().unwrap().0.contains("Another kind"),
+            "a run is not marked over tasks"
         );
+        assert_eq!(app.marks.len(), 2, "the tasks stay marked");
         assert_eq!(app.key("d"), None);
         assert!(screen_text(&mut app).contains("dispatch 2 tasks (a:5, a:9)?"));
         let Some(Request::Act(Action::Dispatch { targets, .. })) = app.key("y") else {
@@ -2758,6 +2781,35 @@ mod tests {
                 .collect(),
             empty: "none",
         }
+    }
+
+    /// Space marks open runs too, and `X` closes them as one act.
+    #[test]
+    fn marked_runs_close_together() {
+        let run = |id: i64, state: &str| Pick::Run {
+            id,
+            clean: false,
+            fixing: false,
+            state: state.into(),
+            project: "p".into(),
+        };
+        assert_eq!(
+            screen::marked(&[run(5, "failed"), run(6, "ready")]),
+            Pick::Runs { ids: vec![5, 6] }
+        );
+        assert!(screen::fits(Act::ForgetRun, &Pick::Runs { ids: vec![5] }));
+        assert!(same_task(&run(5, "failed"), &run(5, "ready")));
+        assert!(!same_task(&run(5, "failed"), &run(6, "failed")));
+        assert_eq!(
+            screen::action(Act::ForgetRun, &Pick::Runs { ids: vec![5, 6] }, &[], ""),
+            Ok(Action::CloseRuns { ids: vec![5, 6] })
+        );
+        let job = Pick::Job {
+            id: 17,
+            awaiting: false,
+        };
+        let said = screen::action(Act::ForgetRun, &job, &[], "").unwrap_err();
+        assert!(said.contains("needs no closing"), "{said}");
     }
 
     /// Spare rows go to what has rows to show, as when nothing waits on you

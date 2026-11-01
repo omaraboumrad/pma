@@ -354,6 +354,11 @@ pub enum Action {
         drop: Vec<usize>,
     },
     /// Approves several runs at once, each of which must be clean.
+    /// `RejectRun` with `leave_files`, over several; one that cannot close
+    /// does not stop the rest.
+    CloseRuns {
+        ids: Vec<i64>,
+    },
     ApproveRuns {
         ids: Vec<i64>,
     },
@@ -1601,6 +1606,29 @@ pub fn act(store: &Store, a: Action) -> Result<Outcome> {
             dispatch::approve(store, &mut run, &whoami())?;
             Outcome::default()
         }
+        Action::CloseRuns { ids } => {
+            let mut out = Outcome::default();
+            for id in ids {
+                let closed = act(
+                    store,
+                    Action::RejectRun {
+                        id,
+                        keep_git_changes: false,
+                        leave_files: true,
+                        infra: false,
+                        seen: None,
+                    },
+                );
+                match closed {
+                    Ok(o) => {
+                        out.said.extend(o.said);
+                        out.warnings.extend(o.warnings);
+                    }
+                    Err(e) => out.warnings.push(format!("#{id}: {e}")),
+                }
+            }
+            out
+        }
         Action::ApproveRuns { ids } => {
             let mut runs = Vec::new();
             for id in &ids {
@@ -2223,6 +2251,7 @@ pub fn command_line(a: &Action) -> Option<Vec<String>> {
         }
         Action::ApproveRun { .. }
         | Action::ApproveRuns { .. }
+        | Action::CloseRuns { .. }
         | Action::RejectRun { .. }
         | Action::AddReviewTime { .. }
         | Action::SettlePrs
