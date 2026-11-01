@@ -4,7 +4,7 @@ Maintain many repositories from one place.
 
 If you keep dozens of small projects, the work is not hard, it is scattered. Each repository has a `TODO.md`, failing CI, outdated dependencies and a dirty working tree, and finding out means opening all of them. `pma` reads them all in one pass, ranks every task across every project in one list, and can hand a task to a coding agent in your clone, or in a throwaway worktree. You read the diff, and `pma` commits it and opens a pull request or pushes.
 
-Scanning 95 repositories takes about 15 seconds.
+A full scan of 112 repositories took 35 to 61 seconds here, nearly all of it GitHub. After the first, you rarely need one.
 
 Nothing is published without you. An agent runs with no push credentials in its environment, `pma` runs the project's tests itself rather than trusting the agent's report, and every change waits unstaged until you approve it.
 

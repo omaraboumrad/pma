@@ -1,7 +1,7 @@
 //! The portfolio database: roots, projects with tiers, settings, the results
 //! of the last scan, agent runs, and portfolio notes.
 //!
-//! One user and one session at a time is assumed. The rollback journal
+//! One user is assumed, and one session per project (`Session`). The rollback journal
 //! (`journal_mode=DELETE`) keeps the file complete between transactions, so
 //! a copy of it is a usable backup.
 
@@ -886,10 +886,15 @@ pub struct TaskRow {
     pub first_seen: i64,
 }
 
-/// Exclusive right to run agents and change worktrees. `flock` releases it
-/// when the process exits, so a crash leaves no stale lock.
+/// The right to run agents and change worktrees: over every project, or over
+/// the ones named, so work on one does not block work on another. `flock`
+/// releases it when the process exits, so a crash leaves no stale lock, and
+/// that makes a lock held the proof that a run is live. Design:
+/// docs/dev/project-locks.md.
 pub struct Session {
-    _file: File,
+    _files: Vec<File>,
+    /// `None` for every project.
+    projects: Option<Vec<String>>,
 }
 
 impl Session {
@@ -916,7 +921,77 @@ impl Session {
         }
         file.set_len(0).map_err(io)?;
         write!(file, "{}", std::process::id()).map_err(io)?;
-        Ok(Some(Session { _file: file }))
+        Ok(Some(Session {
+            _files: vec![file],
+            projects: None,
+        }))
+    }
+
+    /// The named projects, or `None` when something holds one of them or every
+    /// project. Every project is held by taking `session.lock` exclusively, and
+    /// one by holding it shared, so the two exclude each other.
+    pub fn try_projects(dir: &Path, projects: &[String]) -> Result<Option<Session>> {
+        let mut projects = projects.to_vec();
+        projects.sort();
+        projects.dedup();
+        let path = dir.join("session.lock");
+        let io = |e: std::io::Error| format!("{}: {e}", path.display());
+        let shared = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(io)?;
+        match shared.try_lock_shared() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(TryLockError::Error(e)) => return Err(io(e).into()),
+        }
+        let mut files = vec![shared];
+        for project in &projects {
+            // A name from the command line, not yet checked against the store.
+            let file = format!("project-{}.lock", project.replace('/', "_"));
+            match Session::try_lock(dir, &file)? {
+                Some(mut held) => files.append(&mut held._files),
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(Session {
+            _files: files,
+            projects: Some(projects),
+        }))
+    }
+
+    /// `try_projects`, waiting out a brief hold as `acquire` does.
+    pub fn acquire_projects(dir: &Path, projects: &[String]) -> Result<Session> {
+        const WAIT: Duration = Duration::from_secs(2);
+        let started = std::time::Instant::now();
+        loop {
+            if let Some(session) = Session::try_projects(dir, projects)? {
+                return Ok(session);
+            }
+            if started.elapsed() >= WAIT {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let holder = projects
+            .iter()
+            .filter_map(|p| std::fs::read_to_string(dir.join(format!("project-{p}.lock"))).ok())
+            .map(|pid| pid.trim().to_string())
+            .find(|pid| !pid.is_empty())
+            .or_else(|| {
+                std::fs::read_to_string(dir.join("session.lock"))
+                    .ok()
+                    .map(|pid| pid.trim().to_string())
+            })
+            .filter(|pid| !pid.is_empty())
+            .map_or(String::new(), |pid| format!(" (pid {pid})"));
+        Err(format!(
+            "another pma session{holder} is working on {}; wait for it to finish",
+            projects.join(", ")
+        )
+        .into())
     }
 
     /// Like `try_acquire`, but waits out a brief hold, such as `pma review`
@@ -1362,7 +1437,11 @@ impl Store {
             .into_iter()
             .filter(|r| !r.state.is_final())
             .collect();
-        let tx = self.conn.transaction()?;
+        // Immediate: reading first and writing later fails at once, past
+        // `busy_timeout`, if another process wrote in between.
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let before = scan_state(&tx)?;
         let returned: std::collections::HashSet<String> = {
             let mut stmt =
@@ -1674,6 +1753,35 @@ impl Store {
         Ok(())
     }
 
+    /// The seconds the last measured base verify took in `project`.
+    pub fn last_base_seconds(&self, project: &str) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT seconds FROM verify_base WHERE project = ?1 ORDER BY rowid DESC LIMIT 1",
+                [project],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// For each run a dispatch job about one project started: seconds from the
+    /// job being queued to the agent starting.
+    pub fn key_to_agent(&self) -> Result<Vec<i64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT r.dispatched_at - (SELECT MAX(j.created_at) FROM jobs j
+                 WHERE j.project = r.project AND j.args LIKE '[\"dispatch\"%'
+                   AND j.created_at <= r.dispatched_at AND j.finished_at >= r.dispatched_at)
+             FROM runs r",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, Option<i64>>(0))?;
+        Ok(rows
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect())
+    }
+
     /// What each project's files looked like when last read.
     pub fn project_stamps(&self) -> Result<HashMap<String, String>> {
         let mut stmt = self
@@ -1926,23 +2034,24 @@ impl Store {
     }
 
     /// Marks the oldest queued job running and returns it.
-    pub fn claim_job(&self) -> Result<Option<Job>> {
-        let Some(id) = self
-            .conn
-            .query_row(
-                "SELECT id FROM jobs WHERE state = 'queued' ORDER BY id LIMIT 1",
-                [],
-                |r| r.get::<_, i64>(0),
-            )
-            .optional()?
-        else {
-            return Ok(None);
-        };
-        self.conn.execute(
+    /// Queued jobs, oldest first.
+    pub fn queued_jobs(&self) -> Result<Vec<Job>> {
+        let mut jobs = self.jobs(i64::MAX)?;
+        jobs.retain(|j| j.state == "queued");
+        jobs.sort_by_key(|j| j.id);
+        Ok(jobs)
+    }
+
+    /// Takes a queued job; `None` if it was stopped first.
+    pub fn claim_job(&self, id: i64) -> Result<Option<Job>> {
+        let claimed = self.conn.execute(
             "UPDATE jobs SET state = 'running', started_at = ?2 WHERE id = ?1 AND state = 'queued'",
             params![id, crate::dates::now()],
         )?;
-        self.job(id).map(Some)
+        match claimed {
+            0 => Ok(None),
+            _ => self.job(id).map(Some),
+        }
     }
 
     /// Records what would approve the plan a job stopped at.
@@ -2158,7 +2267,7 @@ impl Store {
                 decided_at = ?14, published_at = ?15, review_seconds = ?16,
                 changed_paths = ?17, scope_error = ?18, approved_tree = ?19,
                 approved_head = ?20, approved_by = ?21, reviewed_tree = ?22, infra = ?23,
-                base = ?25, denied = ?26
+                base = ?25, denied = ?26, verify_base_ok = ?27, verify_base_seconds = ?28
              WHERE id = ?1 AND (?24 IS NULL OR state = ?24)",
             params![
                 run.id,
@@ -2189,6 +2298,8 @@ impl Store {
                 read.map(RunState::name),
                 run.base,
                 serde_json::to_string(&run.denied).ok(),
+                run.verify_base_ok,
+                run.verify_base_seconds,
             ],
         )?;
         if written == 0 {
@@ -3159,12 +3270,21 @@ impl Store {
 
     /// Marks runs left queued or running by a session that ended as failed.
     /// Only a `Session` holder runs agents, so while it is held none is live.
-    pub fn fail_interrupted_runs(&self, _held: &Session) -> Result<usize> {
-        Ok(self.conn.execute(
-            "UPDATE runs SET state = 'failed', error = 'interrupted: pma exited during the run'
-             WHERE state IN ('queued', 'running')",
-            [],
-        )?)
+    pub fn fail_interrupted_runs(&self, held: &Session) -> Result<usize> {
+        const FAIL: &str = "UPDATE runs SET state = 'failed',
+                error = 'interrupted: pma exited during the run'
+             WHERE state IN ('queued', 'running')";
+        // Only what `held` covers: a run elsewhere may be live under its own lock.
+        let Some(projects) = &held.projects else {
+            return Ok(self.conn.execute(FAIL, [])?);
+        };
+        let mut failed = 0;
+        for project in projects {
+            failed += self
+                .conn
+                .execute(&format!("{FAIL} AND project = ?1"), [project])?;
+        }
+        Ok(failed)
     }
 
     #[cfg(test)]
@@ -4846,6 +4966,41 @@ mod tests {
         assert!(Session::acquire(&dir).is_ok(), "a brief hold is waited out");
         release.join().unwrap();
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Work on one project leaves another free, and work over every project
+    /// excludes both. Failing interrupted runs stays within what is held.
+    #[test]
+    fn a_project_lock_holds_only_its_project() {
+        let dir = scratch("projectlocks");
+        let store = Store::open(&dir.join("p.db")).unwrap();
+        let names = |n: &str| vec![n.to_string()];
+        let live = |project: &str| {
+            let mut run = Run {
+                project: project.into(),
+                state: RunState::Running,
+                ..Default::default()
+            };
+            store.insert_run(&mut run).unwrap();
+            run.id
+        };
+        let (a_run, b_run) = (live("a"), live("b"));
+
+        // `acquire`: a test thread forking a child can hold a lock for a moment.
+        let a = Session::acquire_projects(&dir, &names("a")).unwrap();
+        assert!(Session::try_projects(&dir, &names("a")).unwrap().is_none());
+        assert!(Session::try_acquire(&dir).unwrap().is_none());
+        let b = Session::acquire_projects(&dir, &names("b")).unwrap();
+
+        assert_eq!(store.fail_interrupted_runs(&a).unwrap(), 1);
+        assert_eq!(store.run(a_run).unwrap().state, RunState::Failed);
+        assert_eq!(store.run(b_run).unwrap().state, RunState::Running);
+
+        drop((a, b));
+        let all = Session::acquire(&dir).unwrap();
+        assert!(Session::try_projects(&dir, &names("a")).unwrap().is_none());
+        assert_eq!(store.fail_interrupted_runs(&all).unwrap(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

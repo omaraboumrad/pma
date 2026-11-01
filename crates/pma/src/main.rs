@@ -2195,7 +2195,17 @@ pub fn run_dispatch(
             .into());
         }
     }
-    let session = Session::acquire(&store::home()?)?;
+    // Named targets hold only their projects, so other work goes on.
+    let session = match (auto || targets.is_empty() || !tags.is_empty(), targets) {
+        (true, _) => Session::acquire(&store::home()?)?,
+        (false, targets) => {
+            let projects: Vec<String> = targets
+                .iter()
+                .map(|t| t.split(':').next().unwrap_or(t).to_string())
+                .collect();
+            Session::acquire_projects(&store::home()?, &projects)?
+        }
+    };
     store.fail_interrupted_runs(&session)?;
     say(api::act(&store, Action::SettlePrs)?);
     let active = store.runs()?;
@@ -2925,7 +2935,8 @@ fn run_review(
         )?);
     } else if let Some(feedback) = rework {
         // In the foreground: a front end queues this command as a job.
-        let session = Session::acquire(&store::home()?)?;
+        let project = store.run(id)?.project;
+        let session = Session::acquire_projects(&store::home()?, &[project])?;
         store.fail_interrupted_runs(&session)?;
         let cfg = api::config(&store)?;
         let mut run = store.run(id)?;
@@ -2946,7 +2957,8 @@ fn run_merge(id: i64, fix: bool) -> Result<()> {
         say(api::act(&store, Action::MergePr { id })?);
         return Ok(());
     }
-    let session = Session::acquire(&store::home()?)?;
+    let project = store.run(id)?.project;
+    let session = Session::acquire_projects(&store::home()?, &[project])?;
     store.fail_interrupted_runs(&session)?;
     let cfg = api::config(&store)?;
     let mut run = store.run(id)?;
@@ -4131,7 +4143,10 @@ fn run_verify(projects: &[String], tags: &[String]) -> Result<()> {
     let store = Store::open_default()?;
     let home = store::state_home()?;
     // It adds and removes a worktree, as a dispatch does.
-    let _session = Session::acquire(&store::home()?)?;
+    let _session = match (projects.is_empty(), tags.is_empty()) {
+        (false, true) => Session::acquire_projects(&store::home()?, projects)?,
+        _ => Session::acquire(&store::home()?)?,
+    };
     let cfg = api::config(&store)?;
     let names = select(&store, projects, tags)?;
     if names.is_empty() {
@@ -4259,8 +4274,16 @@ fn run_publish_approving(
         }
     }
     let store = Store::open_default()?;
-    let _session = Session::acquire(&store::home()?)?;
+    let projects = ids
+        .iter()
+        .map(|id| store.run(*id).map(|r| r.project))
+        .collect::<Result<Vec<_>>>()?;
+    let _session = match projects.is_empty() {
+        true => Session::acquire(&store::home()?)?,
+        false => Session::acquire_projects(&store::home()?, &projects)?,
+    };
     let cfg = api::config(&store)?;
+    pma_core::publish::settle_interactive(&store)?;
     if let Some(drop) = &approve {
         if !drop.is_empty() && ids.len() != 1 {
             return Err("--drop names one run".into());
@@ -4383,7 +4406,10 @@ fn run_sync(names: &[String], tags: &[String], apply: bool) -> Result<()> {
             Ok(i) => i,
             Err(e) => {
                 skip(&e);
-                failed += 1;
+                // A repository with issues turned off has nothing to sync.
+                if !e.contains("disabled issues") {
+                    failed += 1;
+                }
                 continue;
             }
         };
@@ -4597,7 +4623,18 @@ fn render(view: View) -> String {
             placed,
             limit,
         } => format!("{header}\n\n{}", report::stale(&placed, limit)),
-        View::Report { runs, attempts, by } => report_runs::report(&runs, &attempts, by),
+        View::Report {
+            runs,
+            attempts,
+            by,
+            speed,
+        } => {
+            let mut out = report_runs::report(&runs, &attempts, by);
+            if let Some(speed) = speed {
+                out.push_str(&format!("\n{speed}\n"));
+            }
+            out
+        }
         View::Runs(runs) => match runs.is_empty() {
             true => "no runs to review\n".into(),
             false => report::runs(&runs),

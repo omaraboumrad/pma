@@ -411,8 +411,10 @@ fn commit(
 fn push(home: &std::path::Path, run: &Run) -> Result<String> {
     crate::dispatch::unchanged_git(run)?;
     let parent = git(&run.repo, &["rev-parse", "HEAD^"]).unwrap_or_default();
-    if parent != run.base
-        || git(&run.repo, &["rev-parse", "HEAD^{tree}"])? != staged_tree(home, run)?
+    // A person made an interactive run's commits, so they are not pma's one.
+    if !run.interactive
+        && (parent != run.base
+            || git(&run.repo, &["rev-parse", "HEAD^{tree}"])? != staged_tree(home, run)?)
     {
         return Err(format!(
             "HEAD in {} is not run #{}'s commit; push it yourself with `git push`",
@@ -845,6 +847,7 @@ pub fn settle(
 /// end such a run: `pma push` refuses a `HEAD` that has moved past it. Returns
 /// the runs moved. A commit rebased or squashed on the way is not recognised.
 pub fn settle_committed(store: &Store) -> Result<Vec<Run>> {
+    settle_interactive(store)?;
     let runs = store.runs()?;
     let mut settled = Vec::new();
     for run in runs.iter().filter(|r| r.state == RunState::Committed) {
@@ -860,10 +863,49 @@ pub fn settle_committed(store: &Store) -> Result<Vec<Run>> {
         let mut run = run.clone();
         run.outcome = Some(format!("{sha} found on {branch}"));
         run.enter(RunState::Pushed);
-        store.update_run(&run)?;
-        settled.push(run);
+        if store.update_run_from(&run, RunState::Committed).is_ok() {
+            settled.push(run);
+        }
     }
     Ok(settled)
+}
+
+/// An interactive run whose work is already committed needs no stage or commit
+/// from pma: its clone is on the run's branch, ahead of the base, and clean.
+/// A headless run in that state stays refused, since pma checked another tree.
+pub fn settle_interactive(store: &Store) -> Result<()> {
+    let runs = store.runs()?;
+    for run in runs.iter().filter(|r| {
+        r.interactive
+            && r.workspace == Workspace::Clone
+            && matches!(r.state, RunState::Ready | RunState::Approved)
+    }) {
+        let head = git(&run.repo, &["rev-parse", "HEAD"])?;
+        if head == run.base
+            || crate::dispatch::clone_held(&runs, &run.repo).is_err()
+            || git(
+                &run.repo,
+                &["merge-base", "--is-ancestor", &run.base, &head],
+            )
+            .is_err()
+            || git(&run.repo, &["rev-parse", "--abbrev-ref", "HEAD"])? != run.default_branch
+            || !git(&run.repo, &["status", "--porcelain"])?.is_empty()
+        {
+            continue;
+        }
+        let read = run.state;
+        let mut run = run.clone();
+        run.outcome = Some(format!(
+            "committed {} in its session",
+            &head[..7.min(head.len())]
+        ));
+        run.error = None;
+        run.enter(RunState::Committed);
+        // Only from the state it was read in: this holds no lock on the run's
+        // project, and a decision may have landed during the checks.
+        let _ = store.update_run_from(&run, read);
+    }
+    Ok(())
 }
 
 /// The commit a `committed` run's outcome names, as `commit` wrote it.

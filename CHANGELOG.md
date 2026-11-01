@@ -8,6 +8,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - **`pma integrate herdr`** runs every agent in a herdr pane: a tab per run in a `pma: <project>` workspace, closed when the run is decided. Headless by default, which keeps cost, budget and verdict; `I` or `--interactive` gives a live `claude` that reports none of them. `H` opens a run's pane and `T` opens an interactive agent on its directory. A single `integration` setting, since integrations exclude each other. Over the socket API, with an `events.subscribe` connection per run: a blocked agent shows on the run and raises a toast, and closing a pane ends its run at once. Design: `docs/dev/herdr-integration.md`.
 
+- Jobs in different projects run at once, up to `max_parallel`; an interactive job does not count. A run takes a lock on its project instead of a global one, so an `I` on one project no longer blocks a push, reject or dispatch on another. `flock` is what proves a run is live, so a crash leaves nothing stale, over a pid that could be reused. See [docs/dev/project-locks.md](docs/dev/project-locks.md).
+
+- A dispatch whose clone holds another run waits in the queue instead of failing after its turn came, and the job's notice says what it waits for and how long its base took.
+
+- `I` no longer asks for confirmation.
+
+- `pma report` gives median key-to-agent, ready-to-decided and decided-to-pushed times.
+
+- `pma config verify_base_alongside on` starts a headless agent at once and measures its base beside it, in a checkout kept between runs. Off by default: two test suites at once can clash on fixed ports or files.
+
 - After the first `pma scan`, a changed `TODO.md`, a commit or a new repository is picked up on its own: every 5 seconds with the TUI or web open, and before `next`, `matrix`, `status`, `task` and `dispatch`. CI is re-read every `scan.every` minutes (30; 0 turns it off) while a front end is open. Checking file times over running `git status` everywhere takes 61 ms instead of 3.38 s on 112 projects, and leaves an unstaged edit unseen until the next full scan. See [docs/dev/refresh.md](docs/dev/refresh.md).
 
 - The inbox header says how many open items are tagged `#agent` or `#manual`, since only those are listed.
@@ -88,6 +98,14 @@ pma workflow run find-issues --tag nightly --unattended
 - The TUI footer queues transitions: three runs reaching review within a second name the first with "2 more", and each Enter opens the next. Before, only the last was named.
 
 ### Fixed
+
+- An interactive run no longer runs the base check before opening its pane. That check was 94% of the wait from key to agent, 44 s on `margo`, and a person judges the run.
+
+- An interactive run whose work is already committed moves to `committed` by itself, and `u` pushes it. `pma push` refused it because `HEAD` had moved, so two of three such runs ended in `pma close`.
+
+- A `:ci` task on a repository with two workflow files of one name no longer fails: `gh` refuses a name it finds ambiguous, so the log is now fetched by workflow id.
+
+- `pma sync` no longer fails over a repository with issues turned off.
 
 - **Rejecting a clone run could remove later work.** The revert was built from the working tree at the moment of rejecting, not from what the agent changed, so once the clone had moved on it reversed every later commit and all uncommitted work, and reported success. Each attempt now records its change, and a reject reverses only that. A clone past the run's base refuses; `pma close <id>`, or `X`, ends the run, leaves the files alone and stays out of the accepted share, over a flag on `--reject`: rejecting means taking the change out. A run from before this has no record and can only be closed that way.
 

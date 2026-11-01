@@ -978,16 +978,30 @@ fn queue(
     // tree; a clone run's is its working tree, keyed by `start`. One verify
     // at the head alone cannot tell a regression from a repository that was
     // already failing.
+    // Not for an interactive run: a person judges it, and is waiting at the pane.
     let (verify_base_ok, verify_base_seconds) = match &verify {
-        Some(v) => {
+        Some(v) if !pick.interactive => {
             let at = start.as_deref().unwrap_or(&base);
-            base_verify(store, home, cfg, &pick.project, at, v, worktree)?
+            let sandbox = cfg.project(&pick.project).sandbox;
+            match (
+                cfg.verify_base_alongside,
+                store.verify_base(&pick.project, at, v, cfg.timeout, sandbox)?,
+            ) {
+                // `attempt` measures it.
+                (true, None) => (None, None),
+                _ => base_verify(store, home, cfg, &pick.project, at, v, worktree)?,
+            }
         }
-        None => (None, None),
+        _ => (None, None),
     };
     let mut features = Features::of(&pick.text, &details);
     features.repo_files = tracked_files(worktree);
-    features.verify_seconds = verify_base_seconds.filter(|_| verify.is_some());
+    // Unmeasured yet when it runs beside the agent; the last time stands in.
+    features.verify_seconds = match verify_base_seconds {
+        Some(seconds) => Some(seconds),
+        None => store.last_base_seconds(&pick.project)?,
+    }
+    .filter(|_| verify.is_some());
     (features.prior_decided, features.prior_accepted) = store.decided_runs(&pick.project)?;
     let complexity = complexity::estimate(class, &features);
 
@@ -1153,23 +1167,40 @@ fn failed_ci_logs(
     use crate::sync::gh;
     let url = git(repo, &["remote", "get-url", "origin"])?;
     let slug = scan::github_slug(&url).ok_or("origin is not on GitHub")?;
+    let listed = gh(&[
+        "workflow",
+        "list",
+        "-R",
+        &slug,
+        "--limit",
+        "200",
+        "--json",
+        "id,name,state",
+    ])?;
+    let active = scan::active_workflows(&listed)?;
     let mut logs = String::new();
     for workflow in workflows {
-        let runs = gh(&[
-            "run",
-            "list",
-            "-R",
-            &slug,
-            "--branch",
-            branch,
-            "--workflow",
-            workflow,
-            "--limit",
-            "20",
-            "--json",
-            "databaseId,status,conclusion",
-        ])?;
-        let Some(id) = scan::latest_failed_run(&runs)? else {
+        // By id: two workflow files may share a name, which `gh` refuses as
+        // ambiguous. The newest failure among them is the one that counts.
+        let mut failed = None;
+        for (id, _) in active.iter().filter(|(_, name)| name == workflow) {
+            let runs = gh(&[
+                "run",
+                "list",
+                "-R",
+                &slug,
+                "--branch",
+                branch,
+                "--workflow",
+                &id.to_string(),
+                "--limit",
+                "20",
+                "--json",
+                "databaseId,status,conclusion",
+            ])?;
+            failed = failed.max(scan::latest_failed_run(&runs)?);
+        }
+        let Some(id) = failed else {
             return Ok(Err(format!(
                 "`{workflow}` no longer fails on {branch}; run `pma scan`"
             )));
@@ -1485,13 +1516,77 @@ fn attempt(
     run: &mut Run,
     feedback: Option<&str>,
 ) -> Attempt {
+    // `prepare` left this to run beside the agent. Not on a rework, which has
+    // the first attempt's result.
+    let beside = (cfg.verify_base_alongside
+        && !run.interactive
+        && feedback.is_none()
+        && run.verify_base_ok.is_none()
+        && run.verify_base_seconds.is_none())
+    .then_some(())
+    .and(run.verify.clone())
+    .map(|command| {
+        let (home, cfg) = (home.to_path_buf(), cfg.clone());
+        let (project, repo) = (run.project.clone(), run.repo.clone());
+        let at = run.start.clone().unwrap_or_else(|| run.base.clone());
+        std::thread::spawn(move || {
+            let measured = base_tree(&home, &project, &repo, &at).and_then(|tree| {
+                let store = Store::open_default()?;
+                measure_base(&store, &home, &cfg, &project, &at, &command, &tree)
+            });
+            measured
+                .map(|(ok, seconds, _)| (ok, seconds))
+                .map_err(|e| e.to_string())
+        })
+    });
     let a = attempt_once(home, cfg, workers, run, feedback);
+    if let Some(thread) = beside {
+        match thread.join() {
+            Ok(Ok((ok, seconds))) => {
+                run.verify_base_ok = ok;
+                run.verify_base_seconds = Some(seconds);
+            }
+            // Unknown, as a base that could not start is: review says so.
+            Ok(Err(e)) => eprintln!("warning: #{}: base not verified: {e}", run.id),
+            Err(_) => eprintln!("warning: #{}: base not verified", run.id),
+        }
+    }
     if run.workspace == Workspace::Clone
         && let Err(e) = record_change(home, run)
     {
         eprintln!("warning: #{}: its change was not recorded: {e}", run.id);
     }
     a
+}
+
+/// A checkout of `at` for measuring a base beside an agent. Kept between runs,
+/// with its ignored files, so a build there is not cold each time; the project's
+/// lock keeps it to one run.
+fn base_tree(home: &Path, project: &str, repo: &Path, at: &str) -> Result<PathBuf> {
+    let tree = home.join("verify-trees").join(format!("{project}.base"));
+    if tree.join(".git").exists() {
+        git(&tree, &["checkout", "--quiet", "--detach", "--force", at])?;
+        git(&tree, &["clean", "-fdq"])?;
+    } else {
+        if let Some(parent) = tree.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+        }
+        // A directory git lost track of is not reused.
+        let _ = git(repo, &["worktree", "prune"]);
+        git(
+            repo,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                "--force",
+                "--quiet",
+                path_arg(&tree)?,
+                at,
+            ],
+        )?;
+    }
+    Ok(tree)
 }
 
 /// Where a clone run's change is kept, as a patch: a file rather than a commit,

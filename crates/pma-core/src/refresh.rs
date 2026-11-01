@@ -74,6 +74,7 @@ pub fn changed(store: &mut Store) -> Result<usize> {
     if store.last_scan()?.is_none() {
         return Ok(0);
     }
+    crate::publish::settle_committed(store)?;
     let (found, _) = scan::discover(&store.roots()?);
     let stamps = store.project_stamps()?;
     let runs = store.runs()?;

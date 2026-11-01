@@ -1532,7 +1532,12 @@ pub fn screen(view: View) -> Screen {
                 )],
             },
         ),
-        View::Report { runs, attempts, by } => {
+        View::Report {
+            runs,
+            attempts,
+            by,
+            speed,
+        } => {
             let by_name = report_runs::By::ALL
                 .iter()
                 .find(|(_, b)| *b == by)
@@ -1540,6 +1545,10 @@ pub fn screen(view: View) -> Screen {
             let (summary, items) = match report_runs::table_of(&runs, &attempts, by) {
                 None => ("No finished runs yet.".to_string(), Vec::new()),
                 Some((summary, rows)) => {
+                    let summary = match speed {
+                        Some(speed) => format!("{summary}\n{speed}"),
+                        None => summary,
+                    };
                     let last = rows.len().saturating_sub(1);
                     let items = rows
                         .into_iter()

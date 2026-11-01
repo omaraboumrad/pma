@@ -579,7 +579,7 @@ pub const BINDINGS: &[Binding] = &[
         "I",
         TASKS,
         Act::DispatchInteractive,
-        Ask::Confirm,
+        Ask::Nothing,
         "dispatch to drive in herdr",
     ),
     // A run.

@@ -1,7 +1,8 @@
 //! Jobs: a `pma` command queued to run detached. `--detach` stores the
 //! command's arguments and starts a runner unless one holds `runner.lock`.
-//! The runner runs each job as a child `pma`, oldest first, and exits once
-//! the queue is empty. Design: `docs/dev/async_dispatch.md`.
+//! The runner runs each job as a child `pma`, oldest first and side by side
+//! where their projects differ, and exits once the queue is empty. Design:
+//! `docs/dev/async_dispatch.md`, `docs/dev/project-locks.md`.
 //!
 //! A job runs under the agent watchdog, so the runner exiting kills the job,
 //! and the job exiting kills its agents: nothing outlives the process that
@@ -88,9 +89,106 @@ fn spawn_runner() -> Result<()> {
     Ok(())
 }
 
-/// Runs queued jobs until none is left. The lock is released before the
-/// last check, so a job queued while it was held is not stranded: its
-/// command's runner found the lock held and exited.
+/// What a job needs to itself while it runs.
+#[derive(Debug, PartialEq)]
+enum Needs {
+    /// Reads and writes no worktree a run holds.
+    Nothing,
+    Project(String),
+    Everything,
+}
+
+/// A command takes a project's lock only if it is listed here, and only a job
+/// about one project can use it. Anything else takes every project, as a
+/// workflow, whose nodes may touch any of them, must.
+fn needs(job: &Job) -> Needs {
+    let command = job.args.first().map_or("", String::as_str);
+    match (command, &job.project) {
+        ("scan", _) => Needs::Nothing,
+        (
+            "dispatch" | "review" | "push" | "pr" | "stage" | "commit" | "merge" | "verify"
+            | "deps",
+            Some(project),
+        ) => Needs::Project(project.clone()),
+        _ => Needs::Everything,
+    }
+}
+
+fn interactive(job: &Job) -> bool {
+    job.args.iter().any(|a| a == "--interactive")
+}
+
+/// Whether a dispatch must wait for its clone: one run holds a clone until it
+/// is published or rejected. It stays queued rather than failing, and a later
+/// job in the project, which may be the push that frees the clone, goes first.
+fn waits_for_clone(store: &Store, job: &Job, project: &str) -> Result<bool> {
+    if job.args.first().is_none_or(|c| c != "dispatch")
+        || job.args.iter().any(|a| a == "--worktree" || a == "--local")
+        || crate::api::config(store)?.workspace != crate::config::Workspace::Clone
+    {
+        return Ok(false);
+    }
+    let Some(row) = store.project(project)? else {
+        return Ok(false);
+    };
+    Ok(crate::dispatch::clone_busy(&store.runs()?, &row.path).is_some())
+}
+
+/// A job taken, on its own thread.
+struct Running {
+    needs: Needs,
+    /// A person is driving it, so it takes none of `max_parallel`.
+    interactive: bool,
+    thread: std::thread::JoinHandle<()>,
+}
+
+/// The oldest queued job that can start now. Jobs in a project keep their order,
+/// and one that needs everything stops later ones from overtaking it, so it
+/// cannot wait forever.
+fn next_job(store: &Store, running: &[Running], slots: usize) -> Result<Option<Job>> {
+    let everything = running.iter().any(|r| r.needs == Needs::Everything);
+    let used = running
+        .iter()
+        .filter(|r| !r.interactive && matches!(r.needs, Needs::Project(_)))
+        .count();
+    let mut held: Vec<&str> = running
+        .iter()
+        .filter_map(|r| match &r.needs {
+            Needs::Project(p) => Some(p.as_str()),
+            _ => None,
+        })
+        .collect();
+    let queued = store.queued_jobs()?;
+    for job in &queued {
+        match needs(job) {
+            Needs::Nothing => return Ok(Some(job.clone())),
+            Needs::Everything => {
+                if running.is_empty() {
+                    return Ok(Some(job.clone()));
+                }
+                return Ok(None);
+            }
+            Needs::Project(_) if everything => return Ok(None),
+            Needs::Project(project) => {
+                if waits_for_clone(store, job, &project)? {
+                    continue;
+                }
+                let free = !held.contains(&project.as_str());
+                if free && (interactive(job) || used < slots) {
+                    return Ok(Some(job.clone()));
+                }
+                // A later job in this project must not overtake this one.
+                held.push(job.project.as_deref().unwrap_or_default());
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Runs queued jobs until none can ever start: none left, and none running. A
+/// dispatch waiting for its clone keeps this alive, polling. The lock is
+/// released before the last check, so a job queued while it was held is not
+/// stranded: its command's runner found the lock held and exited.
 pub fn run() -> Result<()> {
     let home = store::home()?;
     loop {
@@ -99,14 +197,45 @@ pub fn run() -> Result<()> {
         };
         let store = Store::open_default()?;
         store.fail_running_jobs()?;
-        while let Some(job) = store.claim_job()? {
-            if let Err(e) = run_one(&store, &home, &job) {
-                eprintln!("job {}: {e}", job.id);
-                store.finish_job(job.id, None)?;
+        let mut running: Vec<Running> = Vec::new();
+        loop {
+            running.retain(|r| !r.thread.is_finished());
+            let slots = crate::api::config(&store)?.max_parallel.max(1) as usize;
+            if let Some(job) = next_job(&store, &running, slots)? {
+                let Some(job) = store.claim_job(job.id)? else {
+                    continue;
+                };
+                let (needs, interactive) = (needs(&job), interactive(&job));
+                let scope = match &needs {
+                    Needs::Nothing => Scope::None,
+                    Needs::Project(p) => Scope::Project(p.clone()),
+                    Needs::Everything => Scope::All,
+                };
+                let home = home.clone();
+                let thread = std::thread::spawn(move || {
+                    // Each thread its own connection: a `Store` is not shared.
+                    let Ok(store) = Store::open_default() else {
+                        return;
+                    };
+                    if let Err(e) = run_one(&store, &home, &job, &scope) {
+                        eprintln!("job {}: {e}", job.id);
+                        let _ = store.finish_job(job.id, None);
+                    }
+                    if let Err(e) = notify(&store, job.id) {
+                        eprintln!("job {}: notify: {e}", job.id);
+                    }
+                });
+                running.push(Running {
+                    needs,
+                    interactive,
+                    thread,
+                });
+                continue;
             }
-            if let Err(e) = notify(&store, job.id) {
-                eprintln!("job {}: notify: {e}", job.id);
+            if running.is_empty() && !store.has_queued_jobs()? {
+                break;
             }
+            std::thread::sleep(Duration::from_millis(500));
         }
         drop(lock);
         if !store.has_queued_jobs()? {
@@ -115,10 +244,25 @@ pub fn run() -> Result<()> {
     }
 }
 
-fn run_one(store: &Store, home: &std::path::Path, job: &Job) -> Result<()> {
-    // A command run in the foreground may hold the session. Waiting here
-    // rather than in the job keeps the job from failing on the lock.
-    while Session::try_acquire(home)?.is_none() {
+/// What a job's command will lock when it starts.
+enum Scope {
+    None,
+    Project(String),
+    All,
+}
+
+fn run_one(store: &Store, home: &std::path::Path, job: &Job, scope: &Scope) -> Result<()> {
+    // A command run in the foreground may hold the lock. Waiting here rather
+    // than in the job keeps the job from failing on it.
+    loop {
+        let free = match scope {
+            Scope::None => true,
+            Scope::Project(p) => Session::try_projects(home, std::slice::from_ref(p))?.is_some(),
+            Scope::All => Session::try_acquire(home)?.is_some(),
+        };
+        if free {
+            break;
+        }
         if store.job(job.id)?.state == "stopped" {
             return Ok(());
         }

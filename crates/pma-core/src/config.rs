@@ -25,6 +25,9 @@ pub struct Config {
     pub deps_days: i64,
     /// Minutes between full scans while a front end is open; 0 turns them off.
     pub scan_every: i64,
+    /// Starts the agent at once and measures an uncached base beside it, in a
+    /// checkout of its own, over measuring it first.
+    pub verify_base_alongside: bool,
     /// Days without activity at which the activity signal reaches 1, per tier.
     pub activity_horizon: [i64; 5],
     /// The worker `pma dispatch` runs, by name in the `agents` table.
@@ -162,6 +165,7 @@ impl Default for Config {
             activity_horizon: [30, 60, 120, 240, 365],
             deps_days: 30,
             scan_every: 30,
+            verify_base_alongside: false,
             agent: "claude".into(),
             preset: None,
             default_tier: Some(5),
@@ -292,6 +296,7 @@ impl Config {
         keys.extend(per_tier("activity.horizon"));
         keys.push("deps.days".into());
         keys.push("scan.every".into());
+        keys.push("verify_base_alongside".into());
         keys.extend(
             [
                 "agent",
@@ -481,6 +486,7 @@ impl Config {
                 "default_tier" => Slot::Tier(&mut self.default_tier),
                 "attribution" => Slot::Attribution(&mut self.attribution),
                 "max_parallel" => Slot::Count(&mut self.max_parallel, 1, i64::MAX),
+                "verify_base_alongside" => Slot::Switch(&mut self.verify_base_alongside),
                 "batch_budget" => Slot::Number(&mut self.batch_budget, 0.0),
                 "agent_budget" => Slot::Number(&mut self.agent_budget, 0.0),
                 "workflow_budget" => Slot::Number(&mut self.workflow_budget, 0.0),
@@ -548,7 +554,7 @@ mod tests {
     #[test]
     fn every_key_reads_and_round_trips() {
         let keys = Config::keys();
-        assert_eq!(keys.len(), 37);
+        assert_eq!(keys.len(), 38);
         let defaults = Config::default();
         let mut copy = Config::default();
         for key in &keys {

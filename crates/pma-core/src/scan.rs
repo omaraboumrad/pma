@@ -976,7 +976,7 @@ fn ci_state(dir: &Path) -> Result<(Ci, Vec<(String, String)>), String> {
 
 /// Enabled workflows as `(id, name)`, from `gh workflow list --json id,name,state`.
 /// `gh` prints nothing, not `[]`, for a repository with no workflows.
-fn active_workflows(json: &str) -> Result<Vec<(u64, String)>, String> {
+pub fn active_workflows(json: &str) -> Result<Vec<(u64, String)>, String> {
     if json.trim().is_empty() {
         return Ok(Vec::new());
     }

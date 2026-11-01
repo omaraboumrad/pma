@@ -161,6 +161,8 @@ pub enum View {
         runs: Vec<Run>,
         attempts: Vec<Attempt>,
         by: report_runs::By,
+        /// `speed_line`.
+        speed: Option<String>,
     },
     Runs(Vec<Run>),
     Inbox {
@@ -1112,8 +1114,19 @@ pub fn choices(store: &Store, act: Act) -> Result<Choices> {
 
 /// Marks runs whose session died `failed`, when no session holds the lock.
 pub fn settle_interrupted(store: &Store) -> Result<()> {
-    if let Some(s) = Session::try_acquire(&store::home()?)? {
-        store.fail_interrupted_runs(&s)?;
+    let home = store::home()?;
+    let mut live: Vec<String> = store
+        .runs()?
+        .into_iter()
+        .filter(|r| matches!(r.state, RunState::Queued | RunState::Running))
+        .map(|r| r.project)
+        .collect();
+    live.sort();
+    live.dedup();
+    for project in live {
+        if let Some(s) = Session::try_projects(&home, std::slice::from_ref(&project))? {
+            store.fail_interrupted_runs(&s)?;
+        }
     }
     Ok(())
 }
@@ -1187,6 +1200,7 @@ pub fn query(store: &Store, q: Query) -> Result<View> {
             runs: store.runs()?,
             attempts: store.attempts(None)?,
             by,
+            speed: speed_line(store)?,
         },
         Query::Inbox { of } => {
             settle_interrupted(store)?;
@@ -1563,6 +1577,7 @@ pub fn act(store: &Store, a: Action) -> Result<Outcome> {
     } = &a
         && *target != publish::Target::Stage
     {
+        publish::settle_interactive(store)?;
         approve_ready(store, ids, *target, drop.as_deref())?;
     }
     let note_text = |t: String| -> Result<String> {
@@ -1617,8 +1632,9 @@ pub fn act(store: &Store, a: Action) -> Result<Outcome> {
             infra,
             seen,
         } => {
-            // Rejecting changes the worktree, so it holds the session.
-            let session = Session::acquire(&store::home()?)?;
+            // Rejecting changes the worktree, so it holds the project.
+            let project = store.run(id)?.project;
+            let session = Session::acquire_projects(&store::home()?, &[project])?;
             store.fail_interrupted_runs(&session)?;
             let mut run = store.run(id)?;
             unmoved(&run, seen.as_deref())?;
@@ -1948,11 +1964,97 @@ pub fn act(store: &Store, a: Action) -> Result<Outcome> {
         } => return Err("a scan is offline or reads dependencies, not both".into()),
         queued => {
             let args = command_line(&queued).expect("every other action is queued");
-            let project = project_of(&queued);
+            let project = project_of(&queued).or(run_project(store, &queued)?);
+            let wait = wait_note(store, &queued, project.as_deref())?;
             let id = jobs::queue(store, &args, &std::env::current_dir()?, project.as_deref())?;
-            Outcome::said(format!("job {id} queued: pma {}", args.join(" ")))
+            Outcome::said(format!("job {id} queued{wait}: pma {}", args.join(" ")))
         }
     })
+}
+
+/// The one project the runs a queued action names are in, when they are in one.
+fn run_project(store: &Store, a: &Action) -> Result<Option<String>> {
+    let ids = match a {
+        Action::Publish { ids, .. } => ids.clone(),
+        Action::ReworkRun { id, .. } | Action::RetryRun { id } => vec![*id],
+        _ => return Ok(None),
+    };
+    let mut projects = Vec::new();
+    for id in ids {
+        projects.push(store.run(id)?.project);
+    }
+    projects.dedup();
+    Ok(match projects.as_slice() {
+        [one] => Some(one.clone()),
+        _ => None,
+    })
+}
+
+/// What a queued job will wait for, so a pause reads as work and not a hang.
+fn wait_note(store: &Store, action: &Action, project: Option<&str>) -> Result<String> {
+    let ahead = store
+        .jobs(50)?
+        .iter()
+        .filter(|j| matches!(j.state.as_str(), "queued" | "running"))
+        .count();
+    let mut notes = Vec::new();
+    if let (Action::Dispatch { .. }, Some(project)) = (action, project)
+        && config(store)?.workspace == crate::config::Workspace::Clone
+        && let Some(row) = store.project(project)?
+        && let Some(held) = dispatch::clone_busy(&store.runs()?, &row.path)
+    {
+        notes.push(format!("waits until run #{held} is published or rejected"));
+    }
+    if ahead > 0 {
+        notes.push(format!("{ahead} ahead of it"));
+    }
+    if let (
+        Action::Dispatch {
+            interactive: false, ..
+        },
+        Some(project),
+    ) = (action, project)
+        && let Some(seconds) = store.last_base_seconds(project)?
+    {
+        notes.push(format!("verifies its base first, last took {seconds} s"));
+    }
+    Ok(match notes.is_empty() {
+        true => String::new(),
+        false => format!(" ({})", notes.join("; ")),
+    })
+}
+
+/// One line of how long each step took, as medians, for `pma report`. Key to
+/// agent is known for a job about one project; a run started from the command
+/// line has no key press.
+pub fn speed_line(store: &Store) -> Result<Option<String>> {
+    let median = |mut v: Vec<i64>| -> Option<i64> {
+        v.sort();
+        v.get(v.len().checked_sub(1)? / 2).copied()
+    };
+    let runs = store.runs()?;
+    let gaps = |from: fn(&Run) -> Option<i64>, to: fn(&Run) -> Option<i64>| {
+        runs.iter()
+            .filter_map(|r| Some(to(r)? - from(r)?))
+            .filter(|s| *s >= 0)
+            .collect::<Vec<_>>()
+    };
+    let steps = [
+        ("key to agent", store.key_to_agent()?),
+        ("ready to decided", gaps(|r| r.ready_at, |r| r.decided_at)),
+        (
+            "decided to pushed",
+            gaps(|r| r.decided_at, |r| r.published_at),
+        ),
+    ];
+    let parts: Vec<String> = steps
+        .into_iter()
+        .filter_map(|(name, v)| {
+            let n = v.len();
+            Some(format!("{name} {} s (n={n})", median(v)?))
+        })
+        .collect();
+    Ok((!parts.is_empty()).then(|| format!("median: {}", parts.join(", "))))
 }
 
 /// The project every name or `name:task` target names, when they name one.

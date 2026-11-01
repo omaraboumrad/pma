@@ -1756,6 +1756,129 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"did it","t
     assert_eq!(herdr.called("pane.close")[0]["pane_id"], "w1:p2");
 }
 
+/// An interactive run starts without a baseline, since a person judges it, and
+/// work they committed in the session needs no stage or commit from pma.
+#[test]
+fn an_interactive_run_skips_the_baseline_and_keeps_its_commit() {
+    const COMMITS: &str = "#!/bin/sh\ngit add -A\ngit commit -qm 'by hand'\nexit 0\n";
+    let s = Scratch::new("interactivefast");
+    let (env, origin, alpha) = dispatch_env(&s, &[("claude", COMMITS)]);
+    // The agent is what edits; the tree has to differ for a commit.
+    fs::write(alpha.join("hello.txt"), "hi\n").unwrap();
+    env.ok(&["config", "workspace", "clone"]);
+    let herdr = FakeHerdr::start("fast");
+    herdr.pma(&env, &["integrate", "herdr"]);
+    let (out, err, success) = herdr.pma(&env, &["dispatch", "alpha:5", "--interactive"]);
+    assert!(success, "{out}{err}");
+    assert!(
+        !env.home.join("state/verify-base").exists()
+            || fs::read_dir(env.home.join("state/verify-base"))
+                .unwrap()
+                .next()
+                .is_none(),
+        "no baseline ran"
+    );
+    let (out, err, success) = herdr.pma(&env, &["push", "1"]);
+    assert!(success, "{out}{err}");
+    assert_eq!(
+        git_out(&origin, &["log", "-1", "--format=%s", "main"]),
+        "by hand\n"
+    );
+}
+
+/// Jobs in different projects run at once, and what is live in one project is
+/// neither blocked by nor failed from the other.
+#[test]
+fn jobs_in_different_projects_run_at_once() {
+    let s = Scratch::new("parallel");
+    let release = s.0.join("release");
+    let waits = format!(
+        "#!/bin/sh\ntouch \"$PWD.started\"\nwhile [ ! -f {} ]; do sleep 0.1; done\nexit 0\n",
+        release.display()
+    );
+    let (env, _, alpha) = dispatch_env(&s, &[("claude", &waits)]);
+    let root = alpha.parent().unwrap();
+    git(root, &["clone", "-q", "../origin.git", "beta"], None);
+    env.ok(&["project", "tier", "1", "beta"]);
+    env.ok(&["scan", "--offline"]);
+    env.ok(&["config", "workspace", "clone"]);
+
+    env.ok(&["dispatch", "alpha:5", "--detach"]);
+    env.ok(&["dispatch", "beta:5", "--detach"]);
+    let started = std::time::Instant::now();
+    let both = || root.join("alpha.started").exists() && root.join("beta.started").exists();
+    while !both() && started.elapsed().as_secs() < 30 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let running_both = both();
+    // Reading the lists while both are live must not mark either failed.
+    env.ok(&["next"]);
+    let listed = env.ok(&["review"]);
+    fs::write(&release, "").unwrap();
+    assert!(running_both, "both agents ran at once");
+    assert!(!listed.contains("interrupted"), "{listed}");
+    let started = std::time::Instant::now();
+    while env.ok(&["job"]).contains("running") && started.elapsed().as_secs() < 30 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let jobs = env.ok(&["job"]);
+    assert_eq!(jobs.matches("done").count(), 2, "{jobs}");
+}
+
+/// A dispatch whose clone is held waits instead of failing, and runs once a
+/// later command frees the clone.
+#[test]
+fn a_dispatch_waits_for_its_clone() {
+    let s = Scratch::new("clonewait");
+    let (env, _, _) = dispatch_env(&s, &[("claude", FAKE_CLAUDE)]);
+    env.ok(&["config", "workspace", "clone"]);
+    env.ok(&["dispatch", "alpha:5"]);
+
+    let out = env.ok(&["dispatch", "alpha:7", "--detach"]);
+    assert!(out.contains("queued"), "{out}");
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let jobs = env.ok(&["job"]);
+    assert!(jobs.contains("queued"), "still waiting: {jobs}");
+
+    env.ok(&["review", "1", "--reject"]);
+    let started = std::time::Instant::now();
+    while !env.ok(&["job"]).contains("done") && started.elapsed().as_secs() < 30 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let jobs = env.ok(&["job"]);
+    assert!(jobs.contains("done"), "{jobs}");
+}
+
+/// With `verify_base_alongside`, the agent does not wait for the base: this
+/// verify waits for a file only the agent writes, so measured first it would
+/// time out and read as failing.
+#[test]
+fn the_base_can_be_measured_beside_the_agent() {
+    let s = Scratch::new("alongside");
+    let mark = s.0.join("agent-ran");
+    let agent = format!(
+        "#!/bin/sh\ntouch {}\necho hi > hello.txt\necho '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"ok\",\"total_cost_usd\":0.1}}'\n",
+        mark.display()
+    );
+    let (env, _, _) = dispatch_env(&s, &[("claude", &agent)]);
+    env.ok(&["config", "workspace", "clone"]);
+    env.ok(&["config", "verify_base_alongside", "on"]);
+    let verify = format!(
+        "i=0; while [ ! -f {m} ] && [ $i -lt 40 ]; do sleep 0.5; i=$((i+1)); done; test -f {m}",
+        m = mark.display()
+    );
+    env.ok(&["config", "projects.alpha.verify", &verify]);
+
+    let started = std::time::Instant::now();
+    env.ok(&["dispatch", "alpha:5"]);
+    assert!(started.elapsed().as_secs() < 18, "the agent did not wait");
+    let detail = env.ok(&["review", "1"]);
+    assert!(detail.contains("base passed"), "{detail}");
+    assert!(!detail.contains("the base was not verified"), "{detail}");
+    // The checkout is no reason to refuse the run's git state.
+    assert!(!detail.contains("git settings"), "{detail}");
+}
+
 /// An interactive run comes to the front, since Claude may ask a question at
 /// once. A later run in the workspace gets a tab of its own.
 #[test]
