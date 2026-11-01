@@ -3182,10 +3182,10 @@ mod tests {
             .iter()
             .map(|i| i.cells[0].text.clone())
             .collect();
-        // `a:12` has the run `t12` split only by a space; `a:2` reaches the
-        // `2` through its `T1`.
-        assert_eq!(shown, ["a:12", "a:2"]);
-        assert!(screen_text(&mut app).contains("2 of 12 /t12"));
+        // `task 12` holds `t12`; no other row has it within one cell, though
+        // `a:2` has the letters in order across `T1` and `task 2`.
+        assert_eq!(shown, ["a:12"]);
+        assert!(screen_text(&mut app).contains("1 of 12 /t12"));
         app.key("Enter");
         assert_eq!(app.mode, Mode::Normal);
         assert_eq!(
@@ -3209,7 +3209,7 @@ mod tests {
         }
         app.key("Enter");
         app.loaded(Ok(tasks_view(12)));
-        assert_eq!(app.panes()[0].items.len(), 2);
+        assert_eq!(app.panes()[0].items.len(), 1);
     }
 
     /// A page is what the last draw had room for.
