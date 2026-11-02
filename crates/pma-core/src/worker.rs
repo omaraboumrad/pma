@@ -196,6 +196,10 @@ pub struct Worker {
     /// arguments a preset adds, and sits where a worker wants them: before a
     /// positional prompt for one that takes its message last.
     pub args: Vec<String>,
+    /// The arguments for a person to drive the agent in a herdr pane, with
+    /// the same placeholders less `{budget}` and `{timeout}`: nothing bounds
+    /// a session a person drives. Empty when the worker has no such form.
+    pub interactive_args: Vec<String>,
     /// A flag and a rule template separated by a space, such as
     /// `--allowedTools Bash({cmd})`. The flag is emitted once, the rule once
     /// per subcommand of the verify command. `None` means the worker has no
@@ -228,6 +232,7 @@ pub fn blank(name: &str) -> Worker {
         name: name.to_string(),
         command: String::new(),
         args: Vec::new(),
+        interactive_args: Vec::new(),
         allow: None,
         parse: Parser::TextTail,
         reports_cost: false,
@@ -250,6 +255,10 @@ pub fn set_field(w: &mut Worker, field: &str, value: String) -> Result<(), Strin
         "args" => {
             w.args = serde_json::from_str(&value)
                 .map_err(|e| format!("args must be a JSON array of strings: {e}"))?;
+        }
+        "interactive-args" => {
+            w.interactive_args = serde_json::from_str(&value)
+                .map_err(|e| format!("interactive-args must be a JSON array of strings: {e}"))?;
         }
         "allow" => w.allow = (!value.is_empty()).then_some(value),
         "parse" => {
@@ -284,9 +293,13 @@ pub fn set_field(w: &mut Worker, field: &str, value: String) -> Result<(), Strin
     Ok(())
 }
 
-pub const FIELDS: [(&str, &str); 9] = [
+pub const FIELDS: [(&str, &str); 10] = [
     ("command", "the program to run"),
     ("args", "a JSON array of arguments"),
+    (
+        "interactive-args",
+        "a JSON array of arguments for a person to drive it, or [] for none",
+    ),
     ("allow", "an allowlist flag and rule, or empty for none"),
     (
         "parse",
@@ -345,11 +358,55 @@ impl Worker {
         extra: &[String],
         timeout: std::time::Duration,
     ) -> Command {
-        let dir_text = dir.to_string_lossy().into_owned();
         let budget = budget.to_string();
         let timeout = format!("{}s", timeout.as_secs());
+        self.command_from(
+            &self.args,
+            prompt,
+            dir,
+            model,
+            Some(&budget),
+            Some(&timeout),
+            extra,
+        )
+    }
+
+    /// The command for a person to drive, from `interactive_args`; `None`
+    /// when the worker has none. No budget or timeout reaches it.
+    pub fn build_interactive(
+        &self,
+        prompt: &str,
+        dir: &std::path::Path,
+        model: Option<&str>,
+        extra: &[String],
+    ) -> Option<Command> {
+        (!self.interactive_args.is_empty()).then(|| {
+            self.command_from(
+                &self.interactive_args,
+                prompt,
+                dir,
+                model,
+                None,
+                None,
+                extra,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn command_from(
+        &self,
+        template: &[String],
+        prompt: &str,
+        dir: &std::path::Path,
+        model: Option<&str>,
+        budget: Option<&str>,
+        timeout: Option<&str>,
+        extra: &[String],
+    ) -> Command {
+        let dir_text = dir.to_string_lossy().into_owned();
         let mut args: Vec<String> = Vec::new();
-        for arg in &self.args {
+        for arg in template {
             // Zero or more arguments in one place, so a preset's effort flag
             // need not be a field this record knows about.
             if arg == "{extra}" {
@@ -359,8 +416,8 @@ impl Worker {
             let values = [
                 ("prompt", Some(prompt)),
                 ("dir", Some(dir_text.as_str())),
-                ("budget", Some(budget.as_str())),
-                ("timeout", Some(timeout.as_str())),
+                ("budget", budget),
+                ("timeout", timeout),
                 ("model", model),
             ];
             match fill(arg, &values) {
@@ -428,6 +485,19 @@ impl Worker {
             .iter()
             .map(|s| (*s).to_string())
             .collect(),
+            // The headless flags less `-p`, the stream and the budget: the
+            // prompt, given positionally, starts the session.
+            interactive_args: [
+                "--permission-mode",
+                "auto",
+                "--model",
+                "{model}",
+                "{extra}",
+                "{prompt}",
+            ]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
             allow: Some("--allowedTools Bash({cmd})".into()),
             parse: Parser::ClaudeJson,
             reports_cost: true,
@@ -462,6 +532,7 @@ impl Worker {
             .collect(),
             // `--auto` approves every permission that is not explicitly
             // denied, so there is no per-command allowlist to emit.
+            interactive_args: Vec::new(),
             allow: None,
             parse: Parser::TextTail,
             reports_cost: false,
@@ -525,6 +596,7 @@ impl Worker {
             .iter()
             .map(|s| (*s).to_string())
             .collect(),
+            interactive_args: Vec::new(),
             allow: None,
             parse: Parser::ClaudeJson,
             reports_cost: true,
@@ -548,6 +620,7 @@ impl Worker {
             .iter()
             .map(|s| (*s).to_string())
             .collect(),
+            interactive_args: Vec::new(),
             allow: None,
             parse: Parser::TextTail,
             reports_cost: false,
@@ -569,6 +642,7 @@ impl Worker {
                 .iter()
                 .map(|s| (*s).to_string())
                 .collect(),
+            interactive_args: Vec::new(),
             allow: None,
             parse: Parser::TextTail,
             reports_cost: false,
@@ -615,6 +689,32 @@ mod tests {
                 "0.5"
             ]
         );
+    }
+
+    /// A person drives it, so no budget or timeout reaches it; a worker with
+    /// no interactive form has none.
+    #[test]
+    fn the_interactive_form_has_the_prompt_and_no_bound() {
+        let cmd = Worker::claude()
+            .build_interactive("do it", Path::new("/w/a"), Some("haiku"), &[])
+            .unwrap();
+        assert_eq!(
+            args_of(&cmd),
+            ["--permission-mode", "auto", "--model", "haiku", "do it"]
+        );
+        let mut w = Worker::omp();
+        assert!(
+            w.build_interactive("do it", Path::new("/w/a"), None, &[])
+                .is_none()
+        );
+        w.interactive_args = ["--cwd", "{dir}", "--cap", "{budget}", "{prompt}"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let cmd = w
+            .build_interactive("do it", Path::new("/w/a"), None, &[])
+            .unwrap();
+        assert_eq!(args_of(&cmd), ["--cwd", "/w/a", "do it"]);
     }
 
     /// Choosing no model must not pass the literal placeholder, nor leave a

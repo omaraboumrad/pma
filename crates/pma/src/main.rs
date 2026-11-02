@@ -967,8 +967,8 @@ enum AgentAction {
     /// Set one field, creating the worker when `command` is set first.
     Set {
         name: String,
-        /// One of: command, args, allow, parse, reports-cost,
-        /// enforces-budget, sandbox, resumes.
+        /// One of: command, args, interactive-args, allow, parse,
+        /// reports-cost, enforces-budget, sandbox, resumes, env.
         field: String,
         /// The value; for `args`, a JSON array such as `["-p","{prompt}"]`.
         value: String,
@@ -4062,6 +4062,9 @@ fn agent_command(action: Option<AgentAction>) -> Result<()> {
                 if w.resumes {
                     flags.push("resumes");
                 }
+                if !w.interactive_args.is_empty() {
+                    flags.push("interactive");
+                }
                 vec![
                     if w.name == cfg.agent {
                         format!("* {}", w.name)
@@ -4085,8 +4088,8 @@ fn agent_command(action: Option<AgentAction>) -> Result<()> {
             println!(
                 "\n* is `pma config agent`. A worker is how to run a program; which model \
                  it runs\n  at is a preset (`pma preset`). Flags are cost reported, budget \
-                 enforced, sandbox,\n  allowlist and resume; `pma agent show <name>` prints \
-                 the rest."
+                 enforced, sandbox,\n  allowlist, resume and interactive; `pma agent show <name>` \
+                 prints the rest."
             );
         }
         return Ok(());
@@ -4099,6 +4102,10 @@ fn agent_command(action: Option<AgentAction>) -> Result<()> {
                 vec![
                     "args".into(),
                     serde_json::to_string(&w.args).unwrap_or_default(),
+                ],
+                vec![
+                    "interactive-args".into(),
+                    serde_json::to_string(&w.interactive_args).unwrap_or_default(),
                 ],
                 vec![
                     "allow".into(),

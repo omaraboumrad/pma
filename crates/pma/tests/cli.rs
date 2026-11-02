@@ -1888,6 +1888,58 @@ fn the_base_can_be_measured_beside_the_agent() {
     assert!(!detail.contains("git settings"), "{detail}");
 }
 
+/// Any worker whose record says how a person drives it runs interactively; one
+/// that does not is refused before a pane opens.
+#[test]
+fn an_interactive_run_takes_the_workers_interactive_args() {
+    const RECORD: &str =
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$(dirname \"$0\")/codex.args\"\nexit 0\n";
+    let s = Scratch::new("interactiveargs");
+    let (env, _, _) = dispatch_env(&s, &[("codex", RECORD)]);
+    env.ok(&["agent", "set", "codex", "command", "codex"]);
+    env.ok(&["agent", "set", "codex", "args", r#"["exec", "{prompt}"]"#]);
+    let herdr = FakeHerdr::start("iargs");
+    herdr.pma(&env, &["integrate", "herdr"]);
+    let (out, err, _) = herdr.pma(
+        &env,
+        &["dispatch", "-a", "codex", "alpha:5", "--interactive"],
+    );
+    assert!(
+        format!("{out}{err}").contains("has no interactive form"),
+        "{out}{err}"
+    );
+    assert!(
+        herdr.called("workspace.create").is_empty(),
+        "no pane opened"
+    );
+
+    env.ok(&[
+        "agent",
+        "set",
+        "codex",
+        "interactive-args",
+        r#"["-C", "{dir}", "--budget", "{budget}", "{prompt}"]"#,
+    ]);
+    assert!(
+        env.ok(&["agent", "show", "codex"])
+            .contains("interactive-args")
+    );
+    let (out, err, success) = herdr.pma(
+        &env,
+        &["dispatch", "-a", "codex", "alpha:7", "--interactive"],
+    );
+    assert!(success, "{out}{err}");
+    let args = fs::read_to_string(env.bin.join("codex.args")).unwrap();
+    let args: Vec<&str> = args.lines().collect();
+    assert_eq!(args[0], "-C", "{args:?}");
+    assert!(!args.contains(&"exec"), "not the headless form: {args:?}");
+    assert!(
+        !args.contains(&"--budget"),
+        "nothing bounds a person: {args:?}"
+    );
+    assert!(args.iter().any(|a| a.contains("second task")), "{args:?}");
+}
+
 /// An interactive run comes to the front, since Claude may ask a question at
 /// once. A later run in the workspace gets a tab of its own.
 #[test]

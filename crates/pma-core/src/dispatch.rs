@@ -1358,6 +1358,14 @@ pub fn verify_command(cfg: &Config, project: &str, worktree: &Path) -> Option<St
 /// container then leaves the container for its own sweep to find.
 pub const INNER_GRACE: Duration = Duration::from_secs(30);
 
+/// Why `worker` cannot run for a person to drive.
+pub fn no_interactive(worker: &Worker) -> String {
+    format!(
+        "agent `{}` has no interactive form: `pma agent set {} interactive-args '[...]'`",
+        worker.name, worker.name
+    )
+}
+
 /// Runs queued runs, at most `max_parallel` at once, starting a run only while
 /// the batch stays within `batch_budget`. `done` sees each run as it finishes.
 /// With `retry`, a run's consumed attempts are reset once its agent starts.
@@ -1665,14 +1673,26 @@ fn attempt_once(
         None => run.prompt.clone(),
     };
     a.verify = run.verify.clone();
-    let mut cmd = worker.build(
-        &a.prompt,
-        &run.worktree,
-        run.model.as_deref(),
-        cfg.agent_budget,
-        &run.extra_args,
-        timeout.saturating_sub(INNER_GRACE),
-    );
+    let built = match run.interactive {
+        true => worker.build_interactive(
+            &a.prompt,
+            &run.worktree,
+            run.model.as_deref(),
+            &run.extra_args,
+        ),
+        false => Some(worker.build(
+            &a.prompt,
+            &run.worktree,
+            run.model.as_deref(),
+            cfg.agent_budget,
+            &run.extra_args,
+            timeout.saturating_sub(INNER_GRACE),
+        )),
+    };
+    let Some(mut cmd) = built else {
+        fail(run, &mut a, no_interactive(worker));
+        return a;
+    };
     worker.allow_verify(&mut cmd, run.verify.as_deref());
     cmd.current_dir(&run.worktree);
     if let Err(e) = agent::restrict(&mut cmd, &agent_env) {

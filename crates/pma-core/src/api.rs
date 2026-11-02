@@ -1772,20 +1772,22 @@ pub fn act(store: &Store, a: Action) -> Result<Outcome> {
         }
         Action::TakeOver { id } => {
             let run = store.run(id)?;
-            if run.agent != "claude" {
-                return Err(format!(
-                    "run #{id} used `{}`; only `claude` can take over",
-                    run.agent
-                )
-                .into());
-            }
+            let worker = store.agent(&run.agent)?;
             let prompt = format!(
                 "An earlier agent worked on this task, and its change is uncommitted in this \
                  directory. Read the diff, then wait for my instructions.\n\nTask: {}",
                 run.text
             );
             let title = format!("#{id} take over");
-            crate::herdr::take_over(&run.project, &title, &run.worktree, &prompt)?;
+            let cmd = worker
+                .build_interactive(
+                    &prompt,
+                    &run.worktree,
+                    run.model.as_deref(),
+                    &run.extra_args,
+                )
+                .ok_or_else(|| dispatch::no_interactive(&worker))?;
+            crate::herdr::take_over(&run.project, &title, &run.worktree, &cmd)?;
             Outcome {
                 said: vec![format!(
                     "An edit made there changes run #{id}: read it again before approving."

@@ -193,6 +193,7 @@ fn worker(name: &str, t: &Table) -> Result<Worker> {
             field,
             "command"
                 | "args"
+                | "interactive_args"
                 | "allow"
                 | "parse"
                 | "reports_cost"
@@ -224,6 +225,10 @@ fn worker(name: &str, t: &Table) -> Result<Worker> {
         args: match t.get("args") {
             None => Vec::new(),
             Some(v) => strings(v, &at("args"))?,
+        },
+        interactive_args: match t.get("interactive_args") {
+            None => Vec::new(),
+            Some(v) => strings(v, &at("interactive_args"))?,
         },
         allow: t
             .get("allow")
@@ -532,6 +537,10 @@ pub fn set_agent(doc: &mut DocumentMut, w: &Worker) {
     let mut t = Table::new();
     t["command"] = Item::Value(w.command.as_str().into());
     t["args"] = Item::Value(Value::Array(array(w.args.iter().cloned())));
+    if !w.interactive_args.is_empty() {
+        t["interactive_args"] =
+            Item::Value(Value::Array(array(w.interactive_args.iter().cloned())));
+    }
     if let Some(allow) = &w.allow {
         t["allow"] = Item::Value(allow.as_str().into());
     }
@@ -638,6 +647,25 @@ mod tests {
             (s.roots, s.tiers, s.tags)
         );
         assert_eq!((back.agents, back.presets), (s.agents, s.presets));
+    }
+
+    /// A worker has the interactive form its record names and no other: a
+    /// `claude` without `interactive_args` has none.
+    #[test]
+    fn a_worker_without_interactive_args_has_none() {
+        let path = scratch("interactive");
+        std::fs::write(
+            &path,
+            "[agents.bare]\ncommand = \"claude\"\nargs = []\nparse = \"text-tail\"\n",
+        )
+        .unwrap();
+        let (_, s) = read(&path).unwrap();
+        assert!(s.agents[0].interactive_args.is_empty());
+        let mut doc: DocumentMut = String::new().parse().unwrap();
+        set_agent(&mut doc, &s.agents[0]);
+        assert!(!doc.to_string().contains("interactive_args"), "{doc}");
+        set_agent(&mut doc, &Worker::claude());
+        assert!(doc.to_string().contains("interactive_args = ["), "{doc}");
     }
 
     /// An edit keeps what the user wrote around it, comments included.

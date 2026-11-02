@@ -24,7 +24,7 @@ use crate::worker::{Parser, Worker};
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
-const VERSION: i64 = 48;
+const VERSION: i64 = 49;
 
 const SCHEMA: &str = "
 CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -464,6 +464,16 @@ const READ_RUNS_DONE: &str = "
 UPDATE runs SET state = 'done'
 WHERE state = 'ready' AND branch = '' AND workflow_instance IS NOT NULL;
 ";
+
+/// Version 49. The arguments for a person to drive a worker in a herdr pane.
+/// A `claude` row gets the form it had when this was compiled in, as
+/// `settings.toml` reads a `claude` that names none.
+const WORKER_INTERACTIVE: &str = r#"
+ALTER TABLE agents ADD COLUMN interactive_args TEXT NOT NULL DEFAULT '[]';
+UPDATE agents
+SET interactive_args = '["--permission-mode","auto","--model","{model}","{extra}","{prompt}"]'
+WHERE command = 'claude';
+"#;
 
 /// Version 47. What herdr last said of the agent in a run's pane.
 const HERDR_AGENT_STATE: &str = "ALTER TABLE runs ADD COLUMN agent_state TEXT;";
@@ -1129,6 +1139,7 @@ impl Store {
                     HERDR_PANES,
                     HERDR_AGENT_STATE,
                     PROJECT_STAMPS,
+                    WORKER_INTERACTIVE,
                 ];
                 let tx = conn.unchecked_transaction()?;
                 for step in &steps[version as usize..] {
@@ -3017,7 +3028,7 @@ impl Store {
     pub fn agents(&self) -> Result<Vec<Worker>> {
         let mut stmt = self.conn.prepare(
             "SELECT name, command, args, allow, parse, reports_cost, enforces_budget,
-                    sandbox, resumes, env
+                    sandbox, resumes, env, interactive_args
              FROM agents ORDER BY name",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -3034,6 +3045,8 @@ impl Store {
                 sandbox: r.get(7)?,
                 resumes: r.get(8)?,
                 env: serde_json::from_str(&r.get::<_, String>(9)?).unwrap_or_default(),
+                interactive_args: serde_json::from_str(&r.get::<_, String>(10)?)
+                    .unwrap_or_default(),
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -3820,8 +3833,8 @@ fn seed_agent(conn: &Connection, w: &Worker) -> Result<()> {
     conn.execute(
         "INSERT OR REPLACE INTO agents
             (name, command, args, allow, parse, reports_cost, enforces_budget, sandbox,
-             resumes, env)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             resumes, env, interactive_args)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             w.name,
             w.command,
@@ -3833,6 +3846,7 @@ fn seed_agent(conn: &Connection, w: &Worker) -> Result<()> {
             w.sandbox,
             w.resumes,
             serde_json::to_string(&w.env).unwrap_or_else(|_| "{}".into()),
+            serde_json::to_string(&w.interactive_args).unwrap_or_else(|_| "[]".into()),
         ],
     )?;
     Ok(())
@@ -4301,7 +4315,8 @@ mod tests {
                 store
                     .conn
                     .execute_batch(
-                        "ALTER TABLE runs DROP COLUMN denied;
+                        "ALTER TABLE agents DROP COLUMN interactive_args;
+                         ALTER TABLE runs DROP COLUMN denied;
                          ALTER TABLE runs DROP COLUMN review_started;
                          ALTER TABLE runs DROP COLUMN review_measured;
                          ALTER TABLE runs DROP COLUMN agent_state;
@@ -4374,6 +4389,7 @@ mod tests {
     /// Undoes versions 40 to 43, for a test that rewinds the schema past
     /// them.
     const BEFORE_SCAN_FAULTS: &str = "
+        ALTER TABLE agents DROP COLUMN interactive_args;
         ALTER TABLE runs DROP COLUMN agent_state;
         ALTER TABLE runs DROP COLUMN denied;
         ALTER TABLE runs DROP COLUMN review_started;

@@ -6,6 +6,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Any agent can run interactively**, not only `claude`: a worker's `interactive_args` say how a person drives it, with the placeholders of `args` less `{budget}` and `{timeout}`, and `I`, `--interactive` and `T` use them. `claude` is seeded with its old form. A worker has only the form its record names: a `claude` in `settings.toml` written before the field existed needs the line added, `pma agent set claude interactive-args '["--permission-mode", "auto", "--model", "{model}", "{extra}", "{prompt}"]'`. A worker without them is refused before a pane opens. `T` also starts the run's own agent, model and preset arguments, where it always started `claude`.
+
 - **Reaching a project, and acting on a set of them**, in the TUI and web. `O` opens a project by name or tag from a fuzzy chooser over every project. `/` filters any table by a fuzzy match over each row's cells, best first, and `*` marks every row it keeps, so the five `audio` projects are `/audio`, `*`, `z`. The projects tab gains a tags column. PageDown and PageUp move by a page. Fuzzy over substring because a few letters of a name are enough; a match is within one cell, since across a row five letters find a path through most rows. `e` on marked projects sets their tier or tag together.
 
 - **`#` scopes the TUI and web to a tag.** Every view shows that tag's projects, scan and sync cover them, and `z` and `f` with no project named run over them, as `--tag` does; `--tag=<t>` is also accepted in their typed lines. The scope shows in the title bar and in the web address. Up to now every view showed every project, and `--tag` had no counterpart in the front ends.

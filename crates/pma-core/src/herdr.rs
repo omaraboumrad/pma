@@ -142,14 +142,23 @@ pub fn focus(pane: &str) -> Result<(), String> {
     call("tab.focus", json!({ "tab_id": tab })).map(|_| ())
 }
 
-/// Opens an interactive `claude` on a run's directory, in front. A person is
-/// at its keyboard, so it has their environment rather than `restrict`'s.
-pub fn take_over(project: &str, title: &str, cwd: &Path, prompt: &str) -> Result<String, String> {
+/// Opens `cmd`, an interactive agent, on a run's directory, in front. A
+/// person is at its keyboard, so it has their environment rather than
+/// `restrict`'s, with what the worker sets.
+pub fn take_over(project: &str, title: &str, cwd: &Path, cmd: &Command) -> Result<String, String> {
     let pane = open(project, title, cwd)?;
-    type_line(
-        &pane,
-        &format!("claude --permission-mode auto {}", quote(prompt)),
-    )?;
+    let mut words: Vec<String> = Vec::new();
+    let set: Vec<String> = cmd
+        .get_envs()
+        .filter_map(|(k, v)| Some(format!("{}={}", k.to_string_lossy(), v?.to_string_lossy())))
+        .collect();
+    if !set.is_empty() {
+        words.push("env".into());
+        words.extend(set.iter().map(|kv| quote(kv)));
+    }
+    words.push(quote(&cmd.get_program().to_string_lossy()));
+    words.extend(cmd.get_args().map(|a| quote(&a.to_string_lossy())));
+    type_line(&pane, &words.join(" "))?;
     focus(&pane)?;
     Ok(pane)
 }
@@ -279,38 +288,6 @@ fn notify(title: &str, body: &str) {
 /// Quotes one word for `sh`.
 fn quote(word: &str) -> String {
     format!("'{}'", word.replace('\'', r"'\''"))
-}
-
-/// `cmd` without what makes `claude` headless, for a person to drive: a
-/// positional prompt stays, and starts the session. `None` for another agent,
-/// whose interactive form `pma` does not know.
-pub fn interactive(cmd: &Command) -> Option<Command> {
-    if cmd.get_program() != "claude" {
-        return None;
-    }
-    let mut out = Command::new("claude");
-    let mut args = cmd.get_args();
-    while let Some(arg) = args.next() {
-        match arg.to_str() {
-            Some("-p" | "--verbose") => {}
-            Some("--output-format" | "--max-budget-usd") => {
-                args.next();
-            }
-            _ => {
-                out.arg(arg);
-            }
-        }
-    }
-    for (key, value) in cmd.get_envs() {
-        match value {
-            Some(v) => out.env(key, v),
-            None => out.env_remove(key),
-        };
-    }
-    if let Some(dir) = cmd.get_current_dir() {
-        out.current_dir(dir);
-    }
-    Some(out)
 }
 
 /// The script a pane runs. `view` renders a headless agent's event stream;
@@ -568,8 +545,6 @@ pub fn host(
             if let Err(e) = focus(&pane) {
                 eprintln!("warning: {e}");
             }
-            let cmd = interactive(&cmd)
-                .ok_or_else(|| std::io::Error::other("only `claude` can run interactively"))?;
             run_in(&pane, &cmd, log, None, false, host.title, on_state)?
         }
         false => run_in(&pane, &cmd, log, Some(timeout), true, host.title, on_state)?,
@@ -583,12 +558,6 @@ pub fn host(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn args(cmd: &Command) -> Vec<String> {
-        cmd.get_args()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect()
-    }
 
     /// As captured from herdr 0.9.5: the closed event's name differs from its
     /// subscription type.
@@ -604,30 +573,6 @@ mod tests {
         assert_eq!(hear(lost, "w1:p2"), Heard::Lost);
         let started = r#"{"id":"pma","result":{"type":"subscription_started"}}"#;
         assert_eq!(hear(started, "w1:p2"), Heard::Nothing);
-    }
-
-    #[test]
-    fn interactive_keeps_the_prompt_and_drops_what_is_headless() {
-        let mut cmd = Command::new("claude");
-        cmd.args([
-            "-p",
-            "do it",
-            "--output-format",
-            "stream-json",
-            "--verbose",
-            "--permission-mode",
-            "auto",
-            "--max-budget-usd",
-            "1",
-        ])
-        .env("GH_CONFIG_DIR", "/g")
-        .env_remove("GH_TOKEN")
-        .current_dir("/w");
-        let out = interactive(&cmd).unwrap();
-        assert_eq!(args(&out), ["do it", "--permission-mode", "auto"]);
-        assert_eq!(out.get_current_dir(), Some(Path::new("/w")));
-        assert_eq!(out.get_envs().count(), 2);
-        assert!(interactive(&Command::new("omp")).is_none());
     }
 
     /// The pane's own environment holds what `restrict` removes, so the script

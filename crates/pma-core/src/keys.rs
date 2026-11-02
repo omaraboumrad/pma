@@ -473,6 +473,7 @@ const PANES: &[Tab] = &[
     Tab::Activity,
     Tab::Matrix,
     Tab::Library,
+    Tab::Settings,
     Tab::Project,
 ];
 const RUNS: &[Tab] = &[Tab::Inbox, Tab::Project];
@@ -981,6 +982,23 @@ mod tests {
                 b.key.chars().count() == 1 || b.key.chars().all(|c| c.is_ascii_alphabetic()),
                 "{}",
                 b.key
+            );
+        }
+    }
+
+    /// Every tab of several lists moves between them.
+    #[test]
+    fn settings_moves_between_its_lists() {
+        for (key, command) in [
+            ("Tab", Command::NextPane),
+            ("l", Command::NextPane),
+            ("BackTab", Command::PrevPane),
+            ("h", Command::PrevPane),
+        ] {
+            assert_eq!(
+                lookup(key, Tab::Settings, &Pick::Nothing).map(|b| b.command),
+                Some(command),
+                "{key}"
             );
         }
     }

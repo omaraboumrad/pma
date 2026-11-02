@@ -1958,6 +1958,7 @@ pub fn screen(view: View) -> Screen {
                                 (w.sandbox, "sandbox"),
                                 (w.allow.is_some(), "allowlist"),
                                 (w.resumes, "resumes"),
+                                (!w.interactive_args.is_empty(), "interactive"),
                             ]
                             .into_iter()
                             .filter_map(|(on, name)| on.then_some(name))
