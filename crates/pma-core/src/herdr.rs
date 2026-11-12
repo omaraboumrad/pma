@@ -22,6 +22,7 @@ use serde_json::{Value, json};
 
 use crate::agent::{self, Finished};
 use crate::config::{Config, Integration};
+use crate::herdr_app as app;
 
 /// How long a request may take; a subscription polls its stop flag this often.
 const REQUEST: Duration = Duration::from_secs(10);
@@ -120,6 +121,9 @@ pub fn open(project: &str, title: &str, cwd: &Path) -> Result<String, String> {
 
 /// Closes a pane, and whatever runs in it. It may be gone already.
 pub fn close(pane: &str) {
+    if app::is_app(pane) {
+        return app::close(pane);
+    }
     let _ = call("pane.close", json!({ "pane_id": pane }));
 }
 
@@ -134,6 +138,9 @@ fn type_line(pane: &str, line: &str) -> Result<(), String> {
 
 /// Brings a pane's tab to the front.
 pub fn focus(pane: &str) -> Result<(), String> {
+    if app::is_app(pane) {
+        return app::focus(pane);
+    }
     let got =
         call("pane.get", json!({ "pane_id": pane })).map_err(|e| format!("pane {pane}: {e}"))?;
     let tab = got["pane"]["tab_id"]
@@ -151,7 +158,17 @@ pub fn wait_closed(pane: &str) {
 /// Opens `cmd`, an interactive agent, on a run's directory, in front. A
 /// person is at its keyboard, so it has their environment rather than
 /// `restrict`'s; only what the worker sets itself is added.
-pub fn take_over(project: &str, title: &str, cwd: &Path, cmd: &Command) -> Result<String, String> {
+pub fn take_over(
+    integration: Integration,
+    project: &str,
+    title: &str,
+    cwd: &Path,
+    cmd: &Command,
+) -> Result<String, String> {
+    if integration == Integration::HerdrApp {
+        let argv = ["sh".into(), "-c".into(), command_line(cmd)];
+        return app::start(project, title, cwd, &argv, app::Show::Front);
+    }
     let pane = open(project, title, cwd)?;
     type_line(&pane, &command_line(cmd))?;
     focus(&pane)?;
@@ -173,6 +190,9 @@ fn command_line(cmd: &Command) -> String {
 
 /// `idle`, not `done`: herdr refuses a reported `done` and infers it itself.
 fn report(pane: &str, agent: &str, state: &str) {
+    if app::is_app(pane) {
+        return;
+    }
     let _ = call(
         "pane.report_agent",
         json!({ "pane_id": pane, "source": "custom:pma", "agent": agent, "state": state }),
@@ -216,6 +236,9 @@ fn hear(line: &str, pane: &str) -> Heard {
 /// each change of state to `on_state`. Per the API, a lost or dropped
 /// subscription is followed by a fresh read rather than a replay.
 fn follow(pane: &str, closed: &AtomicBool, stop: &AtomicBool, on_state: &dyn Fn(&str)) {
+    if app::is_app(pane) {
+        return app::follow(pane, closed, stop, on_state);
+    }
     let mut failures = 0;
     let mut last = String::new();
     while !stop.load(Ordering::Relaxed) {
@@ -450,16 +473,26 @@ pub fn guard_until(owner: u32, status: &Path, pane: &str) {
     }
 }
 
-/// Runs `cmd` in `pane` and waits for it, up to `timeout` when it has one.
+/// Where a run's script starts.
+enum Target<'a> {
+    /// An open herdr pane, whose shell the line is typed into.
+    Pane(String),
+    /// A new Herdr.app tab, which runs the script itself.
+    App { project: &'a str, show: app::Show },
+}
+
+/// Runs `cmd` in `target` and waits for it, up to `timeout` when it has one.
+#[allow(clippy::too_many_arguments)]
 fn run_in(
-    pane: &str,
+    target: Target,
     cmd: &Command,
     log: &Path,
     timeout: Option<Duration>,
     headless: bool,
     title: &str,
+    on_pane: impl FnOnce(&str),
     on_state: impl Fn(&str) + Send + 'static,
-) -> std::io::Result<Finished> {
+) -> std::io::Result<(String, Finished)> {
     let started = Instant::now();
     let (path, status) = pane_files(log);
     let _ = std::fs::remove_file(&status);
@@ -487,6 +520,25 @@ fn run_in(
             .open(&path)?
             .write_all(text.as_bytes())?;
     }
+    let line = format!("sh {}", quote(&path.to_string_lossy()));
+    let (pane, typed) = match target {
+        Target::Pane(pane) => (pane, Some(line)),
+        Target::App { project, show } => {
+            let cwd = cmd
+                .get_current_dir()
+                .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+            let argv = ["sh".into(), path.to_string_lossy().into_owned()];
+            match app::start(project, title, &cwd, &argv, show) {
+                Ok(pane) => (pane, None),
+                Err(e) => {
+                    let _ = std::fs::remove_file(&secret);
+                    return Err(std::io::Error::other(e));
+                }
+            }
+        }
+    };
+    let pane = pane.as_str();
+    on_pane(pane);
     guard(&exe, pane, &status)?;
     // Before the line is typed, so no event of this run is missed.
     let closed = Arc::new(AtomicBool::new(false));
@@ -497,15 +549,17 @@ fn run_in(
         std::thread::spawn(move || {
             follow(&pane, &closed, &stop, &|state| {
                 on_state(state);
-                if state == "blocked" {
+                // Herdr.app alerts on a blocked agent itself.
+                if state == "blocked" && !app::is_app(&pane) {
                     notify("pma: an agent needs you", &title);
                 }
             });
         })
     };
     let agent_name = cmd.get_program().to_string_lossy().into_owned();
-    let line = format!("sh {}", quote(&path.to_string_lossy()));
-    type_line(pane, &line).map_err(std::io::Error::other)?;
+    if let Some(line) = typed {
+        type_line(pane, &line).map_err(std::io::Error::other)?;
+    }
     if headless {
         report(pane, &agent_name, "working");
     }
@@ -534,10 +588,11 @@ fn run_in(
     if headless && success.is_some() {
         report(pane, &agent_name, "idle");
     }
-    Ok(Finished {
+    let finished = Finished {
         success,
         seconds: started.elapsed().as_secs() as i64,
-    })
+    };
+    Ok((pane.to_string(), finished))
 }
 
 /// What a run asks of the terminal it lands in.
@@ -552,9 +607,10 @@ pub struct Host<'a> {
     pub close_after: bool,
 }
 
-/// Runs an agent: in a herdr pane under `pma integrate herdr`, otherwise as a
-/// child. `on_pane` hears which pane. With no server the run goes on as a
-/// child and says so, so unattended work does not stop with the terminal.
+/// Runs an agent: in a herdr pane or Herdr.app tab under `pma integrate`,
+/// otherwise as a child. `on_pane` hears which pane. With neither server the
+/// run goes on as a child and says so, so unattended work does not stop with
+/// the terminal.
 pub fn host(
     cfg: &Config,
     host: Host,
@@ -564,43 +620,65 @@ pub fn host(
     on_pane: impl FnOnce(&str),
     on_state: impl Fn(&str) + Send + 'static,
 ) -> std::io::Result<Finished> {
-    if cfg.integration != Integration::Herdr {
+    let without = |cmd: Command, e: String| {
         if host.interactive {
-            return Err(std::io::Error::other(
-                "an interactive run needs `pma integrate herdr`",
-            ));
-        }
-        return agent::run_limited(cmd, None, log, timeout);
-    }
-    let cwd = cmd
-        .get_current_dir()
-        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
-    let pane = match open(host.project, host.title, &cwd) {
-        Ok(pane) => pane,
-        Err(e) if host.interactive => {
             return Err(std::io::Error::other(format!(
                 "an interactive run needs herdr: {e}"
             )));
         }
-        Err(e) => {
+        if !e.is_empty() {
             eprintln!("warning: {e}; running `{}` without a pane", host.title);
-            return agent::run_limited(cmd, None, log, timeout);
         }
+        agent::run_limited(cmd, None, log, timeout)
     };
-    on_pane(&pane);
-    let finished = match host.interactive {
-        true => {
-            // From the command line the person is waiting on it, so it comes
-            // to the front. A job came from the TUI or web, where the person
-            // may be launching more; `H` brings it forward when they choose.
-            if crate::jobs::current().is_none()
-                && let Err(e) = focus(&pane)
-            {
+    // From the command line the person is waiting on an interactive run, so it
+    // comes to the front. A job came from the TUI or web, where the person may
+    // be launching more; `H` brings it forward when they choose.
+    let front = host.interactive && crate::jobs::current().is_none();
+    let limit = (!host.interactive).then_some(timeout);
+    let headless = !host.interactive;
+    let (pane, finished) = match cfg.integration {
+        Integration::None => {
+            if host.interactive {
+                return Err(std::io::Error::other(
+                    "an interactive run needs `pma integrate herdr` or `herdr-app`",
+                ));
+            }
+            return without(cmd, String::new());
+        }
+        Integration::HerdrApp => {
+            if let Err(e) = app::check() {
+                return without(cmd, e);
+            }
+            let show = match (front, host.interactive) {
+                (true, _) => app::Show::Front,
+                (false, true) => app::Show::Back,
+                (false, false) => app::Show::Anywhere,
+            };
+            let target = Target::App {
+                project: host.project,
+                show,
+            };
+            run_in(
+                target, &cmd, log, limit, headless, host.title, on_pane, on_state,
+            )?
+        }
+        Integration::Herdr => {
+            let cwd = cmd
+                .get_current_dir()
+                .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+            let pane = match open(host.project, host.title, &cwd) {
+                Ok(pane) => pane,
+                Err(e) => return without(cmd, e),
+            };
+            if front && let Err(e) = focus(&pane) {
                 eprintln!("warning: {e}");
             }
-            run_in(&pane, &cmd, log, None, false, host.title, on_state)?
+            let target = Target::Pane(pane);
+            run_in(
+                target, &cmd, log, limit, headless, host.title, on_pane, on_state,
+            )?
         }
-        false => run_in(&pane, &cmd, log, Some(timeout), true, host.title, on_state)?,
     };
     if host.close_after && finished.success == Some(true) {
         close(&pane);

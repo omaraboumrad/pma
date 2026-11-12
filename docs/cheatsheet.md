@@ -49,7 +49,7 @@ pma preset set claude-haiku claude haiku   # cheap option for mechanical work
 | `--detach` | queue and return; follow with `pma job`, `pma watch` |
 | `--push` | push each run whose gates are clean; others wait in review |
 | `--retry` | reset used attempts on a target and dispatch again |
-| `--interactive` | drive the agent yourself in a herdr pane; needs its `interactive_args` |
+| `--interactive` | drive the agent yourself in a herdr pane or Herdr.app tab; needs its `interactive_args` |
 
 Precedence: `-a`/`-m` > `-p` > active route > default preset.
 
@@ -160,12 +160,12 @@ pma workflow run review-fix alpha --local --unattended --detach
 | `/` | filter list | `#` | scope everything to a tag |
 | `Space` | mark | `*` | mark all shown |
 | `d` | dispatch marked or selected | `D` | dispatch, push if clean |
-| `I` | dispatch to drive in herdr; stays behind | `Tab` | next list, e.g. `Failing CI` |
+| `I` | dispatch to drive in herdr or Herdr.app; stays behind | `Tab` | next list, e.g. `Failing CI` |
 | `P` | prompt an agent (project view) | `z` | `pma run` a name |
 | `v` | diff in pager (run) / verify (task) | `e` | tier, tag, verify, sandbox |
 | `t` | record review minutes | `c` | scan |
-| `H` / `T` | herdr pane / take over | `Esc` | back |
-| `E` | project in `$EDITOR`, re-read on exit (TUI only) | `S` | shell in project, herdr pane if integrated; re-read on exit |
+| `H` / `T` | herdr pane or Herdr.app tab / take over | `Esc` | back |
+| `E` | project in `$EDITOR`, re-read on exit (TUI only) | `S` | shell in project, herdr pane or Herdr.app tab if integrated; re-read on exit |
 
 All typing happens on the bottom line, as in vim: `:` a command, `/` the list filter, `>` the text an act asks for.
 

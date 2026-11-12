@@ -1870,7 +1870,8 @@ pub fn act(store: &Store, a: Action) -> Result<Outcome> {
             let cmd = worker
                 .build_interactive(&prompt, &run.worktree, model, &[])
                 .ok_or_else(|| crate::dispatch::no_interactive(&worker.name))?;
-            crate::herdr::take_over(&run.project, &title, &run.worktree, &cmd)?;
+            let integration = config(store)?.integration;
+            crate::herdr::take_over(integration, &run.project, &title, &run.worktree, &cmd)?;
             Outcome {
                 said: vec![format!(
                     "An edit made there changes run #{id}: read it again before approving."
@@ -1878,10 +1879,10 @@ pub fn act(store: &Store, a: Action) -> Result<Outcome> {
                 ..Outcome::default()
             }
         }
-        Action::Shell { project } if config(store)?.integration != Integration::Herdr => {
+        Action::Shell { project } if !config(store)?.integration.panes() => {
             return Err(format!(
                 "a shell for {project} needs a terminal: S in `pma tui`, \
-                 or `pma integrate herdr`"
+                 or `pma integrate herdr` or `herdr-app`"
             )
             .into());
         }
@@ -2300,8 +2301,8 @@ pub fn one_project(names: &[String]) -> Option<String> {
     projects.all(|p| p == first).then(|| first.to_string())
 }
 
-/// A shell in `project`'s clone, for a fix by hand: a herdr pane under `pma
-/// integrate herdr`, else `$SHELL` on this terminal. Waits for it to end, then
+/// A shell in `project`'s clone, for a fix by hand: a herdr pane or Herdr.app
+/// tab under `pma integrate`, else `$SHELL` on this terminal. Waits for it to end, then
 /// re-reads the project, as the 5-second refresh would not see an unstaged edit.
 pub fn shell(project: &str) -> Result<()> {
     let mut store = Store::open_default()?;
@@ -2317,6 +2318,13 @@ pub fn shell(project: &str) -> Result<()> {
                 Ok(())
             })
             .map_err(Into::into),
+        Integration::HerdrApp => {
+            let argv: [String; 0] = [];
+            let show = crate::herdr_app::Show::Front;
+            crate::herdr_app::start(project, "shell", &row.path, &argv, show)
+                .map(|pane| crate::herdr::wait_closed(&pane))
+                .map_err(Into::into)
+        }
         Integration::None => {
             let shell = std::env::var_os("SHELL").unwrap_or_else(|| "sh".into());
             // A shell exits with its last command's status, which says

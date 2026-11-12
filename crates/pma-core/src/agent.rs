@@ -37,6 +37,11 @@ pub fn restrict(cmd: &mut Command, dir: &Path) -> std::io::Result<()> {
         "HERDR_TAB_ID",
         "HERDR_WORKSPACE_ID",
         "HERDR_BIN_PATH",
+        // herdr-core (`hc`): these make a child a sub-agent of this terminal.
+        // `hc` still reaches its default socket without them.
+        "HC_TERMINAL_SOCKET",
+        "HC_TERMINAL_ID",
+        "HC_SCOPE",
         "TMUX",
         "TMUX_PANE",
         "STY",
@@ -664,6 +669,9 @@ mod tests {
             "KITTY_LISTEN_ON",
             "WEZTERM_UNIX_SOCKET",
             "NVIM",
+            "HC_TERMINAL_SOCKET",
+            "HC_TERMINAL_ID",
+            "HC_SCOPE",
         ];
         let script = vars
             .iter()

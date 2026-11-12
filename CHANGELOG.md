@@ -12,6 +12,8 @@ Upgrading from 0.10:
 
 ### Added
 
+- **Herdr.app.** `pma integrate herdr-app` runs each agent in a tab of a `pma: <project>` space in [Herdr.app](https://github.com/herdrdev/herdr-app); [herdr-core](https://github.com/herdrdev/herdr-core) runs the terminals. `H`, `T`, `S` and `--interactive` work as under `herdr`. A new tab opens behind the person's view. With the window closed, a headless run goes to herdr-core unseen and `H` gives it a tab later; an interactive one is refused. The app alerts on a blocked agent itself, so `pma` raises no toast. A setting value over detecting which herdr runs: a job runner keeps the environment it started in, and both can run at once. `pma integrate` names whichever is running. `make herdr-app-check` runs a dispatch against the open window. Design: `docs/dev/herdr-integration.md` section 7.
+
 - **minos rooms.** `pma integrate minos` gives each run a room in a [minos](https://github.com/shakfu/minos) server, where a person reads the agent and corrects it between turns; `pma review` names the room. A setting of its own (`minos.*`) over a third `integration` value, so it combines with herdr: corrections during a run in the room, takeover after it with `T`. Passwords come from `MINOS_PASSWORD` and `MINOS_ADMIN_PASSWORD` alone, so `settings.toml` holds none, and no agent receives either. An unset one is the account name, which is minosd's development fixture, until `minos.dev_passwords` is off; against another server it fails to log in and the run goes without a room. Under herdr the password goes to a 0600 file the pane script reads and deletes, since the script stays on disk.
 
   A worker's new `relay` and `relay_args` say how it runs when `minosb` holds its pipes; `claude` ships with them. A worker without a relay runs beside a broker that serves only the socket, and its prompt tells it to poll `minosa messages`: `minosb` has a `claude` adapter only. A template that names `{room}` or `{socket}` starts its own broker, and `{events}` names the events file. `minos.rooms = task` (default) shares a task's room across its runs; `run` gives each its own. A broker that does not enter its room (no server, a seat already taken, a bad password) ran no agent, so the run is retried without the room rather than failed.
@@ -49,6 +51,8 @@ Upgrading from 0.10:
 - The `:` and `/` lines carry no hint; the web keeps it in the line's accessible name. The TUI's `selected` strip shows its title in the accent colour and its values in plain text, where it muted both.
 
 ### Fixed
+
+- Agents no longer inherit herdr-core's `HC_TERMINAL_SOCKET`, `HC_TERMINAL_ID` and `HC_SCOPE`. Run from a Herdr.app terminal, an agent's `hc run` became a sub-agent of the terminal that ran `pma`, which then received its notes. Removing them does not stop `hc`: it falls back to its default socket, and a dead path does not block it, unlike `HERDR_SOCKET_PATH`.
 
 - `pma dispatch --local` printed `$-0.00 spent` when no run reported a cost, and an empty workflow plan cost `-0.00`: Rust's float `Sum` starts from `-0.0`. Both now sum from `0.0`.
 

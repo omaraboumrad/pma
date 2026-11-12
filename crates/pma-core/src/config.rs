@@ -77,6 +77,8 @@ pub enum Integration {
     None,
     /// A pane of a herdr server.
     Herdr,
+    /// A tab of Herdr.app, run by herdr-core.
+    HerdrApp,
 }
 
 impl Integration {
@@ -84,13 +86,20 @@ impl Integration {
         match self {
             Integration::None => "none",
             Integration::Herdr => "herdr",
+            Integration::HerdrApp => "herdr-app",
         }
+    }
+
+    /// Whether runs open a pane, which a shell can wait on from a job.
+    pub fn panes(self) -> bool {
+        self != Integration::None
     }
 
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "none" => Some(Integration::None),
             "herdr" => Some(Integration::Herdr),
+            "herdr-app" => Some(Integration::HerdrApp),
             _ => None,
         }
     }
@@ -544,7 +553,7 @@ impl Config {
                 *w = Workspace::parse(value).ok_or("expected clone or worktree")?;
             }
             Slot::Integration(i) => {
-                *i = Integration::parse(value).ok_or("expected none or herdr")?;
+                *i = Integration::parse(value).ok_or("expected none, herdr or herdr-app")?;
             }
             Slot::Rooms(r) => {
                 *r = Rooms::parse(value).ok_or("expected task or run")?;

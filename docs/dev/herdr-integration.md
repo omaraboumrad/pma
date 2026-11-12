@@ -1,6 +1,6 @@
 # Integrating with herdr
 
-Design note, 2026-10-29. Whether `pma` should integrate with [herdr](https://github.com/herdrdev/herdr), and how. Checked against herdr 0.9.5 on this machine (protocol 22). Sections 4 and 6 are built; the recommendation below predates them.
+Design note, 2026-10-29. Whether `pma` should integrate with [herdr](https://github.com/herdrdev/herdr), and how. Checked against herdr 0.9.5 on this machine (protocol 22). Sections 4, 6 and 7 are built; the recommendation below predates them.
 
 ## What herdr is
 
@@ -98,6 +98,30 @@ Takeover: open a run's clone or worktree in a new herdr pane with an interactive
 Also available: notices (section 2, which can report `no_foreground_client`, so `osascript` still suits detached jobs) and `workspace report-metadata` tokens (section 3, display-only, lost on a server restart).
 
 minos gives steering during a run and herdr after one, which is the likely reason they exclude each other. Inference: `TODO.md` does not say why.
+
+## 7. Herdr.app over herdr-core (built 2026-11-12)
+
+Checked against herdr-app and herdr-core (`hc`) 0.1.20, protocol generation 1. `pma integrate herdr-app` selects it; `pma integrate` reports whichever server answers but never switches. Detection was rejected as the selector: the job runner keeps the environment it started in, and both servers can run at once.
+
+The split differs from the TUI's. `hc` runs terminals and has no workspaces or tabs. The window owns spaces and tabs, driven by `herdr-app do <command>`. `pma` uses both CLIs and no socket of either.
+
+| TUI | App |
+|-|-|
+| `workspace.create` / `tab.create`, then type a line | `space.new` / `tab.new --argv`, which return `{space, tab, terminal}` |
+| `focus: false` | none: a new tab is shown, so `pma` reselects the tab from `herdr-app status` |
+| `pane.close` | `pane.close` on the pane from `herdr-app ls`, else `hc kill` |
+| `events.subscribe` per pane | `hc events --terminal`: a snapshot, then `finished`, `removed`, `status` |
+| `notification.show` on `blocked` | none; the app alerts itself |
+| `pane.report_agent` | none |
+
+Measured:
+
+- The app runs argv as `zsh -lic '"$@"; exec "$0" -li'`, so a shell stays after the script, as in a TUI pane, and `hc` reports no exit code for it. The status file stays.
+- With the window closed, a headless run goes to `hc run --no-parent --no-notify`. Without `--no-parent`, `hc` types a note about each run into the terminal that ran `pma`. `H` then gives it a tab with `terminal.keep`, which lands in the active space.
+- `terminal.keep` and `pane.focus` take an address (`t1c`), not a name.
+- A pane is stored as `hc:<address>`, so `close` and `focus` pick the backend from the run, not from the current setting.
+
+Untested: the shape of a `status` event, since none fired while captured; `hear` accepts `data.status` or `data.state`. Whether `hc server status` starts a core, so `pma integrate` calls it only under `herdr-app`. `scripts/herdr-app-check.sh` (`make herdr-app-check`) runs a dispatch against the open window.
 
 ## Alternative framing
 

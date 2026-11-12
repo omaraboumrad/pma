@@ -18,6 +18,7 @@ pub mod deps;
 pub mod dispatch;
 pub mod fuzzy;
 pub mod herdr;
+pub mod herdr_app;
 pub mod history;
 pub mod jobs;
 pub mod keys;

@@ -27,6 +27,10 @@ test: ## run every test
 herdr-check: ## run a dispatch through a real herdr server against a fresh fixture
 	@sh scripts/herdr-check.sh
 
+.PHONY: herdr-app-check
+herdr-app-check: ## run a dispatch through Herdr.app and herdr-core against a fresh fixture
+	@sh scripts/herdr-app-check.sh
+
 .PHONY: minos-check
 minos-check: ## run a dispatch through a real minos server, built from MINOS_SRC
 	@sh scripts/minos-check.sh

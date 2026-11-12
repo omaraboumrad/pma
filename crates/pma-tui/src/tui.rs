@@ -2836,8 +2836,7 @@ pub fn run(store: &Store) -> Result<()> {
                 // Without herdr the shell needs this terminal; with it, the
                 // act queues a job that waits on the pane.
                 Some(Request::Act(Action::Shell { project }))
-                    if api::config(store)
-                        .is_ok_and(|c| c.integration != pma_core::config::Integration::Herdr) =>
+                    if api::config(store).is_ok_and(|c| !c.integration.panes()) =>
                 {
                     let ended = (|| -> Result<()> {
                         ratatui::try_restore()?;

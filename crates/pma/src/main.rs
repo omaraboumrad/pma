@@ -340,7 +340,8 @@ enum Command {
         #[arg(long, conflicts_with = "local")]
         push: bool,
         /// Run `claude` for you to drive in a herdr pane, not headless. It
-        /// needs `pma integrate herdr`, and reports no cost or summary.
+        /// needs `pma integrate herdr` or `herdr-app`, and reports no cost or
+        /// summary.
         #[arg(long, conflicts_with = "push")]
         interactive: bool,
         /// One run per task named. Without it, the TODO.md items named in one
@@ -564,9 +565,10 @@ enum Command {
     /// person reads it and corrects it between turns; it combines with
     /// `herdr`. With no server, a run goes on without a pane or room and warns.
     Integrate {
-        /// `herdr`, `minos` or `none`.
+        /// `herdr` (the TUI's server), `herdr-app` (Herdr.app over
+        /// herdr-core), `minos` or `none`.
         name: Option<String>,
-        /// Turn `herdr` or `minos` off.
+        /// Turn `herdr`, `herdr-app` or `minos` off.
         #[arg(long, requires = "name")]
         off: bool,
     },
@@ -620,7 +622,8 @@ enum Command {
     },
     /// A shell in a project's clone, for a fix by hand.
     ///
-    /// In a herdr pane under `pma integrate herdr`, else on this terminal.
+    /// In a herdr pane or Herdr.app tab under `pma integrate`, else on this
+    /// terminal.
     /// When it ends the project is re-read, so an unstaged edit shows at once.
     Shell {
         /// The project's name.
@@ -4275,24 +4278,51 @@ fn run_integrate(name: Option<&str>, off: bool) -> Result<()> {
     match (name, off) {
         (None, _) => {}
         (Some("minos"), off) => set("minos.enabled", if off { "off" } else { "on" })?,
-        (Some("herdr"), true) => set("integration", "none")?,
+        (Some("herdr" | "herdr-app"), true) => set("integration", "none")?,
         (Some("none"), true) => return Err("`none` has nothing to turn off".into()),
         (Some(name), false) if config::Integration::parse(name).is_some() => {
             set("integration", name)?
         }
         (Some(name), _) => {
-            return Err(
-                format!("unknown integration `{name}`; expected herdr, minos or none").into(),
-            );
+            return Err(format!(
+                "unknown integration `{name}`; expected herdr, herdr-app, minos or none"
+            )
+            .into());
         }
     }
     let cfg = api::config(&store)?;
     println!("integration = {}", cfg.integration.name());
-    if cfg.integration == config::Integration::Herdr {
-        match pma_core::herdr::check() {
+    use pma_core::herdr_app::Reach;
+    let tui = pma_core::herdr::check();
+    // Only when chosen: `hc server status` may start a core.
+    let app = match cfg.integration {
+        config::Integration::HerdrApp => pma_core::herdr_app::check(),
+        _ if pma_core::herdr_app::window_open() => Ok(Reach::Window),
+        _ => Err(String::new()),
+    };
+    match cfg.integration {
+        config::Integration::Herdr => match &tui {
             Ok(()) => println!("herdr answers; each run opens a tab in `pma: <project>`"),
             Err(e) => println!("herdr: {e}; runs go on without a pane until it answers"),
-        }
+        },
+        config::Integration::HerdrApp => match &app {
+            Ok(Reach::Window) => {
+                println!("Herdr.app answers; each run opens a tab in space `pma: <project>`")
+            }
+            Ok(Reach::CoreOnly) => println!(
+                "Herdr.app's window is closed; runs go to herdr-core unseen until it opens"
+            ),
+            Err(e) => println!("herdr-app: {e}; runs go on without a pane until it answers"),
+        },
+        config::Integration::None => {}
+    }
+    // A hint, not a switch: a job runner keeps the environment it started in,
+    // so a choice made from it would go stale.
+    if cfg.integration != config::Integration::HerdrApp && app == Ok(Reach::Window) {
+        println!("Herdr.app is running: `pma integrate herdr-app` uses it");
+    }
+    if cfg.integration != config::Integration::Herdr && tui.is_ok() {
+        println!("a herdr server is running: `pma integrate herdr` uses it");
     }
     let m = &cfg.minos;
     println!("minos = {}", if m.enabled { "on" } else { "off" });
