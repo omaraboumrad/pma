@@ -8240,4 +8240,12 @@ fn an_interactive_run_without_herdr_fails_and_says_why() {
         detail.contains("error       claude: an interactive run needs `pma integrate herdr`"),
         "{detail}"
     );
+    // A retry stays interactive, so it fails the same way rather than
+    // running headless.
+    env.ok(&["review", "1", "--retry"]);
+    let detail = env.ok(&["review", "2"]);
+    assert!(
+        detail.contains("error       claude: an interactive run needs `pma integrate herdr`"),
+        "{detail}"
+    );
 }

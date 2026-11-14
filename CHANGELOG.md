@@ -52,6 +52,8 @@ Upgrading from 0.10:
 
 ### Fixed
 
+- `pma review N --retry`, and retry in the TUI and web, now keeps a run interactive. Before, it dispatched the task again as a headless agent, because the retry built its dispatch flags with `interactive` off.
+
 - Agents no longer inherit herdr-core's `HC_TERMINAL_SOCKET`, `HC_TERMINAL_ID` and `HC_SCOPE`. Run from a Herdr.app terminal, an agent's `hc run` became a sub-agent of the terminal that ran `pma`, which then received its notes. Removing them does not stop `hc`: it falls back to its default socket, and a dead path does not block it, unlike `HERDR_SOCKET_PATH`.
 
 - `pma dispatch --local` printed `$-0.00 spent` when no run reported a cost, and an empty workflow plan cost `-0.00`: Rust's float `Sum` starts from `-0.0`. Both now sum from `0.0`.

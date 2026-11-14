@@ -3083,7 +3083,10 @@ fn retry_run(id: i64) -> Result<()> {
         false,
         None,
         true,
-        dispatch_flags(false, run.workspace == config::Workspace::Worktree, false),
+        DispatchFlags {
+            interactive: run.interactive,
+            ..dispatch_flags(false, run.workspace == config::Workspace::Worktree, false)
+        },
         &dispatch::Overrides {
             agent: Some(run.agent),
             model,
