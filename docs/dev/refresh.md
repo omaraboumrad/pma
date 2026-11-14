@@ -7,6 +7,7 @@ Decision, 2026-11-01. After the first scan the store follows the files; `pma sca
 | `TODO.md`, git state | a stamp of 5 files changed: every 5 s with a front end open, and before `next`, `matrix`, `status`, `task` and `dispatch` | 61 ms to stat 443 files, against 3.38 s of `git status` |
 | New repositories | the same check | one directory read per root |
 | CI, absent projects | a full scan every `scan.every` minutes (30; 0 turns it off) while a front end is open | one `pma scan` |
+| CI of a project a CI task is dispatched from | before that dispatch | one project's CI read |
 | Dependencies | `pma scan --deps`, unchanged | seconds per project |
 
 Limits:

@@ -98,6 +98,8 @@ pub struct Facts {
     pub ci: Ci,
     /// Each failing workflow's latest failed run, as `(workflow, url)`.
     pub ci_runs: Vec<(String, String)>,
+    /// The workflows CI read alone; see `Alone`.
+    pub ci_alone: Vec<Alone>,
     /// When the stalest lock last changed; see `lock_changed_at`.
     pub lock_at: Option<i64>,
     /// `None` when this scan did not measure dependencies.
@@ -167,6 +169,7 @@ impl Facts {
             last_activity: None,
             ci: Ci::Unknown("offline".into()),
             ci_runs: Vec::new(),
+            ci_alone: Vec::new(),
             lock_at: None,
             deps: None,
             faults: Vec::new(),
@@ -294,6 +297,7 @@ pub fn scan_all(
     ignore: &[String],
     offline: bool,
     deps: bool,
+    prior: &HashMap<String, Vec<Alone>>,
     finished: &(dyn Fn(&str) + Sync),
 ) -> Vec<Facts> {
     let next = AtomicUsize::new(0);
@@ -306,7 +310,8 @@ pub fn scan_all(
                     let Some((name, path)) = projects.get(i) else {
                         break;
                     };
-                    let facts = scan_project(name, path, ignore, offline, deps);
+                    let prior = prior.get(name).map_or(&[][..], Vec::as_slice);
+                    let facts = scan_project(name, path, ignore, offline, deps, prior);
                     results.lock().unwrap().push((i, facts));
                     finished(name);
                 }
@@ -324,6 +329,7 @@ pub fn scan_project(
     ignore: &[String],
     offline: bool,
     deps: bool,
+    prior: &[Alone],
 ) -> Facts {
     let mut facts = Facts::blank(name, path);
     facts.stamp = stamp(path);
@@ -398,8 +404,10 @@ pub fn scan_project(
     facts.lock_at = lock_changed_at(&git, path, &status);
     if !offline {
         facts.ci_read = true;
-        match ci_state(path) {
-            Ok((ci, runs)) => (facts.ci, facts.ci_runs) = (ci, runs),
+        match ci_state(path, prior, crate::dates::now()) {
+            Ok(read) => {
+                (facts.ci, facts.ci_runs, facts.ci_alone) = (read.ci, read.runs, read.alone)
+            }
             Err(why) => {
                 facts.faults.push((Fault::CiUnknown, why.clone()));
                 facts.ci = Ci::Unknown(why);
@@ -911,18 +919,66 @@ pub fn default_branch(dir: &Path) -> Option<String> {
     Some(full.trim().trim_start_matches("origin/").to_string())
 }
 
-/// Judged over the workflows that still exist and are enabled. `gh run list`
-/// keeps a deleted workflow's runs, whose last failure would otherwise read as
-/// failing CI until newer runs pushed it out of the window.
-/// The CI state, and each failing workflow's latest failed run. `Err` with
-/// why when a GitHub project's CI could not be read; no origin, or one off
-/// GitHub, is `Ci::Unknown` and no error.
-fn ci_state(dir: &Path) -> Result<(Ci, Vec<(String, String)>), String> {
+/// How many of a branch's newest runs one call reads; a workflow without a
+/// decisive run among them is asked about alone.
+const WINDOW: usize = 100;
+
+/// How long a workflow read alone is reused, while no run of it can have
+/// started since. It bounds a re-run of an old run, which starts no new one.
+pub const ALONE_FOR: i64 = 86_400;
+
+/// A workflow read alone, kept between scans: `ci_state` reuses it while the
+/// window still reaches back to `through`, since any newer run of it would be
+/// in the window. Design: docs/dev/gh-optimize.md.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Alone {
+    pub workflow: u64,
+    /// The newest run on the branch when it was read, by GitHub's clock.
+    pub through: String,
+    /// Unix time of the read.
+    pub read_at: i64,
+    /// Its latest decisive run, whether it failed and its URL; `None` without one.
+    pub verdict: Option<(bool, String)>,
+}
+
+impl Alone {
+    /// Whether this read of `workflow` still holds: younger than `ALONE_FOR`,
+    /// and the window, whose oldest run started at `oldest`, reaches back to it.
+    fn reusable(&self, workflow: u64, oldest: &str, now: i64) -> bool {
+        self.workflow == workflow
+            && now - self.read_at < ALONE_FOR
+            && oldest <= self.through.as_str()
+    }
+}
+
+/// What one read of a project's CI found.
+#[derive(Debug)]
+pub struct CiRead {
+    pub ci: Ci,
+    /// Each failing workflow's latest failed run, as `(workflow, url)`.
+    pub runs: Vec<(String, String)>,
+    /// The workflows read alone, or reused from `prior`, for the next read.
+    pub alone: Vec<Alone>,
+}
+
+/// The CI state, and each failing workflow's latest failed run, judged over
+/// the workflows that still exist and are enabled: `gh run list` keeps a
+/// deleted workflow's runs. Runs are matched to workflows by id, since two
+/// workflow files may share a name. `prior` is the last read's `alone`.
+/// `Err` with why when a GitHub project's CI could not be read; no origin, or
+/// one off GitHub, is `Ci::Unknown` and no error.
+pub fn ci_state(dir: &Path, prior: &[Alone], now: i64) -> Result<CiRead, String> {
+    let only = |ci: Ci| CiRead {
+        ci,
+        runs: Vec::new(),
+        alone: Vec::new(),
+    };
+    let unknown = |why: &str| only(Ci::Unknown(why.into()));
     let Some(url) = git(dir, &["remote", "get-url", "origin"]) else {
-        return Ok((Ci::Unknown("no origin remote".into()), Vec::new()));
+        return Ok(unknown("no origin remote"));
     };
     let Some(slug) = github_slug(url.trim()) else {
-        return Ok((Ci::Unknown("origin is not on GitHub".into()), Vec::new()));
+        return Ok(unknown("origin is not on GitHub"));
     };
     let branch = default_branch(dir).ok_or(DEFAULT_BRANCH_UNKNOWN)?;
     let gh = |args: &[&str]| {
@@ -935,47 +991,114 @@ fn ci_state(dir: &Path) -> Result<(Ci, Vec<(String, String)>), String> {
         args.extend_from_slice(extra);
         args.extend([
             "--json",
-            "workflowName,status,conclusion,url",
+            "workflowDatabaseId,status,conclusion,url,createdAt",
             "--jq",
-            ".[] | [.workflowName, .status, .conclusion, .url] | @tsv",
+            ".[] | [.workflowDatabaseId, .status, .conclusion, .url, .createdAt] | @tsv",
         ]);
-        gh(&args).map(|tsv| (latest_verdicts(&tsv), decisive_urls(&tsv)))
+        gh(&args).map(|tsv| run_rows(&tsv))
     };
-    (|| {
-        let listed = gh(&[
-            "workflow",
-            "list",
-            "-R",
-            &slug,
-            "--limit",
-            "200",
-            "--json",
-            "id,name,state",
-        ])?;
-        let active = active_workflows(&listed)?;
-        let (mut verdicts, mut urls) = runs(&["--limit", "100"])?;
-        // A workflow that runs rarely can fall outside that window, so it is
-        // asked about alone rather than read as having no runs.
-        for (id, name) in &active {
-            if !verdicts.contains_key(name) {
-                let id = id.to_string();
-                let (alone, alone_urls) = runs(&["--workflow", &id, "--limit", "20"])?;
-                if let Some(&failed) = alone.get(name) {
-                    verdicts.insert(name.clone(), failed);
-                }
-                urls.extend(alone_urls);
+    let listed = gh(&[
+        "workflow",
+        "list",
+        "-R",
+        &slug,
+        "--limit",
+        "200",
+        "--json",
+        "id,name,state",
+    ])?;
+    let active = active_workflows(&listed)?;
+    // No workflow, so no run to ask about.
+    if active.is_empty() {
+        return Ok(only(Ci::NoRuns));
+    }
+    let limit = WINDOW.to_string();
+    let window = runs(&["--limit", &limit])?;
+    let mut verdicts = latest_decisive(&window);
+    let missing: Vec<u64> = active
+        .iter()
+        .map(|(id, _)| *id)
+        .filter(|id| !verdicts.contains_key(id))
+        .collect();
+    // A window short of full holds every run on the branch: a workflow
+    // missing from it has no decisive run there.
+    let mut alone = Vec::new();
+    if window.len() >= WINDOW {
+        let oldest = window.last().map_or("", |r| r.created.as_str());
+        let newest = window.first().map_or("", |r| r.created.as_str());
+        let (kept, ask): (Vec<u64>, Vec<u64>) = missing
+            .into_iter()
+            .partition(|id| prior.iter().any(|a| a.reusable(*id, oldest, now)));
+        alone.extend(prior.iter().filter(|a| kept.contains(&a.workflow)).cloned());
+        // Each in its own thread: a project can have ten of them.
+        let asked: Vec<Result<Alone, String>> = std::thread::scope(|s| {
+            let handles: Vec<_> = ask
+                .iter()
+                .map(|id| {
+                    let runs = &runs;
+                    s.spawn(move || {
+                        let rows = runs(&["--workflow", &id.to_string(), "--limit", "20"])?;
+                        Ok(Alone {
+                            workflow: *id,
+                            through: newest.to_string(),
+                            read_at: now,
+                            verdict: latest_decisive(&rows).remove(id),
+                        })
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join()
+                        .unwrap_or_else(|_| Err("gh run list panicked".into()))
+                })
+                .collect()
+        });
+        for a in asked {
+            alone.push(a?);
+        }
+        for a in &alone {
+            if let Some(v) = &a.verdict {
+                verdicts.insert(a.workflow, v.clone());
             }
         }
-        let ci = ci_of(&active, &verdicts);
-        let failed_runs = match &ci {
-            Ci::Failing(names) => names
-                .iter()
-                .filter_map(|n| urls.get(n).map(|u| (n.clone(), u.clone())))
-                .collect(),
-            _ => Vec::new(),
-        };
-        Ok((ci, failed_runs))
-    })()
+    }
+    Ok(CiRead {
+        ci: ci_of(&active, &verdicts),
+        runs: failed_runs(&active, &verdicts),
+        alone,
+    })
+}
+
+/// One row of `gh run list`.
+#[derive(Debug)]
+struct RunRow {
+    workflow: u64,
+    status: String,
+    conclusion: String,
+    url: String,
+    created: String,
+}
+
+/// Reads `gh run list` rows, newest first, as `workflow id \t status \t
+/// conclusion \t url \t createdAt`.
+fn run_rows(tsv: &str) -> Vec<RunRow> {
+    tsv.lines()
+        .filter_map(|line| {
+            let f: Vec<&str> = line.split('\t').collect();
+            let [id, status, conclusion, url, created] = f[..] else {
+                return None;
+            };
+            Some(RunRow {
+                workflow: id.parse().ok()?,
+                status: status.into(),
+                conclusion: conclusion.into(),
+                url: url.into(),
+                created: created.into(),
+            })
+        })
+        .collect()
 }
 
 /// Enabled workflows as `(id, name)`, from `gh workflow list --json id,name,state`.
@@ -1020,61 +1143,23 @@ fn failed(status: &str, conclusion: &str) -> Option<bool> {
     }
 }
 
-/// The id of a workflow's latest decisive run when that run failed, from
-/// `gh run list --json databaseId,status,conclusion`, newest first. `None`
-/// when the workflow now passes or has no decisive run.
-pub fn latest_failed_run(json: &str) -> Result<Option<u64>, String> {
-    let value: serde_json::Value =
-        serde_json::from_str(json).map_err(|e| format!("gh run list: {e}"))?;
-    let runs = value.as_array().ok_or("gh run list: expected an array")?;
-    Ok(runs
-        .iter()
-        .find_map(|r| {
-            failed(r["status"].as_str()?, r["conclusion"].as_str()?)
-                .map(|f| f.then(|| r["databaseId"].as_u64()).flatten())
-        })
-        .flatten())
-}
-
-/// Reads `gh run list` rows, newest first, as `workflow \t status \t conclusion`.
-/// Each workflow is judged by its latest run that succeeded or failed; the value
-/// is whether that run failed.
-fn latest_verdicts(tsv: &str) -> HashMap<String, bool> {
-    let mut verdicts = HashMap::new();
-    for line in tsv.lines() {
-        let mut f = line.split('\t');
-        let (Some(name), Some(status), Some(conclusion)) = (f.next(), f.next(), f.next()) else {
-            continue;
-        };
-        if let Some(failed) = failed(status, conclusion) {
-            verdicts.entry(name.to_string()).or_insert(failed);
+/// Each workflow's latest decisive run: whether it failed, and its URL.
+fn latest_decisive(rows: &[RunRow]) -> HashMap<u64, (bool, String)> {
+    let mut latest = HashMap::new();
+    for r in rows {
+        if let Some(failed) = failed(&r.status, &r.conclusion) {
+            latest.entry(r.workflow).or_insert((failed, r.url.clone()));
         }
     }
-    verdicts
-}
-
-/// The URL of each workflow's latest decisive run, from the rows
-/// `latest_verdicts` reads, with the URL as a fourth column.
-fn decisive_urls(tsv: &str) -> HashMap<String, String> {
-    let mut urls = HashMap::new();
-    for line in tsv.lines() {
-        let f: Vec<&str> = line.split('\t').collect();
-        if let [name, status, conclusion, url] = f[..]
-            && failed(status, conclusion).is_some()
-        {
-            urls.entry(name.to_string())
-                .or_insert_with(|| url.to_string());
-        }
-    }
-    urls
+    latest
 }
 
 /// The project's CI state over its active workflows. A verdict for a workflow
 /// that is not active is ignored.
-fn ci_of(active: &[(u64, String)], verdicts: &HashMap<String, bool>) -> Ci {
+fn ci_of(active: &[(u64, String)], verdicts: &HashMap<u64, (bool, String)>) -> Ci {
     let judged: Vec<(&String, bool)> = active
         .iter()
-        .filter_map(|(_, name)| verdicts.get(name).map(|f| (name, *f)))
+        .filter_map(|(id, name)| verdicts.get(id).map(|(f, _)| (name, *f)))
         .collect();
     let mut failing: Vec<String> = judged
         .iter()
@@ -1088,6 +1173,34 @@ fn ci_of(active: &[(u64, String)], verdicts: &HashMap<String, bool>) -> Ci {
         (true, false) => Ci::Passing,
         (true, true) => Ci::NoRuns,
     }
+}
+
+/// Each failing workflow's latest failed run, by name. Of two failing
+/// workflows that share a name, the newer run is kept.
+fn failed_runs(
+    active: &[(u64, String)],
+    verdicts: &HashMap<u64, (bool, String)>,
+) -> Vec<(String, String)> {
+    let mut runs: HashMap<&String, &String> = HashMap::new();
+    for (id, name) in active {
+        if let Some((true, url)) = verdicts.get(id) {
+            let kept = runs.entry(name).or_insert(url);
+            if run_id(url) > run_id(kept) {
+                *kept = url;
+            }
+        }
+    }
+    let mut runs: Vec<(String, String)> = runs
+        .into_iter()
+        .map(|(n, u)| (n.clone(), u.clone()))
+        .collect();
+    runs.sort();
+    runs
+}
+
+/// The run id that ends a run's URL.
+pub fn run_id(url: &str) -> Option<u64> {
+    url.rsplit('/').next()?.parse().ok()
 }
 
 /// The repository's page on GitHub, for a slug of the characters GitHub
@@ -1262,7 +1375,7 @@ mod tests {
                 .success();
             assert!(ok, "git {args:?}");
         };
-        let scan = || scan_project("p", &dir, &[], true, false);
+        let scan = || scan_project("p", &dir, &[], true, false, &[]);
         sh(&["init", "-q", "-b", "main"]);
         std::fs::write(dir.join("TODO.md"), "# TODO\n\n## High\n\n- [ ] x\n").unwrap();
         std::fs::write(dir.join("uv.lock"), "").unwrap();
@@ -1289,7 +1402,7 @@ mod tests {
         assert_eq!((tracked.faults.len(), tracked.ahead), (0, Some(1)));
         assert!(tracked.lock_at.is_some(), "read on HEAD and its upstream");
         // Online, an origin off GitHub has no CI to read; nothing is lost.
-        let online = scan_project("p", &dir, &[], false, false);
+        let online = scan_project("p", &dir, &[], false, false, &[]);
         assert_eq!(online.faults, []);
         assert!(online.ci_read && matches!(online.ci, Ci::Unknown(_)));
 
@@ -1428,43 +1541,89 @@ mod tests {
                 .map(|(i, n)| (i as u64, n.to_string()))
                 .collect()
         };
-        let tsv = "test\tin_progress\t\n\
-                   test\tcompleted\tcancelled\n\
-                   test\tcompleted\tfailure\n\
-                   wheels\tcompleted\tsuccess\n\
-                   wheels\tcompleted\tfailure\n\
-                   test\tcompleted\tsuccess\n";
-        let verdicts = latest_verdicts(tsv);
+        let tsv = "0\tin_progress\t\tu/9\tT\n\
+                   0\tcompleted\tcancelled\tu/8\tT\n\
+                   0\tcompleted\tfailure\tu/7\tT\n\
+                   1\tcompleted\tsuccess\tu/6\tT\n\
+                   1\tcompleted\tfailure\tu/5\tT\n\
+                   0\tcompleted\tsuccess\tu/4\tT\n";
+        let verdicts = latest_decisive(&run_rows(tsv));
         assert_eq!(
             ci_of(&active(&["test", "wheels"]), &verdicts),
             Ci::Failing(vec!["test".into()])
         );
         assert_eq!(
+            failed_runs(&active(&["test", "wheels"]), &verdicts),
+            [("test".to_string(), "u/7".to_string())]
+        );
+        assert_eq!(
             ci_of(
                 &active(&["a", "b"]),
-                &latest_verdicts("a\tcompleted\tsuccess\nb\tcompleted\tskipped\n")
+                &latest_decisive(&run_rows(
+                    "0\tcompleted\tsuccess\tu/2\tT\n1\tcompleted\tskipped\tu/1\tT\n"
+                ))
             ),
             Ci::Passing
         );
         assert_eq!(
             ci_of(
                 &active(&["a"]),
-                &latest_verdicts("a\tcompleted\tcancelled\n")
+                &latest_decisive(&run_rows("0\tcompleted\tcancelled\tu/1\tT\n"))
             ),
             Ci::NoRuns
         );
-        assert_eq!(ci_of(&active(&["a"]), &latest_verdicts("")), Ci::NoRuns);
+        assert_eq!(
+            ci_of(&active(&["a"]), &latest_decisive(&run_rows(""))),
+            Ci::NoRuns
+        );
     }
 
+    /// Runs are matched by workflow id: a second workflow file named `audit`
+    /// does not decide the first one's state, and of two failing ones the
+    /// newer run is linked.
     #[test]
-    fn each_workflow_links_to_its_latest_decisive_run() {
-        let tsv = "test\tin_progress\t\thttps://x/3\n\
-                   test\tcompleted\tfailure\thttps://x/2\n\
-                   test\tcompleted\tsuccess\thttps://x/1\n\
-                   lint\tcompleted\tsuccess\n";
-        let urls = decisive_urls(tsv);
-        assert_eq!(urls.get("test").map(String::as_str), Some("https://x/2"));
-        assert_eq!(urls.get("lint"), None, "a row without a URL gives none");
+    fn workflows_that_share_a_name_are_judged_apart() {
+        let active = vec![(1, "audit".to_string()), (2, "audit".to_string())];
+        let passing = latest_decisive(&run_rows(
+            "1\tcompleted\tsuccess\tu/10\tT\n2\tcompleted\tsuccess\tu/9\tT\n",
+        ));
+        assert_eq!(ci_of(&active, &passing), Ci::Passing);
+        let both = latest_decisive(&run_rows(
+            "2\tcompleted\tfailure\tu/12\tT\n1\tcompleted\tfailure\tu/11\tT\n",
+        ));
+        assert_eq!(ci_of(&active, &both), Ci::Failing(vec!["audit".into()]));
+        assert_eq!(
+            failed_runs(&active, &both),
+            [("audit".to_string(), "u/12".to_string())]
+        );
+        assert_eq!(run_id("https://github.com/o/r/actions/runs/42"), Some(42));
+        assert_eq!(run_id("https://github.com/o/r"), None);
+    }
+
+    /// A workflow read alone is reused while the window reaches back to that
+    /// read and it is younger than a day.
+    #[test]
+    fn a_workflow_read_alone_is_reused_while_no_run_can_be_missed() {
+        let a = Alone {
+            workflow: 7,
+            through: "2026-11-10T00:00:00Z".into(),
+            read_at: 1_000,
+            verdict: None,
+        };
+        assert!(a.reusable(7, "2026-11-01T00:00:00Z", 1_000));
+        assert!(a.reusable(7, "2026-11-10T00:00:00Z", 1_000), "the same run");
+        assert!(
+            !a.reusable(8, "2026-11-01T00:00:00Z", 1_000),
+            "another workflow"
+        );
+        assert!(
+            !a.reusable(7, "2026-11-10T00:00:01Z", 1_000),
+            "a run of it may have started since"
+        );
+        assert!(
+            !a.reusable(7, "2026-11-01T00:00:00Z", 1_000 + ALONE_FOR),
+            "expired"
+        );
     }
 
     /// A deleted or disabled workflow keeps its runs in `gh run list`; its last
@@ -1475,40 +1634,12 @@ mod tests {
                          {"id": 2, "name": "nightly", "state": "disabled_manually"}]"#;
         let active = active_workflows(listed).unwrap();
         assert_eq!(active, [(1, "test".to_string())]);
-        let verdicts = latest_verdicts(
-            "old\tcompleted\tfailure\nnightly\tcompleted\tfailure\ntest\tcompleted\tsuccess\n",
-        );
+        let verdicts = latest_decisive(&run_rows(
+            "3\tcompleted\tfailure\tu/3\tT\n2\tcompleted\tfailure\tu/2\tT\n1\tcompleted\tsuccess\tu/1\tT\n",
+        ));
         assert_eq!(ci_of(&active, &verdicts), Ci::Passing);
         assert!(active_workflows("{}").is_err());
         assert_eq!(active_workflows("").unwrap(), [], "no workflows");
-    }
-
-    #[test]
-    fn a_workflow_failed_when_its_latest_decisive_run_failed() {
-        let json = |rows: &str| format!("[{rows}]");
-        let run = |id: u64, status: &str, conclusion: &str| {
-            format!(r#"{{"databaseId":{id},"status":"{status}","conclusion":"{conclusion}"}}"#)
-        };
-        let failing = json(
-            &[
-                run(9, "in_progress", ""),
-                run(8, "completed", "cancelled"),
-                run(7, "completed", "timed_out"),
-                run(6, "completed", "success"),
-            ]
-            .join(","),
-        );
-        assert_eq!(latest_failed_run(&failing), Ok(Some(7)));
-        let fixed = json(
-            &[
-                run(5, "completed", "success"),
-                run(4, "completed", "failure"),
-            ]
-            .join(","),
-        );
-        assert_eq!(latest_failed_run(&fixed), Ok(None), "fixed since");
-        assert_eq!(latest_failed_run("[]"), Ok(None));
-        assert!(latest_failed_run("{}").is_err());
     }
 
     /// A hung `git` or `gh` would hold the whole scan. It is killed at the

@@ -33,7 +33,11 @@ pub fn read(
             Err(e) => held.push(Facts::held(&name, &path, e.to_string())),
         }
     }
-    let mut facts = scan::scan_all(&free, &cfg.activity_ignore, offline, deps, finished);
+    let prior = match offline {
+        true => Default::default(),
+        false => store.ci_alone()?,
+    };
+    let mut facts = scan::scan_all(&free, &cfg.activity_ignore, offline, deps, &prior, finished);
     facts.extend(held);
     Ok(facts)
 }
@@ -48,7 +52,14 @@ fn offline(store: &Store, projects: &[(String, PathBuf)]) -> Result<Vec<Facts>> 
         .filter(|(_, path)| dispatch::clone_held(&runs, path).is_ok())
         .cloned()
         .collect();
-    let mut facts = scan::scan_all(&free, &cfg.activity_ignore, true, false, &|_| {});
+    let mut facts = scan::scan_all(
+        &free,
+        &cfg.activity_ignore,
+        true,
+        false,
+        &Default::default(),
+        &|_| {},
+    );
     for f in &mut facts {
         if let Some(row) = store.project(&f.name)? {
             (f.ci, f.ci_runs) = (row.ci, row.ci_runs);
@@ -65,6 +76,29 @@ pub fn rescan(store: &mut Store, projects: &[(String, PathBuf)]) -> Result<()> {
     let facts = offline(store, projects)?;
     store.save_scan(&facts, false, dates::now())?;
     Ok(())
+}
+
+/// Rereads `projects` with their CI, before a CI task is dispatched, so the
+/// task and every front end's row match CI now. A project whose CI cannot be
+/// read keeps the last one; the warning says why.
+pub fn ci(store: &mut Store, projects: &[(String, PathBuf)]) -> Result<Vec<String>> {
+    let mut facts = offline(store, projects)?;
+    let prior = store.ci_alone()?;
+    let mut warnings = Vec::new();
+    for f in &mut facts {
+        let kept = prior.get(&f.name).map_or(&[][..], Vec::as_slice);
+        match scan::ci_state(&f.path, kept, dates::now()) {
+            Ok(read) => {
+                (f.ci, f.ci_runs, f.ci_alone, f.ci_read) = (read.ci, read.runs, read.alone, true);
+            }
+            Err(why) => warnings.push(format!(
+                "{}: CI not read, using the last scan's: {why}",
+                f.name
+            )),
+        }
+    }
+    store.save_quiet_scan(&facts, false, dates::now())?;
+    Ok(warnings)
 }
 
 /// Rereads `projects` as the timer does, leaving no row in `pma history`: after
@@ -174,7 +208,7 @@ mod tests {
 
         let mut store = Store::open(&dir.join("p.db")).unwrap();
         let projects = vec![("p".to_string(), repo.clone())];
-        let facts = scan::scan_all(&projects, &[], true, false, &|_| {});
+        let facts = scan::scan_all(&projects, &[], true, false, &Default::default(), &|_| {});
         store.save_scan(&facts, true, dates::now()).unwrap();
         let dirty = |s: &Store| s.project("p").unwrap().unwrap().dirty;
         assert_eq!(dirty(&store), 0);

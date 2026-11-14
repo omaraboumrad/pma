@@ -2202,7 +2202,7 @@ pub fn run_dispatch(
     over: &dispatch::Overrides,
     prompt: Option<&str>,
 ) -> Result<()> {
-    let store = Store::open_default()?;
+    let mut store = Store::open_default()?;
     let home = store::state_home()?;
     if let Some(name) = &over.agent {
         let known = store.agents()?;
@@ -2231,6 +2231,11 @@ pub fn run_dispatch(
     };
     store.fail_interrupted_runs(&session)?;
     say(api::act(&store, Action::SettlePrs)?);
+    // A prompt is no CI task.
+    let ci_read = match prompt {
+        Some(_) => Vec::new(),
+        None => refresh_ci(&mut store, targets, auto)?,
+    };
     let active = store.runs()?;
     let rows = store.projects()?;
     let p = api::portfolio(
@@ -2411,9 +2416,12 @@ pub fn run_dispatch(
                     match (found, which.as_str()) {
                         (Some(r), _) => vec![r],
                         (None, "ci") => {
-                            return Err(
-                                format!("{project}: CI was not failing at the last scan").into()
-                            );
+                            let why = match (&row.ci, ci_read.iter().any(|p| p == project)) {
+                                (scan::Ci::Unknown(why), true) => format!("CI is unknown: {why}"),
+                                (_, true) => "CI no longer fails".into(),
+                                (_, false) => "CI was not failing at the last scan".into(),
+                            };
+                            return Err(format!("{project}: {why}").into());
                         }
                         (None, _) => {
                             return Err(format!(
@@ -2809,6 +2817,40 @@ fn clone_outcome(run: &store::Run) -> String {
             run.repo.display()
         ),
     }
+}
+
+/// Reads CI again for each project a CI task may come from: one named whole
+/// or by `:ci`, or with `auto`, any failing at the last scan. Returns the
+/// projects read, so a CI task gone since reads as fixed.
+fn refresh_ci(store: &mut Store, targets: &[String], auto: bool) -> Result<Vec<String>> {
+    let named: Vec<(&str, dispatch::Target)> = targets
+        .iter()
+        .filter_map(|t| dispatch::target(t).ok())
+        .collect();
+    let due: Vec<(String, std::path::PathBuf)> = store
+        .projects()?
+        .into_iter()
+        .filter(|r| r.absent_since.is_none())
+        .filter(|r| {
+            let failing = matches!(r.ci, scan::Ci::Failing(_));
+            named.iter().any(|(p, what)| {
+                *p == r.name
+                    && match what {
+                        dispatch::Target::Signal(s) => s == "ci",
+                        dispatch::Target::Project => failing,
+                        _ => false,
+                    }
+            }) || (auto && failing && (named.is_empty() || named.iter().any(|(p, _)| *p == r.name)))
+        })
+        .map(|r| (r.name, r.path))
+        .collect();
+    if due.is_empty() {
+        return Ok(Vec::new());
+    }
+    for warning in pma_core::refresh::ci(store, &due)? {
+        eprintln!("warning: {warning}");
+    }
+    Ok(due.into_iter().map(|(name, _)| name).collect())
 }
 
 /// Prepares up to `wanted` picks and runs them, reporting each. Returns the

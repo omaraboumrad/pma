@@ -2764,6 +2764,7 @@ mod tests {
             last_activity: None,
             ci: crate::scan::Ci::Passing,
             ci_runs: vec![],
+            ci_alone: vec![],
             lock_at: None,
             deps: None,
             faults: vec![],

@@ -2807,7 +2807,7 @@ fn a_commit_refreshes_the_tasks_and_keeps_ci() {
     const FAILING_GH: &str = r#"#!/bin/sh
 case "$1" in
 workflow) echo '[{"id":1,"name":"test","state":"active"}]' ;;
-run) printf 'test\tcompleted\tfailure\thttps://example.com/1\n' ;;
+run) printf '1\tcompleted\tfailure\thttps://example.com/1\t2026-11-01T00:00:00Z\n' ;;
 esac
 "#;
     let s = Scratch::new("commit-rescan");
@@ -8154,21 +8154,19 @@ const CI_GH: &str = r#"#!/bin/sh
 case "$1 $2" in
   "workflow list") echo '[{"id":11,"name":"test","state":"active"}]' ;;
   "run list")
-    case "$*" in
-      *--jq*) printf 'test\tcompleted\tfailure\thttps://github.com/me/alpha/actions/runs/99\n' ;;
-      *) if [ -e 'PASSING' ]; then
-           echo '[{"databaseId":100,"status":"completed","conclusion":"success"}]'
-         else
-           echo '[{"databaseId":99,"status":"completed","conclusion":"failure"}]'
-         fi ;;
-    esac ;;
+    if [ -e 'PASSING' ]; then
+      printf '11\tcompleted\tsuccess\thttps://github.com/me/alpha/actions/runs/100\t2026-11-01T00:00:00Z\n'
+    else
+      printf '11\tcompleted\tfailure\thttps://github.com/me/alpha/actions/runs/99\t2026-11-01T00:00:00Z\n'
+    fi ;;
   "run view") echo "assertion failed: greeting missing" ;;
   *) echo "fake gh: unexpected $*" >&2; exit 1 ;;
 esac
 "#;
 
-/// A `ci` task carries each failing workflow's failed-job log, and is refused
-/// once that workflow passes again.
+/// A `ci` task carries each failing workflow's failed-job log. Dispatch reads
+/// CI again first, so a workflow that passes since is refused without a
+/// `pma scan`, and the stored row drops the task.
 #[test]
 fn a_ci_task_carries_the_failed_log_and_is_refused_once_it_passes() {
     use std::os::unix::fs::PermissionsExt;
@@ -8187,10 +8185,10 @@ fn a_ci_task_carries_the_failed_log_and_is_refused_once_it_passes() {
     env.ok(&["agent", "set", "catcher", "args", r#"["{prompt}"]"#]);
 
     let ci = ["dispatch", "alpha:ci", "--local", "-a", "catcher"];
-    // The offline scan in `dispatch_env` read no CI.
+    // Dispatch reads CI, and this origin is not on GitHub.
     let (_, err, ok) = env.run(&ci);
     assert!(
-        !ok && err.contains("CI was not failing at the last scan"),
+        !ok && err.contains("alpha: CI is unknown: origin is not on GitHub"),
         "{err}"
     );
 
@@ -8208,11 +8206,9 @@ fn a_ci_task_carries_the_failed_log_and_is_refused_once_it_passes() {
 
     fs::write(&passing, "").unwrap();
     let (_, err, ok) = env.run(&ci);
-    assert!(
-        !ok && err.contains("`test` no longer fails on main; run `pma scan`"),
-        "{err}"
-    );
+    assert!(!ok && err.contains("alpha: CI no longer fails"), "{err}");
     assert!(!prompt_log.exists(), "no agent ran");
+    assert!(!env.ok(&["next"]).contains("fix CI"), "the row is gone");
     fs::remove_file(&passing).unwrap();
 
     let out = env.ok(&ci);
@@ -8224,6 +8220,137 @@ fn a_ci_task_carries_the_failed_log_and_is_refused_once_it_passes() {
         prompt.contains("Workflow `test`, run 99, last 200 lines")
             && prompt.contains("assertion failed: greeting missing"),
         "{prompt}"
+    );
+}
+
+/// `audit` passes since the last scan and `test` still fails: the task goes
+/// ahead for `test` alone. A second workflow named `test`, matched by id,
+/// passes and does not hide the first one's failure.
+const TWO_CI_GH: &str = r#"#!/bin/sh
+case "$1 $2" in
+  "workflow list") echo '[{"id":11,"name":"test","state":"active"},{"id":12,"name":"audit","state":"active"},{"id":13,"name":"test","state":"active"}]' ;;
+  "run list")
+    printf '13\tcompleted\tsuccess\thttps://github.com/me/alpha/actions/runs/103\t2026-11-01T00:00:00Z\n'
+    if [ -e 'PASSING' ]; then
+      printf '12\tcompleted\tsuccess\thttps://github.com/me/alpha/actions/runs/102\t2026-11-01T00:00:00Z\n'
+    else
+      printf '12\tcompleted\tfailure\thttps://github.com/me/alpha/actions/runs/98\t2026-11-01T00:00:00Z\n'
+    fi
+    printf '11\tcompleted\tfailure\thttps://github.com/me/alpha/actions/runs/99\t2026-11-01T00:00:00Z\n' ;;
+  "run view") echo "log of run $3" ;;
+  *) echo "fake gh: unexpected $*" >&2; exit 1 ;;
+esac
+"#;
+
+#[test]
+fn a_ci_task_drops_the_workflows_that_pass_since_the_scan() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let s = Scratch::new("ci-partly-fixed");
+    let prompt_log = s.0.join("prompt.txt");
+    let passing = s.0.join("passing");
+    let catcher = format!(
+        "#!/bin/sh\nprintf '%s' \"$1\" > '{}'\n",
+        prompt_log.display()
+    );
+    let gh = TWO_CI_GH.replace("PASSING", passing.to_str().unwrap());
+    let (env, _, alpha) = dispatch_env(&s, &[("gh", &gh), ("catcher", &catcher)]);
+    fs::set_permissions(env.bin.join("catcher"), fs::Permissions::from_mode(0o755)).unwrap();
+    env.ok(&["agent", "set", "catcher", "command", "catcher"]);
+    env.ok(&["agent", "set", "catcher", "args", r#"["{prompt}"]"#]);
+    let github = "https://github.com/me/alpha.git";
+    git(&alpha, &["remote", "set-url", "origin", github], None);
+    env.ok(&["scan"]);
+    assert!(env.ok(&["next"]).contains("fix CI: audit, test"));
+
+    fs::write(&passing, "").unwrap();
+    let out = env.ok(&["dispatch", "alpha:ci", "--local", "-a", "catcher"]);
+    assert!(out.contains("alpha: fix CI: test"), "{out}");
+    let prompt = fs::read_to_string(&prompt_log).unwrap();
+    assert!(prompt.contains("Task: fix CI: test\n"), "{prompt}");
+    assert!(prompt.contains("Workflow `test`, run 99,"), "{prompt}");
+    assert!(prompt.contains("log of run 99"), "{prompt}");
+    assert!(!prompt.contains("`audit`"), "{prompt}");
+}
+
+/// A stand-in for `gh` that logs each call to LOG. `test` (11) fills a window
+/// of 100 runs on `main`; `release` (12) and `nightly` (13) have no run in it,
+/// and each takes 2 s to read alone. With MOVED the window starts after the
+/// first scan's newest run; with SHORT it holds 5 runs, every run on `main`;
+/// with NONE the repository has no workflows.
+const WINDOW_GH: &str = r#"#!/bin/sh
+echo "$*" >> 'LOG'
+u=https://github.com/me/alpha/actions/runs
+case "$1 $2" in
+  "workflow list")
+    if [ -e 'NONE' ]; then exit 0; fi
+    echo '[{"id":11,"name":"test","state":"active"},{"id":12,"name":"release","state":"active"},{"id":13,"name":"nightly","state":"active"}]' ;;
+  "run list")
+    case "$*" in
+      *"--workflow 12"*) sleep 2; printf "12\tcompleted\tfailure\t$u/5\t2026-10-01T00:00:00Z\n" ;;
+      *"--workflow 13"*) sleep 2; printf "13\tcompleted\tsuccess\t$u/6\t2026-10-02T00:00:00Z\n" ;;
+      *)
+        if [ -e 'MOVED' ]; then new=2026-11-14T13:00:00Z; old=2026-11-12T00:00:00Z
+        else new=2026-11-10T00:00:00Z; old=2026-11-01T00:00:00Z; fi
+        n=100; if [ -e 'SHORT' ]; then n=5; fi
+        i=1; while [ $i -lt $n ]; do printf "11\tcompleted\tsuccess\t$u/$((200-i))\t$new\n"; i=$((i+1)); done
+        printf "11\tcompleted\tsuccess\t$u/100\t$old\n" ;;
+    esac ;;
+  *) echo "fake gh: unexpected $*" >&2; exit 1 ;;
+esac
+"#;
+
+/// A scan asks about a workflow missing from the window of 100 runs alone,
+/// all such workflows at once, and reuses that read while no run of it can
+/// have started since. A short window or no workflows asks nothing more.
+#[test]
+fn a_scan_reads_rare_workflows_alone_once_and_in_parallel() {
+    let s = Scratch::new("ci-window");
+    let flag = |name: &str| s.0.join(name);
+    let mut gh = WINDOW_GH.to_string();
+    for name in ["LOG", "MOVED", "SHORT", "NONE"] {
+        gh = gh.replace(&format!("'{name}'"), &format!("'{}'", flag(name).display()));
+    }
+    let (env, _, alpha) = dispatch_env(&s, &[("gh", &gh)]);
+    let github = "https://github.com/me/alpha.git";
+    git(&alpha, &["remote", "set-url", "origin", github], None);
+    let calls = || {
+        let log = fs::read_to_string(flag("LOG")).unwrap_or_default();
+        fs::remove_file(flag("LOG")).ok();
+        log
+    };
+    let alone = |log: &str| log.lines().filter(|l| l.contains("--workflow")).count();
+    let ci = || env.ok(&["next"]);
+
+    let started = std::time::Instant::now();
+    env.ok(&["scan"]);
+    let took = started.elapsed();
+    assert_eq!(alone(&calls()), 2);
+    assert!(
+        took < std::time::Duration::from_millis(3500),
+        "read at once: {took:?}"
+    );
+    assert!(ci().contains("fix CI: release"));
+
+    env.ok(&["scan"]);
+    assert_eq!(alone(&calls()), 0, "reused");
+    assert!(ci().contains("fix CI: release"));
+
+    fs::write(flag("MOVED"), "").unwrap();
+    env.ok(&["scan"]);
+    assert_eq!(alone(&calls()), 2, "a run may have started since");
+
+    fs::write(flag("SHORT"), "").unwrap();
+    env.ok(&["scan"]);
+    assert_eq!(alone(&calls()), 0, "the window holds every run");
+    assert!(!ci().contains("fix CI"), "no run of `release` on main");
+
+    fs::write(flag("NONE"), "").unwrap();
+    env.ok(&["scan"]);
+    let log = calls();
+    assert!(
+        log.contains("workflow list") && !log.contains("run list"),
+        "{log}"
     );
 }
 

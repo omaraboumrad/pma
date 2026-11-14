@@ -1,6 +1,6 @@
 use super::*;
 
-const VERSION: i64 = 50;
+const VERSION: i64 = 51;
 
 const SCHEMA: &str = "
 CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -452,6 +452,21 @@ ALTER TABLE agents ADD COLUMN relay TEXT;
 ALTER TABLE agents ADD COLUMN relay_args TEXT NOT NULL DEFAULT '[]';
 ";
 
+/// Version 51. Each workflow CI read alone, which `scan::ci_state` reuses
+/// while no run of it can have started since; `scan::Alone`. `failed` is NULL
+/// without a decisive run.
+const CI_ALONE: &str = "
+CREATE TABLE IF NOT EXISTS ci_alone (
+    project TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,
+    workflow INTEGER NOT NULL,
+    through TEXT NOT NULL,
+    read_at INTEGER NOT NULL,
+    failed INTEGER,
+    url TEXT,
+    PRIMARY KEY (project, workflow)
+);
+";
+
 /// Version 49. How a worker starts a session a person drives, as a JSON array.
 const INTERACTIVE_ARGS: &str =
     "ALTER TABLE agents ADD COLUMN interactive_args TEXT NOT NULL DEFAULT '[]';";
@@ -794,6 +809,7 @@ pub(super) fn migrate(conn: &Connection, path: &Path) -> Result<i64> {
                 PROJECT_STAMPS,
                 INTERACTIVE_ARGS,
                 MINOS_ROOMS,
+                CI_ALONE,
             ];
             let tx = conn.unchecked_transaction()?;
             for step in &steps[version as usize..] {

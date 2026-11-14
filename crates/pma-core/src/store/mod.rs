@@ -209,6 +209,7 @@ mod tests {
                 "test".into(),
                 "https://github.com/shakfu/x/actions/runs/7".into(),
             )],
+            ci_alone: Vec::new(),
             lock_at: None,
             deps: None,
             faults: vec![(

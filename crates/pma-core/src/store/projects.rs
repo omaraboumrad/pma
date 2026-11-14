@@ -333,6 +333,18 @@ impl Store {
                 "INSERT OR REPLACE INTO project_stamps (project, stamp) VALUES (?1, ?2)",
                 params![f.name, f.stamp],
             )?;
+            // A read that failed keeps the last one's, as it keeps its CI.
+            if f.ci_read && !matches!(f.ci, Ci::Unknown(_)) {
+                tx.execute("DELETE FROM ci_alone WHERE project = ?1", [&f.name])?;
+                for a in &f.ci_alone {
+                    let (failed, url) = a.verdict.clone().unzip();
+                    tx.execute(
+                        "INSERT OR REPLACE INTO ci_alone (project, workflow, through, read_at, failed, url)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        params![f.name, a.workflow as i64, a.through, a.read_at, failed, url],
+                    )?;
+                }
+            }
             tx.execute("DELETE FROM ci_runs WHERE project = ?1", [&f.name])?;
             for (workflow, url) in &f.ci_runs {
                 tx.execute(
@@ -546,6 +558,33 @@ impl Store {
     }
 
     /// What each project's files looked like when last read.
+    /// Each project's workflows CI last read alone; see `scan::Alone`.
+    pub fn ci_alone(&self) -> Result<HashMap<String, Vec<crate::scan::Alone>>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT project, workflow, through, read_at, failed, url FROM ci_alone
+             ORDER BY project, workflow",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let failed: Option<bool> = r.get(4)?;
+            let url: Option<String> = r.get(5)?;
+            Ok((
+                r.get::<_, String>(0)?,
+                crate::scan::Alone {
+                    workflow: r.get::<_, i64>(1)? as u64,
+                    through: r.get(2)?,
+                    read_at: r.get(3)?,
+                    verdict: failed.zip(url),
+                },
+            ))
+        })?;
+        let mut by_project: HashMap<String, Vec<crate::scan::Alone>> = HashMap::new();
+        for row in rows {
+            let (project, a) = row?;
+            by_project.entry(project).or_default().push(a);
+        }
+        Ok(by_project)
+    }
+
     pub fn project_stamps(&self) -> Result<HashMap<String, String>> {
         let mut stmt = self
             .conn

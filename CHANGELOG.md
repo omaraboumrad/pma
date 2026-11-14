@@ -10,6 +10,8 @@ Upgrading from 0.10:
 
 - The database moves from schema 49 to 50 on first open. `pma` adds `relay` and `relay_args` to each `claude` worker in `settings.toml` that lacks them, and says so.
 
+- The database moves from schema 50 to 51 on first open. It adds `ci_alone`, which the scan fills.
+
 ### Added
 
 - **Herdr.app.** `pma integrate herdr-app` runs each agent in a tab of a `pma: <project>` space in [Herdr.app](https://github.com/herdrdev/herdr-app); [herdr-core](https://github.com/herdrdev/herdr-core) runs the terminals. `H`, `T`, `S` and `--interactive` work as under `herdr`. A new tab opens behind the person's view. With the window closed, a headless run goes to herdr-core unseen and `H` gives it a tab later; an interactive one is refused. The app alerts on a blocked agent itself, so `pma` raises no toast. A setting value over detecting which herdr runs: a job runner keeps the environment it started in, and both can run at once. `pma integrate` names whichever is running. `make herdr-app-check` runs a dispatch against the open window. Design: `docs/dev/herdr-integration.md` section 7.
@@ -50,7 +52,11 @@ Upgrading from 0.10:
 
 - The `:` and `/` lines carry no hint; the web keeps it in the line's accessible name. The TUI's `selected` strip shows its title in the accent colour and its values in plain text, where it muted both.
 
+- A full scan of 117 projects makes 205 to 223 `gh` calls instead of 311, and takes 24 to 26 s instead of 38 s. A repository with no active workflow gets no `run list`. A project's per-workflow reads run in parallel. A workflow read alone is cached in `ci_alone`. It is reused while the 100-run window reaches back to that read, so any newer run of it would be in the window, and for at most 24 h, which bounds a re-run of an old run. A window under 100 runs holds every run, so a workflow missing from it is not asked about. Measurements and the options not built: `docs/dev/gh-optimize.md`.
+
 ### Fixed
+
+- A CI task listed the workflows failing at the last scan. Dispatch then refused the whole task when any of them passed since, even with others still failing. It now reads the project's CI first and stores it, so the task covers only workflows failing now, and the TUI and web row update at once. The agent gets the failed-job log of the run that read found, so scan and dispatch can no longer disagree. Runs are matched to workflows by id rather than name: two workflow files may share a name. A failed read keeps the last scan's CI and warns.
 
 - `pma review N --retry`, and retry in the TUI and web, now keeps a run interactive. Before, it dispatched the task again as a headless agent, because the retry built its dispatch flags with `interactive` off.
 

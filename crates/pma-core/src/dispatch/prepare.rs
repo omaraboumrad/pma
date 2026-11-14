@@ -73,15 +73,7 @@ pub fn prepare(
 
     // The tree the agent starts from: the working tree for a clone run.
     let from = start.as_deref().unwrap_or(&base);
-    let read = task_details(
-        store,
-        home,
-        &mut pick,
-        from,
-        &default_branch,
-        in_clone,
-        &mut dropped,
-    )?;
+    let read = task_details(store, home, &mut pick, from, &default_branch, &mut dropped)?;
     let (details, tags) = match read {
         Ok(read) => read,
         Err(why) => return refuse(why),
@@ -166,27 +158,18 @@ fn task_details(
     pick: &mut Pick,
     from: &str,
     default_branch: &str,
-    in_clone: bool,
     dropped: &mut Vec<String>,
 ) -> Result<std::result::Result<(String, Vec<String>), String>> {
     let repo = &pick.repo;
     let key = pick.key.clone();
     Ok(Ok(match key.as_str() {
         "ci" => {
-            let Some(scan::Ci::Failing(workflows)) = store.project(&pick.project)?.map(|p| p.ci)
-            else {
+            // `run_dispatch` read CI just now, so the store is current.
+            let row = store.project(&pick.project)?;
+            let Some((scan::Ci::Failing(workflows), runs)) = row.map(|p| (p.ci, p.ci_runs)) else {
                 return Ok(Err("CI was not failing at the last scan".into()));
             };
-            // CI failed on the default branch, whatever a local clone has
-            // checked out.
-            let branch = match pick.local || in_clone {
-                true => scan::default_branch(repo).ok_or(scan::DEFAULT_BRANCH_UNKNOWN)?,
-                false => default_branch.to_string(),
-            };
-            match failed_ci_logs(repo, &branch, &workflows)? {
-                Ok(logs) => (logs, Vec::new()),
-                Err(why) => return Ok(Err(why)),
-            }
+            (failed_ci_logs(repo, &workflows, &runs)?, Vec::new())
         }
         "deps" => {
             let detail = store
@@ -628,53 +611,23 @@ fn on_origin(file: Option<&str>, key: &str, text: &str) -> OnOrigin {
     }
 }
 
-/// The failed-job log of each workflow's latest decisive run, the run scan
-/// judged failing. The inner error refuses the task: a workflow passes now.
-fn failed_ci_logs(
-    repo: &Path,
-    branch: &str,
-    workflows: &[String],
-) -> Result<std::result::Result<String, String>> {
+/// The failed-job log of each failing workflow's latest failed run, as the
+/// last CI read linked it.
+fn failed_ci_logs(repo: &Path, workflows: &[String], runs: &[(String, String)]) -> Result<String> {
     use crate::sync::gh;
     let url = git(repo, &["remote", "get-url", "origin"])?;
     let slug = scan::github_slug(&url).ok_or("origin is not on GitHub")?;
-    let listed = gh(&[
-        "workflow",
-        "list",
-        "-R",
-        &slug,
-        "--limit",
-        "200",
-        "--json",
-        "id,name,state",
-    ])?;
-    let active = scan::active_workflows(&listed)?;
     let mut logs = String::new();
     for workflow in workflows {
-        // By id: two workflow files may share a name, which `gh` refuses as
-        // ambiguous. The newest failure among them is the one that counts.
-        let mut failed = None;
-        for (id, _) in active.iter().filter(|(_, name)| name == workflow) {
-            let runs = gh(&[
-                "run",
-                "list",
-                "-R",
-                &slug,
-                "--branch",
-                branch,
-                "--workflow",
-                &id.to_string(),
-                "--limit",
-                "20",
-                "--json",
-                "databaseId,status,conclusion",
-            ])?;
-            failed = failed.max(scan::latest_failed_run(&runs)?);
-        }
-        let Some(id) = failed else {
-            return Ok(Err(format!(
-                "`{workflow}` no longer fails on {branch}; run `pma scan`"
-            )));
+        let Some(id) = runs
+            .iter()
+            .find(|(w, _)| w == workflow)
+            .and_then(|(_, u)| scan::run_id(u))
+        else {
+            logs.push_str(&format!(
+                "Workflow `{workflow}`: no failed run was linked.\n\n"
+            ));
+            continue;
         };
         // A startup failure has no job log; the agent still gets the run id.
         let log = gh(&["run", "view", &id.to_string(), "-R", &slug, "--log-failed"])
@@ -684,7 +637,7 @@ fn failed_ci_logs(
             "Workflow `{workflow}`, run {id}, last {CI_LOG_LINES} lines of `gh run view --log-failed`:\n\n```\n{log}\n```\n\n"
         ));
     }
-    Ok(Ok(logs))
+    Ok(logs)
 }
 
 /// Where an agent drafts changelog entries, relative to its worktree. pma
