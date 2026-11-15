@@ -62,6 +62,21 @@ impl Store {
             ],
         )?;
         run.id = tx.last_insert_rowid();
+        // The CI a landed run is judged against; `ci_verdict`.
+        let before: Option<String> = tx
+            .query_row(
+                "SELECT CASE ci WHEN 'passing' THEN '' WHEN 'failing' THEN ci_detail END
+                 FROM projects WHERE name = ?1",
+                [&run.project],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        tx.execute(
+            "UPDATE runs SET ci_before = ?2 WHERE id = ?1",
+            params![run.id, before],
+        )?;
+        run.ci_before = before.map(|s| s.lines().map(String::from).collect());
         for (n, item) in run.items.iter().enumerate() {
             tx.execute(
                 "INSERT INTO run_items (run, n, key, text, gh, dropped)
@@ -227,6 +242,15 @@ impl Store {
         Ok(())
     }
 
+    /// Records that `sha` reached the default branch.
+    pub fn set_landed(&self, id: i64, sha: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE runs SET landed_sha = ?2, landed_at = ?3 WHERE id = ?1",
+            params![id, sha, crate::dates::now()],
+        )?;
+        Ok(())
+    }
+
     /// `None` when the last attempt ran without a room.
     pub fn set_room(&self, id: i64, room: Option<&str>) -> Result<()> {
         self.conn
@@ -283,7 +307,8 @@ impl Store {
                     approved_tree, approved_head, approved_by,
                     workflow_instance, node, unit, lap, preset, extra_args, git_snapshot,
                     reviewed_tree, infra, workspace, start, denied,
-                    review_measured, pane, interactive, agent_state, room
+                    review_measured, pane, interactive, agent_state, room,
+                    landed_sha, landed_at, ci_before, ci_verdict
              FROM runs ORDER BY id",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -378,6 +403,15 @@ impl Store {
                 interactive: r.get(63)?,
                 agent_state: r.get(64)?,
                 room: r.get(65)?,
+                landed_sha: r.get(66)?,
+                landed_at: r.get(67)?,
+                ci_before: r
+                    .get::<_, Option<String>>(68)?
+                    .map(|s| s.lines().map(String::from).collect()),
+                ci_verdict: r
+                    .get::<_, Option<String>>(69)?
+                    .as_deref()
+                    .and_then(crate::ci_verdict::Verdict::parse),
                 items: Vec::new(),
             })
         })?;
@@ -700,6 +734,14 @@ pub struct Run {
     pub agent_state: Option<String>,
     /// The minos room the last attempt spoke in.
     pub room: Option<String>,
+    /// The commit that reached the default branch, and when pma saw it there.
+    pub landed_sha: Option<String>,
+    pub landed_at: Option<i64>,
+    /// Workflows failing at dispatch, from the last CI read; `None` when CI
+    /// was unknown or absent.
+    pub ci_before: Option<Vec<String>>,
+    /// What CI said of `landed_sha`; `None` while it has not decided.
+    pub ci_verdict: Option<crate::ci_verdict::Verdict>,
     /// A bundle's items, in prompt order; empty for any other run.
     pub items: Vec<RunItem>,
 }
@@ -808,6 +850,10 @@ impl Run {
             review_measured: None,
             pane: None,
             room: None,
+            landed_sha: None,
+            landed_at: None,
+            ci_before: None,
+            ci_verdict: None,
             interactive: false,
             agent_state: None,
             items: Vec::new(),
@@ -1059,6 +1105,10 @@ mod tests {
             review_measured: None,
             pane: None,
             room: None,
+            landed_sha: None,
+            landed_at: None,
+            ci_before: None,
+            ci_verdict: None,
             interactive: false,
             agent_state: None,
             items: vec![

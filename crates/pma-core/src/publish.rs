@@ -171,8 +171,10 @@ fn to_clone(
         step(run, RunState::Committed, outcome)?;
     }
     if target == Target::Push && run.state == RunState::Committed {
-        let outcome = push(home, run)?;
+        let (outcome, sha) = push(home, run)?;
         step(run, RunState::Pushed, outcome)?;
+        store.set_landed(run.id, &sha)?;
+        run.landed_sha = Some(sha);
     }
     Ok(said.join("; "))
 }
@@ -412,7 +414,8 @@ fn commit(
 }
 
 /// Pushes the run's commit, and nothing else, to origin's default branch.
-fn push(home: &std::path::Path, run: &Run) -> Result<String> {
+/// Returns what to say and the commit pushed.
+fn push(home: &std::path::Path, run: &Run) -> Result<(String, String)> {
     crate::dispatch::unchanged_git(run)?;
     let parent = git(&run.repo, &["rev-parse", "HEAD^"]).unwrap_or_default();
     // A person made an interactive run's commits, so they are not pma's one.
@@ -443,11 +446,12 @@ fn push(home: &std::path::Path, run: &Run) -> Result<String> {
             run.default_branch
         )
     })?;
-    Ok(format!(
+    let said = format!(
         "pushed {} to {}",
         &sha[..7.min(sha.len())],
         run.default_branch
-    ))
+    );
+    Ok((said, sha))
 }
 
 /// The diff from what the run started from to `tree`, in the run's log
@@ -876,6 +880,10 @@ pub fn settle_committed(store: &Store) -> Result<Vec<Run>> {
         run.outcome = Some(outcome);
         run.enter(RunState::Pushed);
         if store.update_run_from(&run, RunState::Committed).is_ok() {
+            if let Ok(full) = git(&run.repo, &["rev-parse", &format!("{sha}^{{commit}}")]) {
+                store.set_landed(run.id, &full)?;
+                run.landed_sha = Some(full);
+            }
             settled.push(run);
         }
     }

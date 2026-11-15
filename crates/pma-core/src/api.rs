@@ -796,11 +796,16 @@ pub fn has_run(runs: &[Run], project: &str, key: &str, text: &str) -> bool {
 
 pub fn next_lists(store: &Store, p: &Portfolio) -> Result<next::Next> {
     let active = store.runs()?;
-    let absent: Vec<String> = store
-        .projects()?
-        .into_iter()
+    let projects = store.projects()?;
+    let absent: Vec<String> = projects
+        .iter()
         .filter(|r| r.absent_since.is_some())
-        .map(|r| r.name)
+        .map(|r| r.name.clone())
+        .collect();
+    let failing: Vec<String> = projects
+        .iter()
+        .filter(|r| matches!(r.ci, crate::scan::Ci::Failing(_)))
+        .map(|r| r.name.clone())
         .collect();
     let placed = rank::place(&p.cfg, p.tasks.clone(), p.today);
     let mut spent = std::collections::HashMap::new();
@@ -829,7 +834,9 @@ pub fn next_lists(store: &Store, p: &Portfolio) -> Result<next::Next> {
             false => next::Taken::Free,
         }
     };
-    Ok(next::build(&placed, &active, p.today, taken))
+    let mut lists = next::build(&placed, &active, p.today, taken);
+    next::flag_landed(&mut lists, &active, &failing);
+    Ok(lists)
 }
 
 /// A run's drafted changelog entries: `None` when its project keeps no
@@ -1637,6 +1644,16 @@ fn task_view(store: &Store, project: &str, line: Option<i64>, key: Option<&str>)
                 "failing {}",
                 crate::history::since_text(since.get(project), latest, dates::now())
             ));
+            // So a fix that did not take is seen before another is paid for.
+            let runs = store.runs()?;
+            let last = runs
+                .iter()
+                .filter(|r| r.project == project && r.task_key == "ci" && r.landed_at.is_some())
+                .max_by_key(|r| (r.landed_at, r.id));
+            if let Some(r) = last {
+                let what = r.ci_verdict.map_or("waiting for CI", |v| v.text());
+                lines.push(format!("last fix #{} landed: {what}", r.id));
+            }
             lines
         }
         Some("deps") => row.deps_detail.lines().map(str::to_string).collect(),
@@ -2765,6 +2782,7 @@ mod tests {
             ci: crate::scan::Ci::Passing,
             ci_runs: vec![],
             ci_alone: vec![],
+            ci_seen: vec![],
             lock_at: None,
             deps: None,
             faults: vec![],

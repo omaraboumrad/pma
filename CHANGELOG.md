@@ -12,7 +12,11 @@ Upgrading from 0.10:
 
 - The database moves from schema 50 to 51 on first open. It adds `ci_alone`, which the scan fills.
 
+- The database moves from schema 51 to 52 on first open. It adds four `runs` columns for the CI verdict. Runs landed earlier get no verdict.
+
 ### Added
+
+- **CI verdict on landed runs.** A run that `pma push`, or a push by hand, lands on the default branch is judged by CI on that commit. A fix-CI run is `fixed` or `still-failing` on the workflows failing at its dispatch; any other run is `clean` or `regressed` on workflows passing then. The verdict shows in the run detail, as a second line of `pma report`, in `ci-green`, and on the CI signal's detail. A bad one waits in the inbox while the project's CI fails. Local verify passing on macOS did not show a fix for a Linux or Windows job: one of 19 fix-CI runs pushed so far left CI red unseen. Reading CI after landing over pushing a branch first, which would publish unreviewed code. Design: `docs/dev/ci-verdict.md`.
 
 - **Herdr.app.** `pma integrate herdr-app` runs each agent in a tab of a `pma: <project>` space in [Herdr.app](https://github.com/herdrdev/herdr-app); [herdr-core](https://github.com/herdrdev/herdr-core) runs the terminals. `H`, `T`, `S` and `--interactive` work as under `herdr`. A new tab opens behind the person's view. With the window closed, a headless run goes to herdr-core unseen and `H` gives it a tab later; an interactive one is refused. The app alerts on a blocked agent itself, so `pma` raises no toast. A setting value over detecting which herdr runs: a job runner keeps the environment it started in, and both can run at once. `pma integrate` names whichever is running. `make herdr-app-check` runs a dispatch against the open window. Design: `docs/dev/herdr-integration.md` section 7.
 

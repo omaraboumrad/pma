@@ -89,7 +89,8 @@ pub fn ci(store: &mut Store, projects: &[(String, PathBuf)]) -> Result<Vec<Strin
         let kept = prior.get(&f.name).map_or(&[][..], Vec::as_slice);
         match scan::ci_state(&f.path, kept, dates::now()) {
             Ok(read) => {
-                (f.ci, f.ci_runs, f.ci_alone, f.ci_read) = (read.ci, read.runs, read.alone, true);
+                (f.ci, f.ci_runs, f.ci_alone, f.ci_seen, f.ci_read) =
+                    (read.ci, read.runs, read.alone, read.seen, true);
             }
             Err(why) => warnings.push(format!(
                 "{}: CI not read, using the last scan's: {why}",

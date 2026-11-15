@@ -522,6 +522,17 @@ pub fn run_fields(run: &Run) -> Vec<Vec<String>> {
     if let Some(s) = run.review_time() {
         rows.push(vec!["reviewed".into(), duration(Some(s))]);
     }
+    if let Some(sha) = &run.landed_sha {
+        let what = match (run.ci_verdict, &run.ci_before) {
+            (Some(v), _) => v.text(),
+            (None, Some(_)) => "waiting for CI",
+            (None, None) => "not judged: CI was unknown at dispatch",
+        };
+        rows.push(vec![
+            "ci after".into(),
+            format!("{what} on {}", &sha[..sha.len().min(7)]),
+        ]);
+    }
     for (label, value) in [
         ("feedback", &run.feedback),
         ("error", &run.error),

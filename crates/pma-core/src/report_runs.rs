@@ -184,7 +184,55 @@ pub fn table_of(runs: &[Run], attempts: &[Attempt], by: By) -> Option<(String, V
                 .join(" ")
         ),
     };
-    Some((format!("{share}{pending}{applied}{infra}"), rows))
+    let ci = ci_line(&done);
+    Some((format!("{share}{pending}{applied}{infra}{ci}"), rows))
+}
+
+/// What CI said of landed runs, fix-CI runs apart: a second summary line, or
+/// nothing when no landed run was recorded. A verdict is in no share.
+fn ci_line(runs: &[&Run]) -> String {
+    use crate::ci_verdict::Verdict;
+    let count = |fix: bool, v: Option<Verdict>| {
+        runs.iter()
+            .filter(|r| r.landed_sha.is_some() && (r.task_key == "ci") == fix && r.ci_verdict == v)
+            .count()
+    };
+    let part = |fix: bool, kinds: &[(Option<Verdict>, &str)]| {
+        let said: Vec<String> = kinds
+            .iter()
+            .map(|(v, what)| (count(fix, *v), what))
+            .filter(|(n, _)| *n > 0)
+            .map(|(n, what)| format!("{n} {what}"))
+            .collect();
+        said.join(", ")
+    };
+    let fix = part(
+        true,
+        &[
+            (Some(Verdict::Fixed), "fixed"),
+            (Some(Verdict::StillFailing), "still failing"),
+            (Some(Verdict::NoRun), "no run"),
+            (None, "waiting"),
+        ],
+    );
+    let other = part(
+        false,
+        &[
+            (Some(Verdict::Regressed), "broke CI"),
+            (Some(Verdict::Clean), "broke nothing"),
+            (Some(Verdict::NoRun), "no run"),
+            (None, "waiting"),
+        ],
+    );
+    let parts: Vec<String> = [("fix-CI runs", fix), ("other runs", other)]
+        .into_iter()
+        .filter(|(_, p)| !p.is_empty())
+        .map(|(label, p)| format!("{label} {p}"))
+        .collect();
+    match parts.is_empty() {
+        true => String::new(),
+        false => format!("\nCI after landing: {}", parts.join("; ")),
+    }
 }
 
 pub fn report(runs: &[Run], attempts: &[Attempt], by: By) -> String {
@@ -330,6 +378,43 @@ mod tests {
         let runs = [a, run(2, Class::Mechanical, RunState::Merged)];
         let out = report(&runs, &[], By::Class);
         assert!(out.contains("$0.10+1?"), "{out}");
+    }
+
+    /// Landed runs are counted by what CI said of their commit, fix-CI runs
+    /// apart; a run landed before the commit was recorded is not counted.
+    #[test]
+    fn ci_after_landing_is_a_line_of_its_own() {
+        use crate::ci_verdict::Verdict;
+        let landed = |id, key: &str, verdict| {
+            let mut r = run(id, Class::Specified, RunState::Pushed);
+            r.task_key = key.into();
+            r.landed_sha = Some("abc".into());
+            r.ci_verdict = verdict;
+            r
+        };
+        let runs = [
+            landed(1, "ci", Some(Verdict::Fixed)),
+            landed(2, "ci", Some(Verdict::Fixed)),
+            landed(3, "ci", Some(Verdict::StillFailing)),
+            landed(4, "ci", None),
+            landed(5, "5", Some(Verdict::Regressed)),
+            run(6, Class::Specified, RunState::Pushed),
+        ];
+        let out = report(&runs, &[], By::Class);
+        assert!(out.contains("100% of 6 decided runs accepted"), "{out}");
+        assert!(
+            out.contains(
+                "\nCI after landing: fix-CI runs 2 fixed, 1 still failing, 1 waiting; \
+                 other runs 1 broke CI\n"
+            ),
+            "{out}"
+        );
+        let none = report(
+            &[run(1, Class::Specified, RunState::Pushed)],
+            &[],
+            By::Class,
+        );
+        assert!(!none.contains("CI after landing"), "{none}");
     }
 
     #[test]

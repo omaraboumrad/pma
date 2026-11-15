@@ -100,6 +100,8 @@ pub struct Facts {
     pub ci_runs: Vec<(String, String)>,
     /// The workflows CI read alone; see `Alone`.
     pub ci_alone: Vec<Alone>,
+    /// Each run in the window, newest first, by commit; `ci_verdict`.
+    pub ci_seen: Vec<crate::ci_verdict::Seen>,
     /// When the stalest lock last changed; see `lock_changed_at`.
     pub lock_at: Option<i64>,
     /// `None` when this scan did not measure dependencies.
@@ -170,6 +172,7 @@ impl Facts {
             ci: Ci::Unknown("offline".into()),
             ci_runs: Vec::new(),
             ci_alone: Vec::new(),
+            ci_seen: Vec::new(),
             lock_at: None,
             deps: None,
             faults: Vec::new(),
@@ -406,7 +409,8 @@ pub fn scan_project(
         facts.ci_read = true;
         match ci_state(path, prior, crate::dates::now()) {
             Ok(read) => {
-                (facts.ci, facts.ci_runs, facts.ci_alone) = (read.ci, read.runs, read.alone)
+                (facts.ci, facts.ci_runs, facts.ci_alone, facts.ci_seen) =
+                    (read.ci, read.runs, read.alone, read.seen)
             }
             Err(why) => {
                 facts.faults.push((Fault::CiUnknown, why.clone()));
@@ -959,6 +963,8 @@ pub struct CiRead {
     pub runs: Vec<(String, String)>,
     /// The workflows read alone, or reused from `prior`, for the next read.
     pub alone: Vec<Alone>,
+    /// The window's runs of active workflows, newest first, by commit.
+    pub seen: Vec<crate::ci_verdict::Seen>,
 }
 
 /// The CI state, and each failing workflow's latest failed run, judged over
@@ -972,6 +978,7 @@ pub fn ci_state(dir: &Path, prior: &[Alone], now: i64) -> Result<CiRead, String>
         ci,
         runs: Vec::new(),
         alone: Vec::new(),
+        seen: Vec::new(),
     };
     let unknown = |why: &str| only(Ci::Unknown(why.into()));
     let Some(url) = git(dir, &["remote", "get-url", "origin"]) else {
@@ -991,9 +998,9 @@ pub fn ci_state(dir: &Path, prior: &[Alone], now: i64) -> Result<CiRead, String>
         args.extend_from_slice(extra);
         args.extend([
             "--json",
-            "workflowDatabaseId,status,conclusion,url,createdAt",
+            "workflowDatabaseId,status,conclusion,url,createdAt,headSha",
             "--jq",
-            ".[] | [.workflowDatabaseId, .status, .conclusion, .url, .createdAt] | @tsv",
+            ".[] | [.workflowDatabaseId, .status, .conclusion, .url, .createdAt, .headSha] | @tsv",
         ]);
         gh(&args).map(|tsv| run_rows(&tsv))
     };
@@ -1064,10 +1071,23 @@ pub fn ci_state(dir: &Path, prior: &[Alone], now: i64) -> Result<CiRead, String>
             }
         }
     }
+    let seen = window
+        .iter()
+        .filter(|r| !r.sha.is_empty())
+        .filter_map(|r| {
+            let (_, name) = active.iter().find(|(id, _)| *id == r.workflow)?;
+            Some(crate::ci_verdict::Seen {
+                sha: r.sha.clone(),
+                workflow: name.clone(),
+                outcome: crate::ci_verdict::Outcome::of(&r.status, &r.conclusion),
+            })
+        })
+        .collect();
     Ok(CiRead {
         ci: ci_of(&active, &verdicts),
         runs: failed_runs(&active, &verdicts),
         alone,
+        seen,
     })
 }
 
@@ -1079,15 +1099,17 @@ struct RunRow {
     conclusion: String,
     url: String,
     created: String,
+    /// Empty when `gh` gave none.
+    sha: String,
 }
 
 /// Reads `gh run list` rows, newest first, as `workflow id \t status \t
-/// conclusion \t url \t createdAt`.
+/// conclusion \t url \t createdAt \t headSha`.
 fn run_rows(tsv: &str) -> Vec<RunRow> {
     tsv.lines()
         .filter_map(|line| {
             let f: Vec<&str> = line.split('\t').collect();
-            let [id, status, conclusion, url, created] = f[..] else {
+            let [id, status, conclusion, url, created, ref rest @ ..] = f[..] else {
                 return None;
             };
             Some(RunRow {
@@ -1096,6 +1118,7 @@ fn run_rows(tsv: &str) -> Vec<RunRow> {
                 conclusion: conclusion.into(),
                 url: url.into(),
                 created: created.into(),
+                sha: rest.first().map_or(String::new(), |s| (*s).to_string()),
             })
         })
         .collect()
@@ -1530,6 +1553,14 @@ mod tests {
         assert_eq!(newest_counted_commit(log, &ignore), Some(100));
         assert_eq!(newest_counted_commit("\x00300\n\nTODO.md\n", &ignore), None);
         assert_eq!(newest_counted_commit("", &ignore), None);
+    }
+
+    /// `headSha` is a sixth column; a row without one still counts.
+    #[test]
+    fn run_rows_read_the_commit_when_given() {
+        let rows = run_rows("1\tcompleted\tsuccess\tu/2\tT\tabc\n1\tcompleted\tfailure\tu/1\tT\n");
+        let shas: Vec<&str> = rows.iter().map(|r| r.sha.as_str()).collect();
+        assert_eq!(shas, ["abc", ""]);
     }
 
     #[test]

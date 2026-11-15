@@ -195,6 +195,45 @@ pub fn build(
     next
 }
 
+/// Adds to `next.runs` each project's last landed run whose commit CI judged
+/// worse than the run meant, while that project's CI is still failing. It
+/// leaves the list once CI passes or another run lands there.
+pub fn flag_landed(next: &mut Next, runs: &[Run], failing: &[String]) {
+    for project in failing {
+        let Some(r) = runs
+            .iter()
+            .filter(|r| &r.project == project && r.landed_at.is_some())
+            .max_by_key(|r| (r.landed_at, r.id))
+        else {
+            continue;
+        };
+        let Some(v) = r.ci_verdict.filter(|v| v.bad()) else {
+            continue;
+        };
+        next.runs.push(Row {
+            cells: vec![
+                format!("#{}", r.id),
+                r.state.name().to_string(),
+                match v {
+                    crate::ci_verdict::Verdict::StillFailing => "CI still failing".into(),
+                    _ => v.text().to_string(),
+                },
+                r.project.clone(),
+                report::truncate(&r.text, 80),
+            ],
+            command: Some(format!("pma review {}", r.id)),
+            issue: r.gh,
+            subject: Subject::Run {
+                id: r.id,
+                fixing: false,
+                empty: false,
+                state: r.state.name().into(),
+                project: r.project.clone(),
+            },
+        });
+    }
+}
+
 /// The two lists as text. `limit` caps the rows of each, and the count says
 /// what was left out.
 pub fn render(next: &Next, limit: Option<usize>) -> String {
@@ -330,6 +369,31 @@ mod tests {
             next.tasks[0].command.as_deref(),
             Some("pma dispatch spent:8 --retry")
         );
+    }
+
+    /// Only a project's last landed run, only with a bad verdict, and only
+    /// while that project's CI fails.
+    #[test]
+    fn a_landed_run_ci_judged_badly_waits_while_ci_fails() {
+        use crate::ci_verdict::Verdict;
+        let landed = |id, project: &str, at, verdict| {
+            let mut r = run(id, RunState::Pushed);
+            r.project = project.into();
+            r.landed_at = Some(at);
+            r.ci_verdict = verdict;
+            r
+        };
+        let runs = [
+            landed(1, "a", 10, Some(Verdict::StillFailing)),
+            landed(2, "b", 10, Some(Verdict::Regressed)),
+            landed(3, "b", 20, Some(Verdict::Clean)),
+            landed(4, "c", 10, Some(Verdict::StillFailing)),
+            landed(5, "d", 10, None),
+        ];
+        let mut next = Next::default();
+        flag_landed(&mut next, &runs, &["a".into(), "b".into(), "d".into()]);
+        let rows: Vec<&[String]> = next.runs.iter().map(|r| &r.cells[..3]).collect();
+        assert_eq!(rows, [["#1", "pushed", "CI still failing"]]);
     }
 
     #[test]

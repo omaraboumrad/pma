@@ -1,6 +1,6 @@
 use super::*;
 
-const VERSION: i64 = 51;
+const VERSION: i64 = 52;
 
 const SCHEMA: &str = "
 CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -467,6 +467,16 @@ CREATE TABLE IF NOT EXISTS ci_alone (
 );
 ";
 
+/// Version 52. The commit a run landed, the workflows failing at its
+/// dispatch (one per line, empty when CI passed), and what CI said of the
+/// commit; `ci_verdict`.
+const CI_VERDICT: &str = "
+ALTER TABLE runs ADD COLUMN landed_sha TEXT;
+ALTER TABLE runs ADD COLUMN landed_at INTEGER;
+ALTER TABLE runs ADD COLUMN ci_before TEXT;
+ALTER TABLE runs ADD COLUMN ci_verdict TEXT;
+";
+
 /// Version 49. How a worker starts a session a person drives, as a JSON array.
 const INTERACTIVE_ARGS: &str =
     "ALTER TABLE agents ADD COLUMN interactive_args TEXT NOT NULL DEFAULT '[]';";
@@ -810,6 +820,7 @@ pub(super) fn migrate(conn: &Connection, path: &Path) -> Result<i64> {
                 INTERACTIVE_ARGS,
                 MINOS_ROOMS,
                 CI_ALONE,
+                CI_VERDICT,
             ];
             let tx = conn.unchecked_transaction()?;
             for step in &steps[version as usize..] {
@@ -1239,6 +1250,7 @@ mod tests {
                     .execute("UPDATE agents SET args = ?1 WHERE name = 'claude'", [args])
                     .unwrap();
                 store.conn.execute_batch(BEFORE_SCAN_FAULTS).unwrap();
+                store.conn.execute_batch(UNDO_CI_VERDICT).unwrap();
                 store.conn.pragma_update(None, "user_version", 32).unwrap();
             }
             let store = Store::open(&path).unwrap();
@@ -1292,6 +1304,7 @@ mod tests {
                          ALTER TABLE agents DROP COLUMN interactive_args;",
                     )
                     .unwrap();
+                store.conn.execute_batch(UNDO_CI_VERDICT).unwrap();
                 store.conn.pragma_update(None, "user_version", 43).unwrap();
             }
             let store = Store::open(&path).unwrap();
@@ -1305,6 +1318,14 @@ mod tests {
             let _ = std::fs::remove_dir_all(dir);
         }
     }
+
+    /// Undoes version 52, for a test that rewinds the schema past it.
+    const UNDO_CI_VERDICT: &str = "
+        ALTER TABLE runs DROP COLUMN landed_sha;
+        ALTER TABLE runs DROP COLUMN landed_at;
+        ALTER TABLE runs DROP COLUMN ci_before;
+        ALTER TABLE runs DROP COLUMN ci_verdict;
+    ";
 
     /// Undoes versions 40 to 43, for a test that rewinds the schema past
     /// them.
@@ -1355,6 +1376,7 @@ mod tests {
                         (2, 'todo', 'mended', NULL, '');",
                 )
                 .unwrap();
+            store.conn.execute_batch(UNDO_CI_VERDICT).unwrap();
             store.conn.pragma_update(None, "user_version", 39).unwrap();
         }
         let store = Store::open(&path).unwrap();
@@ -1422,6 +1444,7 @@ mod tests {
                     .unwrap();
             }
             store.conn.execute_batch(BEFORE_SCAN_FAULTS).unwrap();
+            store.conn.execute_batch(UNDO_CI_VERDICT).unwrap();
             store.conn.pragma_update(None, "user_version", 33).unwrap();
         }
         let store = Store::open(&path).unwrap();
@@ -1458,6 +1481,7 @@ mod tests {
                 .conn
                 .execute("UPDATE agents SET model = 'opus' WHERE name = 'claude'", [])
                 .unwrap();
+            store.conn.execute_batch(UNDO_CI_VERDICT).unwrap();
             store.conn.pragma_update(None, "user_version", 23).unwrap();
         }
         let store = Store::open(&path).unwrap();
@@ -1512,6 +1536,7 @@ mod tests {
                      ALTER TABLE agents DROP COLUMN relay_args;",
                 )
                 .unwrap();
+            store.conn.execute_batch(UNDO_CI_VERDICT).unwrap();
             store.conn.pragma_update(None, "user_version", 48).unwrap();
         }
         let store = Store::open(&path).unwrap();
@@ -1550,6 +1575,7 @@ mod tests {
                      ALTER TABLE agents DROP COLUMN relay_args;",
                 )
                 .unwrap();
+            store.conn.execute_batch(UNDO_CI_VERDICT).unwrap();
             store.conn.pragma_update(None, "user_version", 49).unwrap();
         }
         let store = Store::open(&path).unwrap();

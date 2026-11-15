@@ -224,11 +224,10 @@ impl Store {
     /// leaves a root is usually a move, not a deletion.
     pub fn save_scan(&mut self, facts: &[Facts], full: bool, now: i64) -> Result<Vec<String>> {
         use crate::history::{self, Change};
-        let open_runs: Vec<Run> = self
-            .runs()?
-            .into_iter()
-            .filter(|r| !r.state.is_final())
-            .collect();
+        let runs = self.runs()?;
+        // Before the transaction: judging runs git in each run's clone.
+        let verdicts = crate::ci_verdict::judge_landed(&runs, facts, now);
+        let open_runs: Vec<Run> = runs.into_iter().filter(|r| !r.state.is_final()).collect();
         // Immediate: reading first and writing later fails at once, past
         // `busy_timeout`, if another process wrote in between.
         let tx = self
@@ -525,6 +524,12 @@ impl Store {
             )?;
         }
         tx.execute("DELETE FROM scans WHERE id <= ?1", [scan - history::KEPT])?;
+        for (id, verdict) in &verdicts {
+            tx.execute(
+                "UPDATE runs SET ci_verdict = ?2 WHERE id = ?1 AND ci_verdict IS NULL",
+                params![id, verdict.name()],
+            )?;
+        }
         tx.commit()?;
         // A project this scan added may have a tier or tags in the file.
         self.reapply_settings()?;

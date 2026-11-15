@@ -719,9 +719,13 @@ fn activity_pane(
         })
         .collect();
     let agents = watch::agents(state, runs, now);
-    let doing = |r: &Run| -> String {
+    let doing = |r: &Run| -> Cell {
         let Some(a) = agents.iter().find(|a| a.run.id == r.id) else {
-            return String::new();
+            // A finished run says what CI made of its landed commit.
+            return match r.ci_verdict {
+                Some(v) if v.bad() => cell(format!("CI after landing: {}", v.text()), Tone::Bad),
+                _ => cell(String::new(), Tone::Accent),
+            };
         };
         let what = a
             .progress
@@ -729,23 +733,26 @@ fn activity_pane(
             .clone()
             .or_else(|| a.progress.last_text.clone())
             .unwrap_or_else(|| "starting".into());
-        match a.progress.tool_calls {
-            0 => what,
-            n => format!("{what}  ({n} tools, quiet {})", a.quiet),
-        }
+        cell(
+            match a.progress.tool_calls {
+                0 => what,
+                n => format!("{what}  ({n} tools, quiet {})", a.quiet),
+            },
+            Tone::Accent,
+        )
     };
     let row = |item: Cell,
                state: Cell,
                project: &str,
                what: String,
-               doing: String,
+               doing: Cell,
                cost: Cell,
                age: Cell| {
         let mut cells = vec![item, state];
         if with_project {
             cells.push(plain(project));
         }
-        cells.extend([plain(what), cell(doing, Tone::Accent), cost, age]);
+        cells.extend([plain(what), doing, cost, age]);
         cells
     };
     let mut rows: Vec<(bool, i64, Item)> = runs
@@ -778,7 +785,7 @@ fn activity_pane(
                         cell(j.state.clone(), job_tone(&j.state)),
                         j.project.as_deref().unwrap_or(""),
                         format!("pma {}", j.args.join(" ")),
-                        String::new(),
+                        cell(String::new(), Tone::Accent),
                         muted(""),
                         muted(report::ago(now - j.created_at)),
                     ),

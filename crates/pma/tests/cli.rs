@@ -2797,7 +2797,17 @@ fn review_settles_a_commit_pushed_by_hand() {
 
     let out = env.ok(&["review"]);
     assert!(out.contains("found on origin/main"), "{out}");
-    assert!(env.ok(&["review", "1"]).starts_with("#1 pushed"));
+    let detail = env.ok(&["review", "1"]);
+    assert!(detail.starts_with("#1 pushed"), "{detail}");
+    // The landed commit is recorded; this origin is not on GitHub.
+    let head = git_out(&alpha, &["rev-parse", "--short=7", "HEAD"]);
+    assert!(
+        detail.contains(&format!(
+            "not judged: CI was unknown at dispatch on {}",
+            head.trim()
+        )),
+        "{detail}"
+    );
 }
 
 /// A commit ticks the item in the clone, so the task leaves the lists then.
@@ -8271,6 +8281,85 @@ fn a_ci_task_drops_the_workflows_that_pass_since_the_scan() {
     assert!(prompt.contains("Workflow `test`, run 99,"), "{prompt}");
     assert!(prompt.contains("log of run 99"), "{prompt}");
     assert!(!prompt.contains("`audit`"), "{prompt}");
+}
+
+/// A stand-in for `gh` whose one workflow, `test`, ran on the commit origin's
+/// `main` holds: failed, or passed once FIXED exists.
+const LANDED_GH: &str = r#"#!/bin/sh
+u=https://github.com/me/alpha/actions/runs
+case "$1 $2" in
+  "workflow list") echo '[{"id":11,"name":"test","state":"active"}]' ;;
+  "run list")
+    head=$(git --git-dir='ORIGIN' rev-parse main)
+    c=failure; if [ -e 'FIXED' ]; then c=success; fi
+    printf "11\tcompleted\t$c\t$u/100\t2026-11-02T00:00:00Z\t$head\n" ;;
+  "run view") echo "assertion failed: greeting missing" ;;
+  *) echo "fake gh: unexpected $*" >&2; exit 1 ;;
+esac
+"#;
+
+/// A pushed fix-CI run is judged by CI on the commit it pushed, not by local
+/// verify, which passed. While CI still fails it waits in `next`; the
+/// verdict stays once CI passes, and the row goes.
+#[test]
+fn a_pushed_ci_fix_is_judged_by_ci_on_its_commit() {
+    let s = Scratch::new("ci-verdict");
+    let fixed = s.0.join("fixed");
+    let worker = "#!/bin/sh\necho hi > hello.txt\necho done\n";
+    let origin_path = s.0.join("origin.git");
+    let gh = LANDED_GH
+        .replace("ORIGIN", origin_path.to_str().unwrap())
+        .replace("FIXED", fixed.to_str().unwrap());
+    let (env, origin, alpha) = dispatch_env(&s, &[("gh", &gh), ("fixer", worker)]);
+    env.ok(&["agent", "set", "fixer", "command", "fixer"]);
+    env.ok(&["agent", "set", "fixer", "args", r#"["{prompt}"]"#]);
+    // A clone run fetches nothing, so origin can read as GitHub and push to
+    // the bare repository.
+    env.ok(&["config", "workspace", "clone"]);
+    let github = "https://github.com/me/alpha.git";
+    git(&alpha, &["remote", "set-url", "origin", github], None);
+    git(
+        &alpha,
+        &["config", "remote.origin.pushurl", origin.to_str().unwrap()],
+        None,
+    );
+    env.ok(&["scan"]);
+
+    let out = env.ok(&["dispatch", "alpha:ci", "-a", "fixer"]);
+    assert!(out.contains("1 ready"), "{out}");
+    env.ok(&["review", "1", "--approve"]);
+    env.ok(&["push", "1"]);
+    let landed = git_out(&origin, &["rev-parse", "main"]);
+    let detail = env.ok(&["review", "1"]);
+    assert!(
+        detail.contains(&format!("waiting for CI on {}", &landed[..7])),
+        "{detail}"
+    );
+
+    env.ok(&["scan"]);
+    let detail = env.ok(&["review", "1"]);
+    assert!(
+        detail.contains("head passed"),
+        "local verify passed: {detail}"
+    );
+    assert!(
+        detail.contains(&format!("still failing on {}", &landed[..7])),
+        "{detail}"
+    );
+    let next = env.ok(&["next"]);
+    assert!(next.contains("#1  pushed  CI still failing"), "{next}");
+    let report = env.ok(&["report"]);
+    assert!(
+        report.contains("CI after landing: fix-CI runs 1 still failing"),
+        "{report}"
+    );
+    let task = env.ok(&["task", "alpha:ci"]);
+    assert!(task.contains("last fix #1 landed: still failing"), "{task}");
+
+    fs::write(&fixed, "").unwrap();
+    env.ok(&["scan"]);
+    assert!(!env.ok(&["next"]).contains("CI still failing"));
+    assert!(env.ok(&["review", "1"]).contains("still failing on"));
 }
 
 /// A stand-in for `gh` that logs each call to LOG. `test` (11) fills a window

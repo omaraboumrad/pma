@@ -1642,10 +1642,32 @@ fn verdict_of(run: &crate::store::Run, rule: &str) -> Checked {
             },
         },
         "ci-green" => match (&pr, run.state) {
-            (None, RunState::Pushed) => verdict(
-                "unknown",
-                Some("pushed without a pull request, so no checks are read".into()),
-            ),
+            (None, RunState::Pushed) => {
+                use crate::ci_verdict::Verdict;
+                let failing = run.ci_before.as_deref().unwrap_or_default();
+                match (run.ci_verdict, &run.landed_sha) {
+                    (Some(Verdict::Fixed), _) => ok(true),
+                    (Some(Verdict::Clean), _) if failing.is_empty() => ok(true),
+                    (Some(Verdict::Clean), _) => verdict(
+                        "unknown",
+                        Some(format!(
+                            "broke nothing; failing before the run: {}",
+                            failing.join(", ")
+                        )),
+                    ),
+                    (Some(v), _) if v.bad() => verdict("failed", Some(format!("CI {}", v.text()))),
+                    (Some(v), _) => verdict("unknown", Some(v.text().into())),
+                    (None, Some(sha)) if run.ci_before.is_some() => {
+                        Checked::NotReady(format!("waiting for CI on {}", &sha[..sha.len().min(7)]))
+                    }
+                    (None, _) => verdict(
+                        "unknown",
+                        Some(
+                            "pushed without a pull request, and its commit was not recorded".into(),
+                        ),
+                    ),
+                }
+            }
             (None, _) => unpublished(),
             (Some(url), _) => match gh_json(&["pr", "view", url, "--json", "statusCheckRollup"]) {
                 Err(e) => verdict("unknown", Some(e)),
