@@ -132,7 +132,8 @@ impl Store {
                 decided_at = ?14, published_at = ?15, review_seconds = ?16,
                 changed_paths = ?17, scope_error = ?18, approved_tree = ?19,
                 approved_head = ?20, approved_by = ?21, reviewed_tree = ?22, infra = ?23,
-                base = ?25, denied = ?26, verify_base_ok = ?27, verify_base_seconds = ?28
+                base = ?25, denied = ?26, verify_base_ok = ?27, verify_base_seconds = ?28,
+                pr_head = ?29
              WHERE id = ?1 AND (?24 IS NULL OR state = ?24)",
             params![
                 run.id,
@@ -165,6 +166,7 @@ impl Store {
                 serde_json::to_string(&run.denied).ok(),
                 run.verify_base_ok,
                 run.verify_base_seconds,
+                run.pr_head,
             ],
         )?;
         if written == 0 {
@@ -308,7 +310,7 @@ impl Store {
                     workflow_instance, node, unit, lap, preset, extra_args, git_snapshot,
                     reviewed_tree, infra, workspace, start, denied,
                     review_measured, pane, interactive, agent_state, room,
-                    landed_sha, landed_at, ci_before, ci_verdict
+                    landed_sha, landed_at, ci_before, ci_verdict, pr_head
              FROM runs ORDER BY id",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -412,6 +414,7 @@ impl Store {
                     .get::<_, Option<String>>(69)?
                     .as_deref()
                     .and_then(crate::ci_verdict::Verdict::parse),
+                pr_head: r.get(70)?,
                 items: Vec::new(),
             })
         })?;
@@ -742,6 +745,9 @@ pub struct Run {
     pub ci_before: Option<Vec<String>>,
     /// What CI said of `landed_sha`; `None` while it has not decided.
     pub ci_verdict: Option<crate::ci_verdict::Verdict>,
+    /// The commit pma pushed to the run's pull request, which `merge` holds
+    /// the pull request's head to.
+    pub pr_head: Option<String>,
     /// A bundle's items, in prompt order; empty for any other run.
     pub items: Vec<RunItem>,
 }
@@ -854,6 +860,7 @@ impl Run {
             landed_at: None,
             ci_before: None,
             ci_verdict: None,
+            pr_head: None,
             interactive: false,
             agent_state: None,
             items: Vec::new(),
@@ -1109,6 +1116,7 @@ mod tests {
             landed_at: None,
             ci_before: None,
             ci_verdict: None,
+            pr_head: None,
             interactive: false,
             agent_state: None,
             items: vec![

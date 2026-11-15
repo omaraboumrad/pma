@@ -10,7 +10,7 @@
 
 - [ ] Add `pma integrate <name>`: pma should integration adapters to integrate with [herdr](https://herdr.dev/tui/docs/cli-reference/) and also see <https://herdr.dev/tui/docs/socket-api/>; and also with [minos](https://github.com/shakfu/minos). Such integrations are mutually exclusive.
 
-- [ ] Finish the pilot cohort and apply its gate #manual 1 of 20 items shipped since 2026-09-24 (`docs/dev/pilot.md`). Fix the `report` count above first, or the shares will mislead. (REVIEW.md U1)
+- [ ] Finish the pilot cohort and apply its gate #manual 1 of 20 items shipped since 2026-09-24 (`docs/dev/pilot.md`). The `report` count was fixed 2026-11-15: hand-committed runs closed as infrastructure now settle as accepted. (REVIEW.md U1)
 
 - [ ] Decide whether pma is the dashboard or the dispatch loop #manual The evidence supports `scan`/`status`/`history`; most of the code serves dispatch and workflows. pma is for other developers, one per install, so the adoption items below are in scope; multi-user use comes later. (REVIEW.md, Questions)
 
@@ -66,7 +66,7 @@
 
 - [ ] Per-project session locks One agent command and one job run at a time across all projects (`docs/dev/async_dispatch.md`, open question 1), so a detached job on one project blocks a dispatch on another. Needs a shared `batch_budget` ledger. (REVIEW.md U8)
 
-- [ ] `pma merge` refuses a pull request with failing checks or a moved head #agent `publish::merge` refuses only a conflict, so it merges a pull request with failing or pending checks, and commits pushed after review. Refuse failing or pending checks; allow none. Refuse a head that is not the commit pma pushed: record that commit at `pma pr`, which today records only the URL, and pass it to `gh pr merge --match-head-commit`. Tests in `tests/cli.rs` with the fake `gh` (`FAKE_GH_PR`): each refusal. Also from the original item and not built: several ids in one `pma merge`, and `--delete-branch`.
+- [ ] `pma merge` takes several ids, and `--delete-branch` Left from the item that made merge refuse failing or unfinished checks and a moved head (built 2026-11-15).
 
 - [ ] The process-group kill does not reach a child that calls `setsid` (`src/agent.rs:105-106`, `119`). `docs/dev/design.md:377` says no agent outlives the session. A survivor's writes to the worktree no longer reach an approval or a publish: an approval must match the tree last shown, and publishing starts from the approved tree. It still runs, reads what the user can, and writes outside the worktree. A cgroup or PID namespace would bound it; `sanduk` does. (REVIEW.md M10)
 

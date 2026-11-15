@@ -371,6 +371,52 @@ pub fn parse_relayed(output: &str) -> Report {
 
 /// A log's text, with invalid UTF-8 replaced: one stray byte from an agent
 /// must not cost the result line. `None` when the file cannot be read.
+/// A random version 4 UUID, for a session id; `None` without `/dev/urandom`.
+pub fn new_session_id() -> Option<String> {
+    use std::io::Read;
+    let mut b = [0u8; 16];
+    File::open("/dev/urandom").ok()?.read_exact(&mut b).ok()?;
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    Some(format!(
+        "{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    ))
+}
+
+/// What Claude Code says session `id` cost: the last `cost-state` record's
+/// `totalCostUSD` in its transcript, under `$CLAUDE_CONFIG_DIR` or
+/// `~/.claude`. The record is not a documented format, so `None` when it,
+/// or the transcript, is missing.
+pub fn session_cost(id: &str) -> Option<f64> {
+    let root = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| Path::new(&h).join(".claude")))?;
+    let name = format!("{id}.jsonl");
+    let transcript = std::fs::read_dir(root.join("projects"))
+        .ok()?
+        .flatten()
+        .map(|d| d.path().join(&name))
+        .find(|p| p.is_file())?;
+    session_cost_in(&std::fs::read_to_string(transcript).ok()?)
+}
+
+fn session_cost_in(transcript: &str) -> Option<f64> {
+    transcript
+        .lines()
+        .rev()
+        .filter(|l| l.contains("\"cost-state\""))
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v.get("type").and_then(serde_json::Value::as_str) == Some("cost-state"))?
+        .get("totalCostUSD")?
+        .as_f64()
+}
+
 pub fn read_log(path: &Path) -> Option<String> {
     let bytes = std::fs::read(path).ok()?;
     Some(String::from_utf8_lossy(&bytes).into_owned())
@@ -414,6 +460,22 @@ pub fn detect_verify(dir: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The last `cost-state` record holds the session's running total; a
+    /// transcript without one reports no cost rather than zero.
+    #[test]
+    fn a_session_cost_is_its_last_cost_state() {
+        let transcript = r#"{"type":"user","message":"mentions \"cost-state\""}
+{"type":"cost-state","totalCostUSD":0.25}
+{"type":"assistant","message":{}}
+{"type":"cost-state","totalCostUSD":0.75}
+{"type":"assistant","message":{}}"#;
+        assert_eq!(session_cost_in(transcript), Some(0.75));
+        assert_eq!(session_cost_in(r#"{"type":"user"}"#), None);
+        let id = new_session_id().unwrap();
+        assert_eq!(id.len(), 36);
+        assert_eq!(&id[14..15], "4");
+    }
 
     /// Refusals come from the result's list and from classifier tool results,
     /// and one in both counts once. A file quoting the words is no refusal.

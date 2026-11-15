@@ -373,19 +373,32 @@ fn fill(template: &str, values: &[(&str, Option<&str>)]) -> Option<String> {
 impl Worker {
     /// The command for a session a person drives, from `interactive_args`.
     /// `None` when the worker has none. It has no budget or timeout, so those
-    /// placeholders read as zero.
+    /// placeholders read as zero. `{session}` is the id pma reads the
+    /// session's cost by; without one it is dropped, with its flag.
     pub fn build_interactive(
         &self,
         prompt: &str,
         dir: &std::path::Path,
         model: Option<&str>,
         extra: &[String],
+        session: Option<&str>,
     ) -> Option<Command> {
         if self.interactive_args.is_empty() {
             return None;
         }
+        let mut args: Vec<String> = Vec::new();
+        for arg in &self.interactive_args {
+            match fill(arg, &[("session", session)]) {
+                Some(filled) => args.push(filled),
+                None => {
+                    if args.last().is_some_and(|a| a.starts_with('-')) {
+                        args.pop();
+                    }
+                }
+            }
+        }
         let w = Worker {
-            args: self.interactive_args.clone(),
+            args,
             ..self.clone()
         };
         Some(w.build(prompt, dir, model, 0.0, extra, std::time::Duration::ZERO))
@@ -544,6 +557,9 @@ impl Worker {
                 "auto",
                 "--model",
                 "{model}",
+                // Names the transcript the session's cost is read from.
+                "--session-id",
+                "{session}",
                 "{extra}",
                 "{prompt}",
             ]
@@ -761,6 +777,7 @@ mod tests {
                 Path::new("/w/a"),
                 Some("opus"),
                 &["--effort".into()],
+                Some("s-1"),
             )
             .unwrap();
         assert_eq!(
@@ -770,17 +787,19 @@ mod tests {
                 "auto",
                 "--model",
                 "opus",
+                "--session-id",
+                "s-1",
                 "--effort",
                 "do it"
             ]
         );
         let cmd = w
-            .build_interactive("do it", Path::new("/w/a"), None, &[])
+            .build_interactive("do it", Path::new("/w/a"), None, &[], None)
             .unwrap();
         assert_eq!(args_of(&cmd), ["--permission-mode", "auto", "do it"]);
         assert!(
             Worker::omp()
-                .build_interactive("do it", Path::new("/w"), None, &[])
+                .build_interactive("do it", Path::new("/w"), None, &[], None)
                 .is_none()
         );
     }

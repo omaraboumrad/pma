@@ -14,7 +14,11 @@ Upgrading from 0.10:
 
 - The database moves from schema 51 to 52 on first open. It adds four `runs` columns for the CI verdict. Runs landed earlier get no verdict.
 
+- The database moves from schema 52 to 53 on first open. It adds `runs.pr_head`. A `claude` worker whose `interactive_args` are the form pma shipped gains `--session-id {session}` in `settings.toml`, and `pma` says so.
+
 ### Added
+
+- **Interactive cost.** An interactive `claude` session starts with `--session-id`, and its cost is read from that session's transcript (`totalCostUSD` of the last `cost-state` record). It was unknown for 31 of 45 runs. The record is not a documented Claude Code format; without it the cost stays unknown, never zero.
 
 - **CI verdict on landed runs.** A run that `pma push`, or a push by hand, lands on the default branch is judged by CI on that commit. A fix-CI run is `fixed` or `still-failing` on the workflows failing at its dispatch; any other run is `clean` or `regressed` on workflows passing then. The verdict shows in the run detail, as a second line of `pma report`, in `ci-green`, and on the CI signal's detail. A bad one waits in the inbox while the project's CI fails. Local verify passing on macOS did not show a fix for a Linux or Windows job: one of 19 fix-CI runs pushed so far left CI red unseen. Reading CI after landing over pushing a branch first, which would publish unreviewed code. Design: `docs/dev/ci-verdict.md`.
 
@@ -42,6 +46,8 @@ Upgrading from 0.10:
 
 ### Changed
 
+- `pma merge` refuses a pull request with a failing or unfinished check, or whose head is not the commit `pma pr` pushed, and names them. GitHub is held to the same head (`--match-head-commit`). A pull request with no checks merges. One opened before schema 53 has no recorded head and is refused; merge it on GitHub.
+
 - A dispatch's run is in the store, `queued`, while its base check runs, and the dispatch says what it waits on: the command, the timeout, the log, and `verify_base_alongside on` to start the agent beside it. An uncached suite can take the whole timeout, and with no row and no output nothing showed why the agent had not started. Routing, which needs the base result, fills in the agent, model and route after; a task it refuses leaves no row. The existing `queued` state over a new `preparing` one: everything already treats `queued` as a run under way.
 
 - **Six tabs, not eight.** `1` inbox, `2` projects, `3` activity, `4` history, `5` setup, `6` matrix. History holds the run report and the scan panes that were on the projects tab; setup holds the settings tab's panes, agents first, and the library's. The inbox loses its `Tasks` list, which held 3 of 1,335 tasks, and shows notes when there are any. Rationale and usage figures: `docs/dev/views.md`, `docs/dev/views-refactor.md`.
@@ -59,6 +65,8 @@ Upgrading from 0.10:
 - A full scan of 117 projects makes 205 to 223 `gh` calls instead of 311, and takes 24 to 26 s instead of 38 s. A repository with no active workflow gets no `run list`. A project's per-workflow reads run in parallel. A workflow read alone is cached in `ci_alone`. It is reused while the 100-run window reaches back to that read, so any newer run of it would be in the window, and for at most 24 h, which bounds a re-run of an old run. A window under 100 runs holds every run, so a workflow missing from it is not asked about. Measurements and the options not built: `docs/dev/gh-optimize.md`.
 
 ### Fixed
+
+- A run committed by hand with the exact tree pma verified now settles as `committed`, then `pushed`, for headless runs as for interactive ones, and also when it was closed first. `pma close` had counted 7 such runs as infrastructure, out of the accept share. `pma report` now lists runs closed without a decision apart from those rejected for infrastructure.
 
 - A CI task listed the workflows failing at the last scan. Dispatch then refused the whole task when any of them passed since, even with others still failing. It now reads the project's CI first and stores it, so the task covers only workflows failing now, and the TUI and web row update at once. The agent gets the failed-job log of the run that read found, so scan and dispatch can no longer disagree. Runs are matched to workflows by id rather than name: two workflow files may share a name. A failed read keeps the last scan's CI and warns.
 

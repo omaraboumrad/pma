@@ -239,6 +239,9 @@ pub fn reject(
     Ok(files)
 }
 
+/// The outcome of a run closed with its files left: judged by no one.
+pub const CLOSED_LEFT: &str = "closed; its files were left as they are";
+
 /// Removes a run's worktree and marks it rejected, consuming no attempt: what
 /// `reject` does before a reviewer's judgement is counted. A local edit that
 /// failed verify was counted by verify; one that did not apply was judged by
@@ -307,7 +310,7 @@ pub fn discard(store: &Store, run: &mut Run, keep: bool, leave_files: bool) -> R
             revert(run, Some(&record))?;
         }
         if leave_files {
-            run.outcome = Some("closed; its files were left as they are".into());
+            run.outcome = Some(CLOSED_LEFT.into());
         }
         run.enter(RunState::Rejected);
         store.update_run_from(run, read)?;

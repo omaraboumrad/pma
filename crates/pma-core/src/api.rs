@@ -1885,7 +1885,7 @@ pub fn act(store: &Store, a: Action) -> Result<Outcome> {
             );
             let title = format!("#{id} take over");
             let cmd = worker
-                .build_interactive(&prompt, &run.worktree, model, &[])
+                .build_interactive(&prompt, &run.worktree, model, &[], None)
                 .ok_or_else(|| crate::dispatch::no_interactive(&worker.name))?;
             let integration = config(store)?.integration;
             crate::herdr::take_over(integration, &run.project, &title, &run.worktree, &cmd)?;

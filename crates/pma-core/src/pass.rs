@@ -1672,32 +1672,17 @@ fn verdict_of(run: &crate::store::Run, rule: &str) -> Checked {
             (Some(url), _) => match gh_json(&["pr", "view", url, "--json", "statusCheckRollup"]) {
                 Err(e) => verdict("unknown", Some(e)),
                 Ok(v) => {
-                    let checks = v
+                    let rollup = v
                         .get("statusCheckRollup")
                         .and_then(Value::as_array)
-                        .cloned()
+                        .map(Vec::as_slice)
                         .unwrap_or_default();
-                    let decisive = |c: &Value| -> Option<bool> {
-                        let state = c
-                            .get("conclusion")
-                            .filter(|s| s.as_str().is_some_and(|s| !s.is_empty()))
-                            .or_else(|| c.get("state"))
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_ascii_uppercase();
-                        match state.as_str() {
-                            "SUCCESS" | "NEUTRAL" | "SKIPPED" => Some(true),
-                            "FAILURE" | "TIMED_OUT" | "STARTUP_FAILURE" | "ERROR" | "CANCELLED"
-                            | "ACTION_REQUIRED" => Some(false),
-                            _ => None,
-                        }
-                    };
-                    let verdicts: Vec<Option<bool>> = checks.iter().map(decisive).collect();
-                    if verdicts.contains(&Some(false)) {
+                    let checks = crate::publish::checks(rollup);
+                    if !checks.failed.is_empty() {
                         verdict("failed", Some("a check failed".into()))
-                    } else if verdicts.iter().any(Option::is_none) {
+                    } else if !checks.pending.is_empty() {
                         Checked::NotReady("a check has not finished".into())
-                    } else if verdicts.is_empty() {
+                    } else if checks.total == 0 {
                         verdict("unknown", Some("no checks are reported".into()))
                     } else {
                         ok(true)

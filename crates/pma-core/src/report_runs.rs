@@ -52,8 +52,10 @@ struct Tally {
     /// they have not landed, so they are in no share.
     applied: i64,
     open: i64,
-    /// Runs closed or rejected for infrastructure, in no share.
+    /// Runs rejected for infrastructure, in no share.
     infra: Vec<i64>,
+    /// Runs closed with their files left, judged by no one, in no share.
+    closed: Vec<i64>,
     attempts: i64,
     cost: f64,
     /// Runs whose agent reported no cost, so `cost` is a floor.
@@ -74,6 +76,11 @@ impl Tally {
             RunState::Approved | RunState::Committed | RunState::Pushed | RunState::Merged => {
                 self.decided += 1;
                 self.accepted += 1;
+            }
+            RunState::Rejected
+                if run.infra && run.outcome.as_deref() == Some(crate::dispatch::CLOSED_LEFT) =>
+            {
+                self.closed.push(run.id)
             }
             RunState::Rejected if run.infra => self.infra.push(run.id),
             RunState::Rejected | RunState::Closed => self.decided += 1,
@@ -174,18 +181,23 @@ pub fn table_of(runs: &[Run], attempts: &[Attempt], by: By) -> Option<(String, V
         0 => String::new(),
         n => format!("; {n} applied unstaged, in no share"),
     };
-    let infra = match total.infra.as_slice() {
+    let ids = |what: &str, ids: &[i64]| match ids {
         [] => String::new(),
         ids => format!(
-            "; closed or rejected for infrastructure, in no share: {}",
+            "; {what}, in no share: {}",
             ids.iter()
                 .map(|id| format!("#{id}"))
                 .collect::<Vec<_>>()
                 .join(" ")
         ),
     };
+    let infra = ids("rejected for infrastructure", &total.infra);
+    let closed = ids("closed without a decision", &total.closed);
     let ci = ci_line(&done);
-    Some((format!("{share}{pending}{applied}{infra}{ci}"), rows))
+    Some((
+        format!("{share}{pending}{applied}{infra}{closed}{ci}"),
+        rows,
+    ))
 }
 
 /// What CI said of landed runs, fix-CI runs apart: a second summary line, or
@@ -333,15 +345,22 @@ mod tests {
     fn an_infrastructure_rejection_is_in_no_share() {
         let mut infra = run(2, Class::Specified, RunState::Rejected);
         infra.infra = true;
+        let mut closed = run(4, Class::Specified, RunState::Rejected);
+        closed.infra = true;
+        closed.outcome = Some(crate::dispatch::CLOSED_LEFT.into());
         let runs = [
             run(1, Class::Specified, RunState::Merged),
             infra,
             run(3, Class::Specified, RunState::Rejected),
+            closed,
         ];
         let out = report(&runs, &[], By::Class);
         assert!(out.contains("50% of 2 decided runs accepted"), "{out}");
         assert!(
-            out.contains("closed or rejected for infrastructure, in no share: #2\n"),
+            out.contains(
+                "; rejected for infrastructure, in no share: #2; \
+                 closed without a decision, in no share: #4\n"
+            ),
             "{out}"
         );
     }

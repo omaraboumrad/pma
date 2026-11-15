@@ -568,6 +568,7 @@ impl Env {
         );
         let mut cmd = command(env!("CARGO_BIN_EXE_pma"));
         cmd.env("PMA_HOME", &self.home)
+            .env("CLAUDE_CONFIG_DIR", self.home.join("claude"))
             .env("PATH", path)
             .env("PUSH_LOG", &self.push_log)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -1079,7 +1080,7 @@ fn an_infrastructure_rejection_uses_no_attempt_and_is_in_no_share() {
     let report = env.ok(&["report"]);
     assert!(report.starts_with("nothing decided yet"), "{report}");
     assert!(
-        report.contains("closed or rejected for infrastructure, in no share: #1"),
+        report.contains("rejected for infrastructure, in no share: #1"),
         "{report}"
     );
 
@@ -1099,8 +1100,10 @@ fn an_infrastructure_rejection_uses_no_attempt_and_is_in_no_share() {
 }
 
 /// A stand-in for `gh pr`, driven by files in `$PMA_HOME`: `pr-state` for
-/// `pr view`, `pr-list` for an open pull request, `pr-create-fails`.
+/// `pr view`, `pr-json` for the JSON `merge` reads, `pr-list` for an open
+/// pull request, `pr-create-fails`.
 const FAKE_GH_PR: &str = r#"#!/bin/sh
+case "$*" in *headRefOid*) cat "$PMA_HOME/pr-json"; exit ;; esac
 case "$1 $2" in
   "pr create")
     if [ -e "$PMA_HOME/pr-create-fails" ]; then echo "HTTP 502" >&2; exit 1; fi
@@ -1129,6 +1132,13 @@ fn a_pull_request_merges_or_has_its_conflicts_fixed() {
     let s = Scratch::new("pr-merge");
     let (env, origin, _alpha) = dispatch_env(&s, &[("claude", FAKE_CLAUDE), ("gh", FAKE_GH_PR)]);
     let pr_state = env.home.join("pr-state");
+    let pr_json = |mergeable: &str, head: &str, checks: &str| {
+        let json = format!(
+            r#"{{"mergeable":"{mergeable}","headRefOid":"{}","statusCheckRollup":[{checks}]}}"#,
+            head.trim()
+        );
+        fs::write(env.home.join("pr-json"), json).unwrap();
+    };
 
     env.ok(&["dispatch", "alpha:5"]);
     env.ok(&["review", "1", "--approve"]);
@@ -1138,6 +1148,7 @@ fn a_pull_request_merges_or_has_its_conflicts_fixed() {
 
     // A conflict refuses the merge and names the fix.
     fs::write(&pr_state, "CONFLICTING\n").unwrap();
+    pr_json("CONFLICTING", &tip, "");
     let (_, err, success) = env.run(&["merge", "1"]);
     assert!(
         !success && err.contains("has conflicts") && err.contains("--fix"),
@@ -1164,9 +1175,42 @@ fn a_pull_request_merges_or_has_its_conflicts_fixed() {
     assert!(todo.contains("- [x] add greeting"), "{todo}");
 
     fs::write(&pr_state, "MERGEABLE\n").unwrap();
+    let head = git_out(&origin, &["rev-parse", "pma/add-greeting"]);
+    let refused = |want: &str| {
+        let (_, err, success) = env.run(&["merge", "1"]);
+        assert!(!success && err.contains(want), "{err}");
+        assert!(!env.home.join("pr-merge-args").exists());
+    };
+    // A failing or unfinished check refuses it, and is named.
+    let check = |name: &str, status: &str, conclusion: &str| {
+        format!(r#"{{"name":"{name}","status":"{status}","conclusion":"{conclusion}"}}"#)
+    };
+    let pass = check("lint", "COMPLETED", "SUCCESS");
+    pr_json(
+        "MERGEABLE",
+        &head,
+        &format!("{pass},{}", check("test", "COMPLETED", "FAILURE")),
+    );
+    refused("checks failed: test:");
+    pr_json(
+        "MERGEABLE",
+        &head,
+        &format!("{pass},{}", check("test", "IN_PROGRESS", "")),
+    );
+    refused("checks have not finished: test:");
+    // A commit pushed by someone else since `pma pr` refuses it.
+    pr_json("MERGEABLE", &tip, &pass);
+    refused(", the commit pma pushed");
+
+    // No checks at all is no failure. GitHub is held to the same head.
+    pr_json("MERGEABLE", &head, "");
     assert!(env.ok(&["merge", "1"]).contains("pull request merged"));
     let args = fs::read_to_string(env.home.join("pr-merge-args")).unwrap();
     assert!(args.contains("--squash"), "{args}");
+    assert!(
+        args.contains(&format!("--match-head-commit\n{}", head.trim())),
+        "{args}"
+    );
     assert!(env.ok(&["review", "1"]).starts_with("#1 merged"));
     let (_, err, success) = env.run(&["merge", "1"]);
     assert!(!success && err.contains("no open pull request"), "{err}");
@@ -1757,10 +1801,18 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"did it","t
 }
 
 /// An interactive run starts without a baseline, since a person judges it, and
-/// work they committed in the session needs no stage or commit from pma.
+/// work they committed in the session needs no stage or commit from pma. Its
+/// cost is read from the transcript of the session id pma gave it.
 #[test]
 fn an_interactive_run_skips_the_baseline_and_keeps_its_commit() {
-    const COMMITS: &str = "#!/bin/sh\ngit add -A\ngit commit -qm 'by hand'\nexit 0\n";
+    const COMMITS: &str = r#"#!/bin/sh
+while [ $# -gt 0 ]; do [ "$1" = --session-id ] && id=$2; shift; done
+mkdir -p "$PMA_HOME/claude/projects/p"
+printf '{"type":"cost-state","totalCostUSD":0.42}\n' > "$PMA_HOME/claude/projects/p/$id.jsonl"
+git add -A
+git commit -qm 'by hand'
+exit 0
+"#;
     let s = Scratch::new("interactivefast");
     let (env, origin, alpha) = dispatch_env(&s, &[("claude", COMMITS)]);
     // The agent is what edits; the tree has to differ for a commit.
@@ -1778,6 +1830,8 @@ fn an_interactive_run_skips_the_baseline_and_keeps_its_commit() {
                 .is_none(),
         "no baseline ran"
     );
+    let detail = env.ok(&["review", "1"]);
+    assert!(detail.contains("$0.42"), "{detail}");
     let (out, err, success) = herdr.pma(&env, &["push", "1"]);
     assert!(success, "{out}{err}");
     assert_eq!(
@@ -2808,6 +2862,40 @@ fn review_settles_a_commit_pushed_by_hand() {
         )),
         "{detail}"
     );
+}
+
+/// A headless run committed by hand with the tree pma verified is accepted
+/// work, as is one closed first: both settle as committed, then pushed.
+#[test]
+fn a_verified_tree_committed_by_hand_settles_the_run() {
+    let s = Scratch::new("tree-by-hand");
+    let (env, _, alpha) = dispatch_env(&s, &[("claude", FAKE_CLAUDE)]);
+    env.ok(&["config", "workspace", "clone"]);
+    let by_hand = |msg: &str| {
+        git(&alpha, &["add", "--all"], None);
+        git(&alpha, &["commit", "-qm", msg], None);
+        git(&alpha, &["push", "-q", "origin", "main"], None);
+    };
+
+    env.ok(&["dispatch", "alpha:5"]);
+    by_hand("fix one");
+    env.ok(&["review"]);
+    let detail = env.ok(&["review", "1"]);
+    assert!(detail.starts_with("#1 pushed"), "{detail}");
+
+    // Closed before the commit: the close recorded no decision.
+    env.ok(&["dispatch", "alpha:7"]);
+    env.ok(&["close", "2"]);
+    by_hand("fix two");
+    env.ok(&["review"]);
+    let detail = env.ok(&["review", "2"]);
+    assert!(detail.starts_with("#2 pushed"), "{detail}");
+    let report = env.ok(&["report"]);
+    assert!(
+        report.starts_with("100% of 2 decided runs accepted"),
+        "{report}"
+    );
+    assert!(!report.contains("in no share"), "{report}");
 }
 
 /// A commit ticks the item in the clone, so the task leaves the lists then.
@@ -5544,7 +5632,7 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"ok","total
     let report = env.ok(&["report"]);
     assert!(report.starts_with("nothing decided yet"), "{report}");
     assert!(
-        report.contains("closed or rejected for infrastructure, in no share: #"),
+        report.contains("rejected for infrastructure, in no share: #"),
         "{report}"
     );
 }

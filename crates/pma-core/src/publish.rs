@@ -116,9 +116,10 @@ fn open_pr(store: &Store, cfg: &Config, run: &mut Run) -> Result<String> {
         )
         .into());
     }
-    let outcome = publish_one(cfg, run)?;
+    let (outcome, head) = publish_one(cfg, run)?;
     run.enter(RunState::PrOpen);
     run.outcome = Some(outcome.clone());
+    run.pr_head = Some(head);
     run.error = None;
     // Saved before cleanup, so a cleanup failure cannot hide what was
     // published.
@@ -582,7 +583,8 @@ pub enum Landed {
 
 /// Commits the approved tree in the worktree, pushes the run's branch and
 /// opens a pull request for it.
-fn publish_one(cfg: &Config, run: &Run) -> Result<String> {
+/// Returns the pull request's URL and the commit pushed to its branch.
+fn publish_one(cfg: &Config, run: &Run) -> Result<(String, String)> {
     let wt = &run.worktree;
     if !wt.is_dir() {
         return Err(format!("{} no longer exists", wt.display()).into());
@@ -682,6 +684,10 @@ fn publish_one(cfg: &Config, run: &Run) -> Result<String> {
     if lease.is_some() {
         wt_git(run, &["update-ref", "-d", &tip_ref])?;
     }
+    let head = wt_git(
+        run,
+        &["rev-parse", if pushed { &origin_branch } else { "HEAD" }],
+    )?;
     // A retry after `gh pr create` failed may find the pull request
     // made anyway.
     let open = gh_in(
@@ -699,7 +705,7 @@ fn publish_one(cfg: &Config, run: &Run) -> Result<String> {
             ".[0].url // empty",
         ],
     )?;
-    Ok(if open.is_empty() {
+    let url = if open.is_empty() {
         let (title, trailers) = message.split_once("\n\n").unwrap_or((&message, ""));
         let body = pr_body(run, trailers);
         gh_in(
@@ -719,7 +725,8 @@ fn publish_one(cfg: &Config, run: &Run) -> Result<String> {
         )?
     } else {
         open
-    })
+    };
+    Ok((url, head))
 }
 
 /// A pull request's body: the run, the agent's summary, the verify result,
@@ -761,8 +768,51 @@ pub fn conflicting(url: &str) -> Result<bool> {
     Ok(read.trim() == "CONFLICTING")
 }
 
+/// A pull request's checks: the names of those that failed and of those
+/// still running, and how many reported at all.
+#[derive(Debug, Default, PartialEq)]
+pub struct Checks {
+    pub failed: Vec<String>,
+    pub pending: Vec<String>,
+    pub total: usize,
+}
+
+/// Reads `gh pr view --json statusCheckRollup`'s array, which mixes check
+/// runs (`name`, `conclusion`) and status contexts (`context`, `state`).
+pub fn checks(rollup: &[serde_json::Value]) -> Checks {
+    let mut out = Checks {
+        total: rollup.len(),
+        ..Checks::default()
+    };
+    for c in rollup {
+        let text = |k: &str| {
+            c.get(k)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+        };
+        let state = Some(text("conclusion"))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| text("state"))
+            .to_ascii_uppercase();
+        let name = Some(text("name"))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| text("context"))
+            .to_string();
+        match state.as_str() {
+            "SUCCESS" | "NEUTRAL" | "SKIPPED" => {}
+            "FAILURE" | "TIMED_OUT" | "STARTUP_FAILURE" | "ERROR" | "CANCELLED"
+            | "ACTION_REQUIRED" => out.failed.push(name),
+            _ => out.pending.push(name),
+        }
+    }
+    out
+}
+
 /// Merges a `pr-open` run's pull request. Squashes, as a publish makes one
-/// commit; a repository that forbids it refuses through `gh`.
+/// commit; a repository that forbids it refuses through `gh`. Refuses a
+/// conflict, a failing or unfinished check, and a head other than the commit
+/// pma pushed; GitHub refuses the last too, should the head move meanwhile.
+/// A pull request with no checks merges.
 pub fn merge(store: &Store, run: &mut Run) -> Result<String> {
     if run.state != RunState::PrOpen {
         return Err(format!(
@@ -773,14 +823,68 @@ pub fn merge(store: &Store, run: &mut Run) -> Result<String> {
         .into());
     }
     let url = run.outcome.clone().unwrap_or_default();
-    if conflicting(&url)? {
+    let Some(pushed) = run.pr_head.clone() else {
+        return Err(format!(
+            "run #{} has no record of the commit pma pushed to {url}; merge it on GitHub",
+            run.id
+        )
+        .into());
+    };
+    let read = crate::sync::gh(&[
+        "pr",
+        "view",
+        &url,
+        "--json",
+        "mergeable,headRefOid,statusCheckRollup",
+    ])?;
+    let pr: serde_json::Value =
+        serde_json::from_str(&read).map_err(|e| format!("gh pr view: {e}"))?;
+    let field = |k: &str| {
+        pr.get(k)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+    };
+    if field("mergeable") == "CONFLICTING" {
         return Err(format!(
             "pull request has conflicts: {url}\nPress F, or run `pma merge {} --fix`, to have an agent fix them.",
             run.id
         )
         .into());
     }
-    crate::sync::gh(&["pr", "merge", &url, "--squash"])?;
+    let head = field("headRefOid");
+    if head != pushed {
+        return Err(format!(
+            "pull request head is {}, not {}, the commit pma pushed; review the \
+             commits added since on GitHub: {url}",
+            &head[..head.len().min(7)],
+            &pushed[..pushed.len().min(7)]
+        )
+        .into());
+    }
+    let rollup = pr
+        .get("statusCheckRollup")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let checks = checks(rollup);
+    if !checks.failed.is_empty() {
+        return Err(format!("checks failed: {}: {url}", checks.failed.join(", ")).into());
+    }
+    if !checks.pending.is_empty() {
+        return Err(format!(
+            "checks have not finished: {}: {url}",
+            checks.pending.join(", ")
+        )
+        .into());
+    }
+    crate::sync::gh(&[
+        "pr",
+        "merge",
+        &url,
+        "--squash",
+        "--match-head-commit",
+        &pushed,
+    ])?;
     run.enter(RunState::Merged);
     store.update_run(run)?;
     Ok(format!("pull request merged: {url}"))
@@ -913,10 +1017,36 @@ fn tick_in_clone(run: &Run) -> Result<Option<String>> {
     Ok(Some("; its item ticked in TODO.md, uncommitted".into()))
 }
 
-/// An interactive run whose work is already committed needs no stage or commit
-/// from pma: its clone is on the run's branch, ahead of the base, and clean.
-/// A headless run in that state stays refused, since pma checked another tree.
+/// A clone run whose work is already committed needs no stage or commit from
+/// pma. An interactive run qualifies when its clone is on the run's branch,
+/// ahead of the base, and clean. Any run qualifies, closed ones included, when
+/// a commit after the base holds the tree pma verified; see `by_tree`.
 pub fn settle_interactive(store: &Store) -> Result<()> {
+    let runs = store.runs()?;
+    for run in &runs {
+        let Some(sha) = by_tree(run) else {
+            continue;
+        };
+        let read = run.state;
+        let mut run = run.clone();
+        let how = if run.interactive {
+            "in its session"
+        } else {
+            "by hand"
+        };
+        let mut outcome = format!("committed {} {how}", &sha[..7.min(sha.len())]);
+        // A closed run's task was already dealt with by its reviewer.
+        if read != RunState::Rejected
+            && let Some(note) = tick_in_clone(&run)?
+        {
+            outcome.push_str(&note);
+        }
+        run.outcome = Some(outcome);
+        run.error = None;
+        run.infra = false;
+        run.enter(RunState::Committed);
+        let _ = store.update_run_from(&run, read);
+    }
     let runs = store.runs()?;
     for run in runs.iter().filter(|r| {
         r.interactive
@@ -952,6 +1082,35 @@ pub fn settle_interactive(store: &Store) -> Result<()> {
         let _ = store.update_run_from(&run, read);
     }
     Ok(())
+}
+
+/// The commit after a clone run's base whose tree is the one pma verified
+/// (`reviewed_tree`), for a run still under review or closed with its files
+/// left. Same tree means same content, so the run's checks hold for it.
+/// A closed run with no change has nothing to find.
+fn by_tree(run: &Run) -> Option<String> {
+    let closed = run.state == RunState::Rejected
+        && run.infra
+        && run.outcome.as_deref() == Some(crate::dispatch::CLOSED_LEFT);
+    if run.workspace != Workspace::Clone
+        || !(closed || matches!(run.state, RunState::Ready | RunState::Approved))
+    {
+        return None;
+    }
+    let tree = run.reviewed_tree.as_deref()?;
+    let base_tree = git(&run.repo, &["rev-parse", &format!("{}^{{tree}}", run.base)]).ok()?;
+    if tree == base_tree {
+        return None;
+    }
+    let log = git(
+        &run.repo,
+        &["log", "--format=%H %T", &format!("{}..HEAD", run.base)],
+    )
+    .ok()?;
+    log.lines()
+        .filter_map(|l| l.split_once(' '))
+        .find(|(_, t)| *t == tree)
+        .map(|(c, _)| c.to_string())
 }
 
 /// The commit a `committed` run's outcome names, as `commit` wrote it.
@@ -1060,6 +1219,28 @@ fn which(program: &str) -> Option<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Check runs carry `conclusion`, status contexts `state`; either names
+    /// a failure, and one with neither decided is still running.
+    #[test]
+    fn checks_read_both_kinds() {
+        let rollup: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[{"name":"test","status":"COMPLETED","conclusion":"FAILURE"},
+                {"name":"lint","status":"COMPLETED","conclusion":"SKIPPED"},
+                {"name":"build","status":"QUEUED","conclusion":""},
+                {"context":"ci/legacy","state":"ERROR"},
+                {"context":"deploy","state":"PENDING"}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            checks(&rollup),
+            Checks {
+                failed: vec!["test".into(), "ci/legacy".into()],
+                pending: vec!["build".into(), "deploy".into()],
+                total: 5,
+            }
+        );
+    }
 
     /// A bundle's commit counts what it closes, lists it, and closes each
     /// issue; a dropped item is in none of the three.

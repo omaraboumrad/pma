@@ -318,6 +318,8 @@ struct Launch<'l> {
     /// A broker beside the agent that serves the room's socket.
     side: Option<(Sidecar, &'l Link)>,
     room: Option<String>,
+    /// The id an interactive session runs under, to read its cost by.
+    session: Option<String>,
 }
 
 /// The steps of `attempt_once`. An error fails the run and the attempt.
@@ -401,12 +403,20 @@ fn launch<'l>(
             Err(e) => eprintln!("warning: #{}: no minos room: {e}", run.id),
         }
     }
+    let session = (run.interactive
+        && worker
+            .interactive_args
+            .iter()
+            .any(|a| a.contains("{session}")))
+    .then(agent::new_session_id)
+    .flatten();
     let built = match run.interactive {
         true => worker.build_interactive(
             &a.prompt,
             &run.worktree,
             run.model.as_deref(),
             &run.extra_args,
+            session.as_deref(),
         ),
         false => Some(worker.build_linked(
             &a.prompt,
@@ -440,6 +450,7 @@ fn launch<'l>(
         wrapped,
         side,
         room,
+        session,
     })
 }
 
@@ -457,6 +468,7 @@ fn host_agent(
         wrapped,
         side,
         mut room,
+        session,
     } = launch;
     let (cfg, worker, id) = (s.cfg, s.worker, run.id);
     let set_room = |room: Option<&str>| {
@@ -525,12 +537,20 @@ fn host_agent(
     let output = || agent::read_log(&log).unwrap_or_default();
     // A person drove it in a terminal, so there is no event stream to read.
     let report = match run.interactive {
-        true => agent::Report {
-            ok: finished.success == Some(true),
-            summary: "interactive session in herdr; it reports no summary or cost".into(),
-            cost_usd: None,
-            denied: Vec::new(),
-        },
+        true => {
+            let cost_usd = session.as_deref().and_then(agent::session_cost);
+            let what = if cost_usd.is_some() {
+                "summary"
+            } else {
+                "summary or cost"
+            };
+            agent::Report {
+                ok: finished.success == Some(true),
+                summary: format!("interactive session in herdr; it reports no {what}"),
+                cost_usd,
+                denied: Vec::new(),
+            }
+        }
         // A person's correction starts another turn of the same session.
         false if relayed => agent::parse_relayed(&output()),
         false => worker

@@ -1,6 +1,6 @@
 use super::*;
 
-const VERSION: i64 = 52;
+const VERSION: i64 = 53;
 
 const SCHEMA: &str = "
 CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -477,6 +477,9 @@ ALTER TABLE runs ADD COLUMN ci_before TEXT;
 ALTER TABLE runs ADD COLUMN ci_verdict TEXT;
 ";
 
+/// Version 53. The commit pma pushed to a run's pull request.
+const PR_HEAD: &str = "ALTER TABLE runs ADD COLUMN pr_head TEXT;";
+
 /// Version 49. How a worker starts a session a person drives, as a JSON array.
 const INTERACTIVE_ARGS: &str =
     "ALTER TABLE agents ADD COLUMN interactive_args TEXT NOT NULL DEFAULT '[]';";
@@ -821,6 +824,7 @@ pub(super) fn migrate(conn: &Connection, path: &Path) -> Result<i64> {
                 MINOS_ROOMS,
                 CI_ALONE,
                 CI_VERDICT,
+                PR_HEAD,
             ];
             let tx = conn.unchecked_transaction()?;
             for step in &steps[version as usize..] {
@@ -938,6 +942,30 @@ impl Store {
                     self.change_settings(|doc| crate::settings::set_agent(doc, &w))?;
                     eprintln!(
                         "pma: wrote agents.{}.relay to {}",
+                        w.name,
+                        self.settings.display()
+                    );
+                }
+            }
+        }
+        // An interactive session's cost is read by its id. Only the form pma
+        // shipped before gains the flag; an edited one is the user's.
+        if version < 53 {
+            let before = [
+                "--permission-mode",
+                "auto",
+                "--model",
+                "{model}",
+                "{extra}",
+                "{prompt}",
+            ];
+            let template = crate::worker::Worker::claude();
+            for mut w in self.agents()? {
+                if w.command == template.command && w.interactive_args == before {
+                    w.interactive_args = template.interactive_args.clone();
+                    self.change_settings(|doc| crate::settings::set_agent(doc, &w))?;
+                    eprintln!(
+                        "pma: added --session-id to agents.{}.interactive_args in {}",
                         w.name,
                         self.settings.display()
                     );
@@ -1319,8 +1347,10 @@ mod tests {
         }
     }
 
-    /// Undoes version 52, for a test that rewinds the schema past it.
+    /// Undoes versions 52 and 53, for a test that rewinds the schema past
+    /// them.
     const UNDO_CI_VERDICT: &str = "
+        ALTER TABLE runs DROP COLUMN pr_head;
         ALTER TABLE runs DROP COLUMN landed_sha;
         ALTER TABLE runs DROP COLUMN landed_at;
         ALTER TABLE runs DROP COLUMN ci_before;
@@ -1552,6 +1582,40 @@ mod tests {
             Worker::claude().interactive_args,
             "{text}"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Version 53 adds `--session-id` to a `claude` worker still on the form
+    /// pma shipped; an edited one keeps its own.
+    #[test]
+    fn claude_gets_a_session_id_unless_edited() {
+        let dir = scratch("session-id");
+        let path = dir.join("p.db");
+        {
+            let store = Store::open(&path).unwrap();
+            let mut shipped = Worker::claude();
+            shipped
+                .interactive_args
+                .retain(|a| a != "--session-id" && a != "{session}");
+            let mut mine = shipped.clone();
+            mine.name = "mine".into();
+            mine.interactive_args.push("--verbose".into());
+            store
+                .change_settings(|doc| {
+                    crate::settings::set_agent(doc, &shipped);
+                    crate::settings::set_agent(doc, &mine);
+                })
+                .unwrap();
+            store
+                .conn
+                .execute_batch("ALTER TABLE runs DROP COLUMN pr_head;")
+                .unwrap();
+            store.conn.pragma_update(None, "user_version", 52).unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let args = |name: &str| store.agent(name).unwrap().interactive_args;
+        assert_eq!(args("claude"), Worker::claude().interactive_args);
+        assert!(!args("mine").iter().any(|a| a == "{session}"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
